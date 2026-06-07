@@ -10,8 +10,12 @@
 //! surface is added behind a feature in a later step.
 
 pub mod hud;
+#[cfg(feature = "layershell")]
+pub mod layershell;
 
 pub use hud::{Hud, Toast, ToastKind};
+#[cfg(feature = "layershell")]
+pub use layershell::LayerShellOverlay;
 
 /// Errors creating or driving an overlay surface.
 #[derive(Debug, thiserror::Error)]
