@@ -11,10 +11,16 @@ description = "open-recorder capture/encode engine: ring buffer + keyframe-aware
 ord-common.workspace = true
 thiserror.workspace = true
 ffmpeg-next = { version = "8", optional = true }
+crossbeam = { version = "0.8", optional = true }
+waycap-rs = { git = "https://github.com/Adonca2203/waycap-rs.git", rev = "493c1c6898afa941978d2d09fccd12b10fa6b27f", default-features = false, features = ["nvidia", "egl"], optional = true }
 
 [features]
 # `mux` pulls in ffmpeg-next (needs the system ffmpeg libs at build time). Off by
 # default so the pure logic (ring/clip/engine/backend) builds and tests in CI
 # without ffmpeg. The daemon enables it.
+#
+# `waycap` pulls in waycap-rs (PipeWire DMA-BUF + NVENC) for the real capture
+# backend. Needs the GPU/CUDA toolchain; off in CI. Implies `mux`.
 default = []
 mux = ["dep:ffmpeg-next"]
+waycap = ["dep:waycap-rs", "dep:crossbeam", "mux"]

@@ -17,6 +17,8 @@ pub mod clip;
 pub mod engine;
 pub mod mux;
 pub mod ring;
+#[cfg(feature = "waycap")]
+pub mod waycap_backend;
 
 pub use backend::{BackendError, CaptureBackend, Codec, MockBackend, StreamParams};
 pub use clip::{select_clip, ClipError, ClipSelection};
