@@ -137,7 +137,8 @@
             libGL
             libglvnd
             mesa
-            dbus       # portal screencast (libdbus-sys)
+            dbus           # portal screencast (libdbus-sys)
+            libxkbcommon   # smithay-client-toolkit (layer-shell HUD)
           ];
 
           # The waycap-rs `nvidia` feature pulls in `cust`, whose build script

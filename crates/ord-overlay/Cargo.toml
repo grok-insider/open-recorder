@@ -9,3 +9,12 @@ description = "open-recorder HUD overlay abstraction (layer-shell / X11 / Win32)
 
 [dependencies]
 thiserror.workspace = true
+smithay-client-toolkit = { version = "0.19", optional = true }
+wayland-client = { version = "0.31", optional = true }
+
+[features]
+# `layershell` builds the real wlr-layer-shell HUD surface (pure-Rust via
+# smithay-client-toolkit; needs a Wayland session at runtime). Off by default so
+# the trait + HUD model build and test without Wayland.
+default = []
+layershell = ["dep:smithay-client-toolkit", "dep:wayland-client"]
