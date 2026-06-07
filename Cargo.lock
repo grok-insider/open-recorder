@@ -3033,6 +3033,7 @@ dependencies = [
 name = "ord-overlay"
 version = "0.1.0"
 dependencies = [
+ "ord-common",
  "smithay-client-toolkit 0.19.2",
  "thiserror 2.0.18",
  "wayland-client 0.31.14",

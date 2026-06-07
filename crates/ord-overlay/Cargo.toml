@@ -9,8 +9,14 @@ description = "open-recorder HUD overlay abstraction (layer-shell / X11 / Win32)
 
 [dependencies]
 thiserror.workspace = true
+ord-common.workspace = true
 smithay-client-toolkit = { version = "0.19", optional = true }
 wayland-client = { version = "0.31", optional = true }
+
+[[bin]]
+name = "ord-hud"
+path = "src/bin/ord-hud.rs"
+required-features = ["layershell"]
 
 [features]
 # `layershell` builds the real wlr-layer-shell HUD surface (pure-Rust via
