@@ -22,10 +22,97 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
-      # Phase-1 spike: a development shell with the native toolchain needed to
-      # build waycap-rs (PipeWire DMA-BUF capture + ffmpeg/NVENC encode). The
-      # workspace packages are added in later phases; for now this shell is what
-      # the spike binary (spike/) builds in.
+      # Packages:
+      #   ord-cli  — the `ord` control client (pure Rust, builds anywhere).
+      #   ordd     — the daemon. The default build uses the mock backend so it
+      #              builds without a GPU; the real recorder is built with the
+      #              `waycap` feature in the devshell (needs CUDA/PipeWire). We
+      #              expose the buildable default here and document the GPU build.
+      packages = forAllSystems (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          common = {
+            version = "0.1.0";
+            src = ./.;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # The workspace lockfile carries waycap-rs and its forked pipewire-rs
+              # as git deps (used by ord-core's optional `waycap` feature). Vendoring
+              # the lock requires their NAR hashes even for the pure CLI build.
+              outputHashes = {
+                "waycap-rs-3.0.0" = "sha256-jUfzvOkl7bcCiFs4wBjvpuzE9t5nHuP6O+JCKRadEQo=";
+                "libspa-0.9.2" = "sha256-eqHVfGpjsfXouGOwBh306/E8g0jQIE5w6cZ5a8TbOIQ=";
+              };
+            };
+          };
+        in
+        rec {
+          ord-cli = pkgs.rustPlatform.buildRustPackage (common // {
+            pname = "ord-cli";
+            cargoBuildFlags = [ "-p" "ord-cli" ];
+            cargoTestFlags = [ "-p" "ord-cli" "-p" "ord-common" "-p" "ord-core" ];
+            # CLI + pure crates have no system deps.
+            doCheck = true;
+            meta = {
+              description = "open-recorder control CLI (ord)";
+              mainProgram = "ord";
+              license = nixpkgs.lib.licenses.mit;
+              platforms = systems;
+            };
+          });
+          default = ord-cli;
+        });
+
+      # Home Manager module: installs the CLI and (optionally) runs ordd as a
+      # user service. The daemon package itself is supplied by the user (the GPU
+      # build from the devshell) via `services.ordd.package`.
+      homeManagerModules.default = { config, lib, pkgs, ... }:
+        let
+          cfg = config.programs.open-recorder;
+        in
+        {
+          options.programs.open-recorder = {
+            enable = lib.mkEnableOption "open-recorder clip recorder";
+            package = lib.mkOption {
+              type = lib.types.package;
+              default = self.packages.${pkgs.stdenv.hostPlatform.system}.ord-cli;
+              defaultText = lib.literalExpression "open-recorder.packages.\${system}.ord-cli";
+              description = "The `ord` CLI package to install.";
+            };
+            daemon = {
+              enable = lib.mkEnableOption "the ordd user service";
+              package = lib.mkOption {
+                type = lib.types.nullOr lib.types.package;
+                default = null;
+                description = ''
+                  The `ordd` daemon package (built with the `waycap` feature from
+                  the project devshell). Required if `daemon.enable` is true.
+                '';
+              };
+            };
+          };
+          config = lib.mkIf cfg.enable {
+            home.packages = [ cfg.package ]
+              ++ lib.optional (cfg.daemon.enable && cfg.daemon.package != null) cfg.daemon.package;
+
+            systemd.user.services.ordd = lib.mkIf cfg.daemon.enable {
+              Unit = {
+                Description = "open-recorder capture daemon";
+                After = [ "graphical-session.target" ];
+                PartOf = [ "graphical-session.target" ];
+              };
+              Service = {
+                ExecStart = "${cfg.daemon.package}/bin/ordd";
+                Restart = "on-failure";
+                RestartSec = 3;
+              };
+              Install.WantedBy = [ "graphical-session.target" ];
+            };
+          };
+        };
+
+      # Development shell with the native toolchain to build the full workspace
+      # incl. the `waycap` (NVENC) + `mux` (ffmpeg) features and the spike.
       devShells = forAllSystems (system:
         let
           # NOTE: we deliberately do NOT set config.cudaSupport. NVENC is
