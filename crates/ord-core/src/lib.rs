@@ -15,11 +15,13 @@
 pub mod backend;
 pub mod clip;
 pub mod engine;
+pub mod mux;
 pub mod ring;
 
 pub use backend::{BackendError, CaptureBackend, Codec, MockBackend, StreamParams};
 pub use clip::{select_clip, ClipError, ClipSelection};
 pub use engine::{Engine, PreparedClip};
+pub use mux::{write_clip, MuxError};
 pub use ring::{EncodedFrame, RingBuffer};
 
 /// A presentation timestamp in microseconds (matches ffmpeg/waycap-rs `pts`).
