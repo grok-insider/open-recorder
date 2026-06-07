@@ -17,6 +17,10 @@ pub enum Command {
     SetBuffer { enabled: bool },
     /// Ask the daemon for its current state.
     Status,
+    /// Turn this connection into an event stream: the daemon pushes every
+    /// subsequent [`Event`] (e.g. `ClipSaved`, `BufferState`) until the client
+    /// disconnects. Used by the HUD overlay.
+    Subscribe,
 }
 
 /// A message sent from the daemon to clients.
@@ -90,6 +94,7 @@ mod tests {
             Command::SetBuffer { enabled: true },
             Command::SetBuffer { enabled: false },
             Command::Status,
+            Command::Subscribe,
         ];
         for cmd in cases {
             let bytes = cmd.encode().unwrap();

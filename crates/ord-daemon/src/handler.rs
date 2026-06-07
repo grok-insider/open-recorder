@@ -48,6 +48,10 @@ impl<B: CaptureBackend> Handler<B> {
             Command::ToggleRecord => self.handle_toggle_record(),
             Command::SetBuffer { enabled } => self.handle_set_buffer(enabled),
             Command::Status => self.handle_status(),
+            // Subscribe is finalized at the server layer (it keeps the connection
+            // open and pushes events). The handler replies with an initial status
+            // snapshot so the subscriber has current state immediately.
+            Command::Subscribe => self.handle_status(),
         }
     }
 

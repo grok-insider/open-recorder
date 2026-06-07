@@ -22,7 +22,8 @@ fn usage() -> &'static str {
        ord save [--last N]   save the last N seconds (default 30)\n  \
        ord record            toggle manual recording\n  \
        ord status            show daemon status\n  \
-       ord buffer on|off     enable/disable the replay buffer\n"
+       ord buffer on|off     enable/disable the replay buffer\n  \
+       ord subscribe         stream daemon events (for the HUD)\n"
 }
 
 fn parse() -> Result<Command, String> {
@@ -47,6 +48,7 @@ fn parse() -> Result<Command, String> {
         }
         "record" => Ok(Command::ToggleRecord),
         "status" => Ok(Command::Status),
+        "subscribe" => Ok(Command::Subscribe),
         "buffer" => {
             let v = args.next().ok_or("buffer needs on|off")?;
             let enabled = match v.as_str() {
@@ -103,6 +105,20 @@ fn run() -> Result<(), String> {
     })?;
     write_frame(&mut stream, &cmd.encode().map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
+
+    // Subscribe streams events until the daemon closes; print each as it arrives.
+    if matches!(cmd, Command::Subscribe) {
+        loop {
+            match read_frame(&mut stream) {
+                Ok(bytes) => {
+                    let event = Event::decode(&bytes).map_err(|e| e.to_string())?;
+                    println!("{}", render(event));
+                }
+                Err(_) => return Ok(()), // daemon closed the stream
+            }
+        }
+    }
+
     let bytes = read_frame(&mut stream).map_err(|e| e.to_string())?;
     let event = Event::decode(&bytes).map_err(|e| e.to_string())?;
     println!("{}", render(event));
