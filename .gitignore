@@ -1,0 +1,25 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# Nix
+/result
+/result-*
+
+# Recordings / clips (never commit captured media)
+*.mkv
+*.mp4
+*.webm
+*.opus
+*.flac
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Runtime / scratch
+*.log
+/tmp-spike/
