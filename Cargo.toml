@@ -5,6 +5,8 @@ members = [
     "crates/ord-core",
     "crates/ord-daemon",
     "crates/ord-cli",
+    "crates/ord-overlay",
+    "crates/ord-ui",
 ]
 # The Phase-1 spike is a throwaway with heavy GPU/CUDA deps; keep it out of the
 # workspace so the testable core builds with plain cargo (and in CI without a GPU).
