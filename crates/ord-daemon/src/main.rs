@@ -19,12 +19,15 @@ fn clips_dir() -> PathBuf {
 }
 
 fn clip_filename() -> PathBuf {
-    // Seconds-since-epoch keeps names sortable and unique without extra deps.
+    // <game-or-clip>-<epoch>.mkv: sortable, unique, and labelled by the
+    // foreground app when detectable.
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    clips_dir().join(format!("clip-{secs}.mkv"))
+    let game = ord_daemon::detect_foreground();
+    let stem = ord_daemon::clip_stem(game.as_deref());
+    clips_dir().join(format!("{stem}-{secs}.mkv"))
 }
 
 #[cfg(feature = "mux")]
