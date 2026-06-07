@@ -41,6 +41,7 @@ Architecture: [`docs/architecture.md`](./docs/architecture.md).
 | [`docs/overlay.md`](./docs/overlay.md) | Special-workspace vs layer-shell HUD; cross-platform overlay strategy. |
 | [`docs/backends.md`](./docs/backends.md) | The `CaptureBackend` and `Overlay` traits and their implementations. |
 | [`docs/testing.md`](./docs/testing.md) | Test strategy: unit / integration / golden / bench / GPU lanes. |
+| [`docs/spike-results.md`](./docs/spike-results.md) | Phase-1 spike outcome: native NVENC stack builds + initializes on the 610 driver. |
 
 ## License
 
