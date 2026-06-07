@@ -4,12 +4,11 @@ A native, open-source, Medal.tv / ShadowPlay-style game clipper for Linux —
 always-on instant replay with near-zero overhead, save the last N seconds on a
 keypress, browse and trim clips. NVIDIA-first, designed cross-platform.
 
-> **Status: in development.** The capture/clip engine, daemon, CLI, event
-> subscription, clip-library model, and a real **wlr-layer-shell HUD** are
-> implemented and tested. The HUD is verified end-to-end on live Hyprland (the
-> buffer indicator + "Clip saved" toast render click-through over a fullscreen
-> game). Real NVENC capture (the `waycap` feature) builds in the nix devshell;
-> the only step left is the interactive screencast-portal pick in a live session.
+> **Status: working.** Full pipeline verified end-to-end on hardware (NVIDIA RTX
+> 5070 Ti, Hyprland): `ordd --features waycap` + `ord save` records real NVENC
+> H.264 clips to `~/Videos/open-recorder/` (ffprobe-validated), the click-through
+> wlr-layer-shell HUD renders over fullscreen content, and `ord-ui` lists the
+> library. This replaces Steam's CPU-x264 macroblocking with hardware NVENC.
 > See [`plan.md`](./plan.md) and [`docs/spike-results.md`](./docs/spike-results.md).
 
 ## Crates

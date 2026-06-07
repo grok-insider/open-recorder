@@ -4,7 +4,26 @@ The spike validates that the native zero-copy capture→NVENC path is viable on
 this machine (NVIDIA RTX 5070 Ti, open driver 610) before the product is built
 on it. Code: `spike/`.
 
-## Verdict: build gate PASSED; runtime needs an interactive portal pick
+## UPDATE: full end-to-end VERIFIED on hardware
+
+The complete app now records real clips. Driving the portal picker (via
+`ydotool` in a live Hyprland session), `ordd --features waycap` + `ord save`
+produces a valid H.264 1440p `.mkv` in `~/Videos/open-recorder/`, confirmed by
+ffprobe (correct codec, duration, clean remux, full decode). The HUD overlay
+renders over fullscreen content during capture. Bugs found and fixed during this
+real run:
+
+- NVENC emits **Annex-B**; mkv needs **AVCC** + avcC extradata (added
+  `mux/annexb`).
+- The ring buffer assumed microsecond pts but waycap emits **nanoseconds**, so
+  it evicted almost everything (`buffered: 0s`) — made it time-base aware.
+- `waycap` feature didn't imply `mux`, so saves silently wrote nothing.
+- Timestamps needed DTS ordering + ms normalization for a correct duration.
+
+See `crates/ord-core/src/mux/annexb.rs`, `ring.rs`, and the golden test
+`crates/ord-core/tests/mux_golden.rs`.
+
+## Verdict (original): build gate PASSED; runtime needs an interactive portal pick
 
 ### What is proven
 
