@@ -10,3 +10,11 @@ description = "open-recorder capture/encode engine: ring buffer + keyframe-aware
 [dependencies]
 ord-common.workspace = true
 thiserror.workspace = true
+ffmpeg-next = { version = "8", optional = true }
+
+[features]
+# `mux` pulls in ffmpeg-next (needs the system ffmpeg libs at build time). Off by
+# default so the pure logic (ring/clip/engine/backend) builds and tests in CI
+# without ffmpeg. The daemon enables it.
+default = []
+mux = ["dep:ffmpeg-next"]
