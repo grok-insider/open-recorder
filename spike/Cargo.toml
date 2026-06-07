@@ -20,7 +20,8 @@ path = "src/main.rs"
 # pairing (vulkan would pull ash + a full vk context). default-features=false
 # drops vaapi.
 waycap-rs = { git = "https://github.com/Adonca2203/waycap-rs.git", rev = "493c1c6898afa941978d2d09fccd12b10fa6b27f", default-features = false, features = ["nvidia", "egl"] }
+# Exercise the real production muxer (ord-core::write_clip).
+ord-core = { path = "../crates/ord-core", features = ["mux"] }
 crossbeam = "0.8"
-ffmpeg-next = "8"
 log = "0.4"
 simple-logging = "2"

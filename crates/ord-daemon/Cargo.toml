@@ -19,6 +19,10 @@ thiserror.workspace = true
 [features]
 # The shipped daemon records for real; CI builds the default (mock) daemon to
 # run the handler/socket integration tests without a GPU.
+#
+# `waycap` (real NVENC recorder) implies `mux` so the daemon's own
+# #[cfg(feature = "mux")] clip writer is active — otherwise saves would report
+# success but write nothing.
 default = []
-waycap = ["ord-core/waycap"]
 mux = ["ord-core/mux"]
+waycap = ["ord-core/waycap", "mux"]
