@@ -84,5 +84,28 @@ proceed.
 - **Do not set `config.cudaSupport`** globally — it forces a from-source rebuild
   of ffmpeg-full + opencv + whisper. NVENC comes from the driver at runtime; the
   cached `ffmpeg-full` already carries the nvenc encoders via nv-codec-headers.
-- **HEVC/AV1**: available in ffmpeg; exposing them through waycap-rs is a fork
-  item (the enum only has `H264Nvenc`). H.264 is fine for v1.
+- **HEVC/AV1**: available in ffmpeg (`hevc_nvenc`, `av1_nvenc` confirmed in the
+  devshell); exposing them through waycap-rs is a fork item (the enum only has
+  `H264Nvenc`). H.264 is fine for v1.
+
+## HEVC/AV1 via a waycap-rs fork — verified recipe
+
+Assessed the fork scope against the pinned waycap-rs commit. It is **small and
+surgical**, not a rewrite:
+
+- `src/encoders/nvenc_encoder.rs` hardcodes `let encoder_name = "h264_nvenc";`
+  (NvencEncoder::new). `create_encoder()` is otherwise **codec-agnostic** — it
+  uses `ffmpeg::codec::encoder::find_by_name(encoder)` with CUDA frames and a
+  bitrate; no H.264-only assumptions in the hot path.
+- `src/types/config.rs::VideoEncoder` only lists `H264Nvenc`/`H264Vaapi`.
+- `src/encoders/dynamic_encoder.rs` maps the GPU vendor to `H264Nvenc`.
+
+**Fork steps:** add `Hevc*`/`Av1*` variants to `VideoEncoder`, thread the chosen
+codec into `NvencEncoder::new` so `encoder_name` becomes `"hevc_nvenc"` /
+`"av1_nvenc"`, and update `dynamic_encoder` mapping. Everything downstream
+(CUDA frame ctx, the encoded-frame channel, our adapter) is unchanged.
+
+Our `WaycapBackend` already reports a `Codec` in `params()`; when a forked
+waycap-rs exposes HEVC, only the `with_video_encoder(...)` call + that reported
+codec need to change. Until then v1 ships H.264 NVENC, which already eliminates
+the CPU-x264 macroblocking that motivated the project.
