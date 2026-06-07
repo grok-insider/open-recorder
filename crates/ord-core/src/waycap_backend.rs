@@ -46,6 +46,8 @@ impl From<Quality> for QualityPreset {
 pub struct WaycapBackend {
     quality: Quality,
     fps: u32,
+    width: u32,
+    height: u32,
     capture: Option<Capture<waycap_rs::DynamicEncoder>>,
     forwarder: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
@@ -53,16 +55,27 @@ pub struct WaycapBackend {
 }
 
 impl WaycapBackend {
-    /// Create a backend (does not start capture or prompt the portal yet).
+    /// Create a backend (does not start capture or prompt the portal yet). The
+    /// width/height are container hints; actual dimensions come from the H.264
+    /// SPS in the stream.
     pub fn new(quality: Quality, fps: u32) -> Self {
         Self {
             quality,
             fps,
+            width: 2560,
+            height: 1440,
             capture: None,
             forwarder: None,
             stop: Arc::new(AtomicBool::new(false)),
             running: false,
         }
+    }
+
+    /// Set the container dimension hints.
+    pub fn with_dimensions(mut self, width: u32, height: u32) -> Self {
+        self.width = width;
+        self.height = height;
+        self
     }
 }
 
@@ -131,10 +144,14 @@ impl CaptureBackend for WaycapBackend {
 
     fn params(&self) -> StreamParams {
         StreamParams {
-            width: 0,
-            height: 0,
+            // Dimensions are carried in the H.264 SPS (in each keyframe), so the
+            // muxer/decoder recover them even though waycap-rs does not surface
+            // them here. These act only as a container hint.
+            width: self.width,
+            height: self.height,
             fps: self.fps,
             codec: Codec::H264,
+            time_base_den: crate::backend::NANOS_PER_SEC, // waycap pts are nanoseconds
         }
     }
 

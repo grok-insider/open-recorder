@@ -38,10 +38,14 @@ pub struct Engine<B: CaptureBackend> {
 
 impl<B: CaptureBackend> Engine<B> {
     /// Create an engine over `backend` with a `capacity_seconds` replay buffer.
+    /// The ring buffer uses the backend's pts time base so eviction keeps exactly
+    /// `capacity_seconds` of footage regardless of whether pts are micro- or
+    /// nanoseconds.
     pub fn new(backend: B, capacity_seconds: u32) -> Self {
+        let ticks_per_sec = backend.params().time_base_den;
         Self {
+            ring: RingBuffer::with_time_base(capacity_seconds, ticks_per_sec),
             backend,
-            ring: RingBuffer::new(capacity_seconds),
             rx: None,
         }
     }

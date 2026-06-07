@@ -19,7 +19,13 @@ pub struct StreamParams {
     pub fps: u32,
     /// Codec fourcc-ish tag, e.g. "h264".
     pub codec: Codec,
+    /// Ticks per second for the frame `pts`/`dts` (the time-base denominator).
+    /// waycap-rs uses nanoseconds (1_000_000_000); the mock uses microseconds.
+    pub time_base_den: i64,
 }
+
+/// Nanoseconds per second — waycap-rs frame pts time base.
+pub const NANOS_PER_SEC: i64 = 1_000_000_000;
 
 /// Video codec a backend emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +101,7 @@ impl MockBackend {
                 height: 1440,
                 fps,
                 codec: Codec::H264,
+                time_base_den: MICROS_PER_SEC, // mock pts are microseconds
             },
             total_frames,
             keyframe_interval,

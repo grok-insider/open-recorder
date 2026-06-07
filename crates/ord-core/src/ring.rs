@@ -52,38 +52,63 @@ impl EncodedFrame {
 #[derive(Debug)]
 pub struct RingBuffer {
     frames: VecDeque<EncodedFrame>,
-    capacity_micros: Micros,
+    capacity_ticks: Micros,
+    ticks_per_sec: i64,
+    max_pts: Micros,
     bytes: usize,
 }
 
 impl RingBuffer {
-    /// Create a buffer holding at most `capacity_seconds` of frames.
-    /// `capacity_seconds` must be >= 1.
+    /// Create a buffer holding at most `capacity_seconds` of frames, with frame
+    /// `pts` expressed in **microseconds** (the default used by the mock backend
+    /// and tests). `capacity_seconds` must be >= 1.
     pub fn new(capacity_seconds: u32) -> Self {
+        Self::with_time_base(capacity_seconds, MICROS_PER_SEC)
+    }
+
+    /// Create a buffer where frame `pts` are expressed in `ticks_per_sec` units
+    /// (e.g. `NANOS_PER_SEC` for waycap-rs). This is essential: eviction is a
+    /// time window, so the buffer must know the pts time base or it will keep the
+    /// wrong amount of footage.
+    pub fn with_time_base(capacity_seconds: u32, ticks_per_sec: i64) -> Self {
         debug_assert!(capacity_seconds >= 1, "buffer capacity must be >= 1s");
+        debug_assert!(ticks_per_sec >= 1);
         Self {
             frames: VecDeque::new(),
-            capacity_micros: capacity_seconds as i64 * MICROS_PER_SEC,
+            capacity_ticks: capacity_seconds as i64 * ticks_per_sec,
+            ticks_per_sec,
+            max_pts: i64::MIN,
             bytes: 0,
         }
     }
 
     /// Push a frame, then evict any frames older than `capacity` behind the
-    /// newest frame's pts.
+    /// newest seen pts.
     ///
-    /// Frames are expected in non-decreasing pts order. A frame whose pts is
-    /// before the current newest is dropped (out-of-order arrivals are not
-    /// buffered), keeping the window well-formed.
+    /// Frames may arrive slightly out of order (waycap-rs reorders for B-frames),
+    /// so the eviction window is anchored to the maximum pts seen, and frames are
+    /// inserted by pts to keep the buffer ordered.
     pub fn push(&mut self, frame: EncodedFrame) {
-        if let Some(back) = self.frames.back() {
-            if frame.pts < back.pts {
-                return;
-            }
-        }
-        let newest_pts = frame.pts;
+        self.max_pts = self.max_pts.max(frame.pts);
         self.bytes += frame.len();
-        self.frames.push_back(frame);
-        self.evict_before(newest_pts - self.capacity_micros);
+        // Insert keeping the deque ordered by pts (frames usually arrive in
+        // order; this corrects the occasional reorder without dropping frames).
+        if self
+            .frames
+            .back()
+            .map(|b| frame.pts >= b.pts)
+            .unwrap_or(true)
+        {
+            self.frames.push_back(frame);
+        } else {
+            let pos = self
+                .frames
+                .iter()
+                .position(|f| f.pts > frame.pts)
+                .unwrap_or(self.frames.len());
+            self.frames.insert(pos, frame);
+        }
+        self.evict_before(self.max_pts - self.capacity_ticks);
     }
 
     /// Remove frames whose pts is strictly less than `cutoff`.
@@ -113,9 +138,9 @@ impl RingBuffer {
         self.bytes
     }
 
-    /// The span (microseconds) from the oldest to the newest buffered frame.
+    /// The span (in pts ticks) from the oldest to the newest buffered frame.
     /// Zero if fewer than two frames.
-    pub fn span_micros(&self) -> Micros {
+    pub fn span_ticks(&self) -> Micros {
         match (self.frames.front(), self.frames.back()) {
             (Some(f), Some(b)) => b.pts - f.pts,
             _ => 0,
@@ -124,7 +149,7 @@ impl RingBuffer {
 
     /// Buffered span rounded down to whole seconds (for status reporting).
     pub fn buffered_seconds(&self) -> u32 {
-        (self.span_micros() / MICROS_PER_SEC) as u32
+        (self.span_ticks() / self.ticks_per_sec) as u32
     }
 
     /// The pts of the newest buffered frame, if any.
@@ -165,7 +190,7 @@ mod tests {
         assert!(rb.is_empty());
         assert_eq!(rb.len(), 0);
         assert_eq!(rb.bytes(), 0);
-        assert_eq!(rb.span_micros(), 0);
+        assert_eq!(rb.span_ticks(), 0);
         assert_eq!(rb.buffered_seconds(), 0);
         assert_eq!(rb.newest_pts(), None);
         assert_eq!(rb.oldest_pts(), None);
@@ -200,11 +225,16 @@ mod tests {
     }
 
     #[test]
-    fn out_of_order_frame_is_dropped() {
+    fn out_of_order_frame_is_inserted_in_order() {
+        // waycap-rs can reorder frames (B-frames); the buffer inserts by pts
+        // rather than dropping, keeping the deque ordered and the frame retained.
         let mut rb = RingBuffer::new(60);
         rb.push(f(5.0, true));
-        rb.push(f(3.0, false)); // earlier than newest -> dropped
-        assert_eq!(rb.len(), 1);
+        rb.push(f(3.0, false)); // earlier than newest -> inserted before it
+        assert_eq!(rb.len(), 2);
+        let ptss: Vec<i64> = rb.frames().map(|f| f.pts).collect();
+        assert_eq!(ptss, vec![3 * MICROS_PER_SEC, 5 * MICROS_PER_SEC]);
+        // newest (max pts) is still 5s.
         assert_eq!(rb.newest_pts(), Some(5 * MICROS_PER_SEC));
     }
 
@@ -212,7 +242,7 @@ mod tests {
     fn single_frame_span_is_zero() {
         let mut rb = RingBuffer::new(60);
         rb.push(f(7.0, true));
-        assert_eq!(rb.span_micros(), 0);
+        assert_eq!(rb.span_ticks(), 0);
         assert_eq!(rb.buffered_seconds(), 0);
     }
 
