@@ -124,6 +124,14 @@ nix develop                     # devshell with pipewire/ffmpeg/cuda/clang toolc
 
 ## Status
 
-Pre-implementation. This repository currently contains the plan and docs only.
-Code lands starting with the Phase-1 spike (validate `waycap-rs` zero-copy
-DMA-BUF + NVENC HEVC on the NVIDIA 610 open driver) — see `plan.md`.
+In development. Implemented and tested (default, no-GPU feature set):
+`ord-common` (newtypes, IPC, framing), `ord-core` (ring buffer, keyframe clip
+selection, engine, mock backend; `mux` + `waycap` features build in the
+devshell), `ord-daemon` (`ordd` socket + handler + game detection),
+`ord-cli` (`ord`), `ord-overlay` (trait + HUD model), `ord-ui` (clip library
+model + egui app behind `gui`). 68 tests pass; `nix build .#ord-cli` works.
+
+Pending: end-to-end NVENC validation in a live Hyprland session (the spike
+reaches the portal `CreateSession`; needs an interactive pick — see
+`docs/spike-results.md`), the real wlr-layer-shell HUD surface, and HEVC/AV1 via
+a waycap-rs fork.
