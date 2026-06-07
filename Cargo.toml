@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ord-common",
+    "crates/ord-core",
+]
+# The Phase-1 spike is a throwaway with heavy GPU/CUDA deps; keep it out of the
+# workspace so the testable core builds with plain cargo (and in CI without a GPU).
+exclude = [
+    "spike",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["0xfell"]
+repository = "https://github.com/0xfell/open-recorder"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+thiserror = "2"
+ord-common = { path = "crates/ord-common" }
