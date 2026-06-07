@@ -1,0 +1,23 @@
+[package]
+name = "ord-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "open-recorder clip library GUI (egui)"
+
+[[bin]]
+name = "ord-ui"
+path = "src/main.rs"
+
+[dependencies]
+ord-common.workspace = true
+thiserror.workspace = true
+eframe = { version = "0.29", optional = true }
+
+[features]
+# `gui` pulls in eframe/egui (needs system GL/Wayland libs). Off in CI so the
+# pure clip-library scanning logic builds and tests without a display.
+default = []
+gui = ["dep:eframe"]
