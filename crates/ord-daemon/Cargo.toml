@@ -1,0 +1,24 @@
+[package]
+name = "ord-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "open-recorder background daemon (ordd): capture supervision + control socket"
+
+[[bin]]
+name = "ordd"
+path = "src/main.rs"
+
+[dependencies]
+ord-common.workspace = true
+ord-core.workspace = true
+thiserror.workspace = true
+
+[features]
+# The shipped daemon records for real; CI builds the default (mock) daemon to
+# run the handler/socket integration tests without a GPU.
+default = []
+waycap = ["ord-core/waycap"]
+mux = ["ord-core/mux"]
