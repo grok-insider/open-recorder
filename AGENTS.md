@@ -125,13 +125,16 @@ nix develop                     # devshell with pipewire/ffmpeg/cuda/clang toolc
 ## Status
 
 In development. Implemented and tested (default, no-GPU feature set):
-`ord-common` (newtypes, IPC, framing), `ord-core` (ring buffer, keyframe clip
-selection, engine, mock backend; `mux` + `waycap` features build in the
-devshell), `ord-daemon` (`ordd` socket + handler + game detection),
-`ord-cli` (`ord`), `ord-overlay` (trait + HUD model), `ord-ui` (clip library
-model + egui app behind `gui`). 68 tests pass; `nix build .#ord-cli` works.
+`ord-common` (newtypes, IPC + `Subscribe`, framing), `ord-core` (ring buffer,
+keyframe clip selection, engine, mock backend; `mux` + `waycap` features build in
+the devshell), `ord-daemon` (`ordd` socket + handler + game detection + event
+broadcast to subscribers), `ord-cli` (`ord` incl. `subscribe`), `ord-overlay`
+(trait + HUD model + **real wlr-layer-shell surface** behind `layershell` +
+`ord-hud` binary), `ord-ui` (clip library model + egui app behind `gui`). 69
+tests pass; `nix build .#ord-cli` works; the HUD is verified end-to-end on live
+Hyprland (renders click-through over a fullscreen game).
 
-Pending: end-to-end NVENC validation in a live Hyprland session (the spike
-reaches the portal `CreateSession`; needs an interactive pick — see
-`docs/spike-results.md`), the real wlr-layer-shell HUD surface, and HEVC/AV1 via
-a waycap-rs fork.
+Pending: end-to-end NVENC capture validation in a live Hyprland session (the
+spike reaches the portal `CreateSession`; needs an interactive pick — see
+`docs/spike-results.md`), and HEVC/AV1 via a waycap-rs fork (verified recipe in
+`docs/spike-results.md`).

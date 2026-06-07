@@ -4,11 +4,13 @@ A native, open-source, Medal.tv / ShadowPlay-style game clipper for Linux —
 always-on instant replay with near-zero overhead, save the last N seconds on a
 keypress, browse and trim clips. NVIDIA-first, designed cross-platform.
 
-> **Status: in development.** The capture/clip engine, daemon, and CLI are
-> implemented and tested; the egui clip library and HUD overlay models are in.
-> Real NVENC capture (the `waycap` feature) builds in the nix devshell and is
-> pending final end-to-end validation in a live Hyprland session. See
-> [`plan.md`](./plan.md) and [`docs/spike-results.md`](./docs/spike-results.md).
+> **Status: in development.** The capture/clip engine, daemon, CLI, event
+> subscription, clip-library model, and a real **wlr-layer-shell HUD** are
+> implemented and tested. The HUD is verified end-to-end on live Hyprland (the
+> buffer indicator + "Clip saved" toast render click-through over a fullscreen
+> game). Real NVENC capture (the `waycap` feature) builds in the nix devshell;
+> the only step left is the interactive screencast-portal pick in a live session.
+> See [`plan.md`](./plan.md) and [`docs/spike-results.md`](./docs/spike-results.md).
 
 ## Crates
 
@@ -18,7 +20,7 @@ keypress, browse and trim clips. NVIDIA-first, designed cross-platform.
 | `ord-core` | – | Ring buffer, keyframe-aware clip selection, engine, ffmpeg muxer (`mux`), NVENC capture (`waycap`). |
 | `ord-daemon` | `ordd` | Capture supervision + Unix-socket control + game-named clips. |
 | `ord-cli` | `ord` | Thin control client for compositor keybinds. |
-| `ord-overlay` | – | `Overlay` trait + HUD toast model (layer-shell surface WIP). |
+| `ord-overlay` | `ord-hud` | `Overlay` trait + HUD toast model + real wlr-layer-shell surface (`layershell`); `ord-hud` subscribes to the daemon and shows events. |
 | `ord-ui` | `ord-ui` | egui clip library (`gui`); CLI clip listing otherwise. |
 
 ## Build & run
@@ -28,10 +30,11 @@ keypress, browse and trim clips. NVIDIA-first, designed cross-platform.
 cargo test --workspace
 cargo build --release -p ord-cli
 
-# Real recorder (NVENC): in the project devshell (CUDA + ffmpeg + PipeWire).
+# Real recorder (NVENC) + HUD: in the project devshell (CUDA + ffmpeg + PipeWire).
 nix develop
-cargo build --release -p ord-daemon --features waycap   # ordd
-cargo build --release -p ord-ui --features gui           # clip library window
+cargo build --release -p ord-daemon --features waycap        # ordd
+cargo build --release -p ord-ui --features gui               # clip library window
+cargo build --release -p ord-overlay --features layershell   # ord-hud overlay
 ```
 
 Run the daemon, then drive it:
@@ -48,6 +51,7 @@ ord buffer off              # pause the buffer
 ```ini
 # ~/.config/hypr/hyprland.conf
 exec-once = ordd
+exec-once = ord-hud          # click-through HUD (buffer indicator + toasts)
 bind = ALT, R, exec, ord save --last 30
 bind = ALT SHIFT, R, exec, ord record
 # Clip library in a special workspace (like Discord/Spotify):
