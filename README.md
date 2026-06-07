@@ -22,7 +22,48 @@ keypress, browse and trim clips. NVIDIA-first, designed cross-platform.
 | `ord-overlay` | `ord-hud` | `Overlay` trait + HUD toast model + real wlr-layer-shell surface (`layershell`); `ord-hud` subscribes to the daemon and shows events. |
 | `ord-ui` | `ord-ui` | egui clip library (`gui`); CLI clip listing otherwise. |
 
-## Build & run
+## Install (NixOS, prebuilt — no compiling)
+
+CI builds every binary and pushes it to the **`0xfell` cachix cache**, so you
+get prebuilt closures instead of compiling CUDA/ffmpeg/waycap-rs locally. Add the
+substituter once:
+
+```nix
+# configuration.nix (NixOS) or nix.conf
+nix.settings = {
+  substituters = [ "https://0xfell.cachix.org" ];
+  trusted-public-keys = [
+    "0xfell.cachix.org-1:0VSPKbe/Eilt+WTT/0faSQeQnnhDOH7PxkUvoRtvPPo="
+  ];
+};
+```
+
+Then run or install any binary straight from the flake:
+
+```sh
+nix run github:0xfell/open-recorder#ordd      # the NVENC daemon
+nix profile install github:0xfell/open-recorder   # all of: ord, ordd, ord-hud, ord-ui
+```
+
+### Home Manager
+
+```nix
+{
+  inputs.open-recorder.url = "github:0xfell/open-recorder";
+
+  # in your HM config:
+  imports = [ inputs.open-recorder.homeManagerModules.default ];
+  programs.open-recorder.enable = true;   # installs all binaries
+  # ordd + ord-hud run as user services by default; disable with:
+  # programs.open-recorder.daemon.enable = false;
+  # programs.open-recorder.hud.enable = false;
+}
+```
+
+Runtime needs the NVIDIA driver (`/run/opengl-driver`, present on any NixOS
+NVIDIA host) and a Wayland session with a working screencast portal.
+
+## Build from source
 
 ```sh
 # Pure logic (no GPU): builds + tests anywhere.
@@ -34,6 +75,9 @@ nix develop
 cargo build --release -p ord-daemon --features waycap        # ordd
 cargo build --release -p ord-ui --features gui               # clip library window
 cargo build --release -p ord-overlay --features layershell   # ord-hud overlay
+
+# Or build the nix packages directly (same as the cache provides):
+nix build .#ordd .#ord-hud .#ord-ui .#ord-cli
 ```
 
 Run the daemon, then drive it:
@@ -47,10 +91,12 @@ ord buffer off              # pause the buffer
 
 ## Hyprland integration
 
+With the Home Manager module, `ordd` and `ord-hud` already run as user services,
+so you only need the keybinds:
+
 ```ini
 # ~/.config/hypr/hyprland.conf
-exec-once = ordd
-exec-once = ord-hud          # click-through HUD (buffer indicator + toasts)
+# (if NOT using the HM services, also add: exec-once = ordd / exec-once = ord-hud)
 bind = ALT, R, exec, ord save --last 30
 bind = ALT SHIFT, R, exec, ord record
 # Clip library in a special workspace (like Discord/Spotify):
