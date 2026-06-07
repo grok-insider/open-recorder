@@ -22,78 +22,168 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
-      # Packages:
-      #   ord-cli  — the `ord` control client (pure Rust, builds anywhere).
-      #   ordd     — the daemon. The default build uses the mock backend so it
-      #              builds without a GPU; the real recorder is built with the
-      #              `waycap` feature in the devshell (needs CUDA/PipeWire). We
-      #              expose the buildable default here and document the GPU build.
+      # Packages — all prebuilt and pushed to the 0xfell cachix cache by CI, so
+      # NixOS users never compile:
+      #   ord-cli  — the `ord` control client (pure Rust).
+      #   ordd     — the daemon, real NVENC recorder (`waycap` + `mux` features).
+      #   ord-hud  — the wlr-layer-shell HUD (`layershell` feature).
+      #   ord-ui   — the egui clip library window (`gui` feature).
+      #   default  — a single output bundling all four binaries.
       packages = forAllSystems (system:
         let
-          pkgs = import nixpkgs { inherit system; };
-          common = {
-            version = "0.1.0";
-            src = ./.;
-            cargoLock = {
-              lockFile = ./Cargo.lock;
-              # The workspace lockfile carries waycap-rs and its forked pipewire-rs
-              # as git deps (used by ord-core's optional `waycap` feature). Vendoring
-              # the lock requires their NAR hashes even for the pure CLI build.
-              outputHashes = {
-                "waycap-rs-3.0.0" = "sha256-jUfzvOkl7bcCiFs4wBjvpuzE9t5nHuP6O+JCKRadEQo=";
-                "libspa-0.9.2" = "sha256-eqHVfGpjsfXouGOwBh306/E8g0jQIE5w6cZ5a8TbOIQ=";
-              };
+          pkgs = import nixpkgs {
+            inherit system;
+            config.allowUnfree = true; # CUDA (for the waycap NVENC build)
+          };
+          lib = nixpkgs.lib;
+
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # The workspace lockfile carries waycap-rs and its forked pipewire-rs
+            # as git deps (ord-core's `waycap` feature). Vendoring needs their
+            # NAR hashes even for the pure CLI build.
+            outputHashes = {
+              "waycap-rs-3.0.0" = "sha256-jUfzvOkl7bcCiFs4wBjvpuzE9t5nHuP6O+JCKRadEQo=";
+              "libspa-0.9.2" = "sha256-eqHVfGpjsfXouGOwBh306/E8g0jQIE5w6cZ5a8TbOIQ=";
             };
           };
+
+          # Native libraries the GPU/Wayland builds link or dlopen.
+          nativeLibs = with pkgs; [
+            pipewire
+            wayland
+            wayland-protocols
+            libdrm
+            ffmpeg-full
+            libGL
+            libglvnd
+            mesa
+            dbus
+            libxkbcommon
+          ];
+
+          # cust's build script (find_cuda_helper) wants a unified CUDA toolkit
+          # with `lib64/`; the merged derivation provides include/ + lib/.
+          cudatoolkit = pkgs.cudaPackages.cudatoolkit;
+
+          # Common build environment for the native (GPU/Wayland) packages.
+          nativeEnv = {
+            nativeBuildInputs = with pkgs; [ pkg-config rustPlatform.bindgenHook makeWrapper ];
+            buildInputs = nativeLibs ++ [ cudatoolkit ];
+            # bindgen (ffmpeg-next/cust) needs libclang.
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            # cust/find_cuda_helper: present the toolkit with a lib64/ layout.
+            CUDA_PATH = "${cudatoolkit}";
+            CUDA_ROOT = "${cudatoolkit}";
+            preBuild = ''
+              export CUDA_LIBRARY_PATH="$TMPDIR/.cuda-shim"
+              mkdir -p "$CUDA_LIBRARY_PATH"
+              ln -sfn "${cudatoolkit}/lib" "$CUDA_LIBRARY_PATH/lib64"
+            '';
+            # NVENC/CUDA libs (libcuda.so.1, libnvidia-encode.so.1) are NOT in
+            # nixpkgs — they ship with the running NVIDIA driver. Wrap each binary
+            # so /run/opengl-driver/lib (the NixOS driver tree) plus the linked
+            # native libs are on LD_LIBRARY_PATH at runtime.
+            postFixup = ''
+              for b in $out/bin/*; do
+                if [ -f "$b" ] && [ -x "$b" ]; then
+                  wrapProgram "$b" \
+                    --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${lib.makeLibraryPath nativeLibs}"
+                fi
+              done
+            '';
+          };
+
+          mkPkg = { pname, crate, features ? [], native ? false, mainProgram, description }:
+            pkgs.rustPlatform.buildRustPackage (
+              (lib.optionalAttrs native nativeEnv) // {
+                inherit pname cargoLock;
+                version = "0.1.0";
+                src = ./.;
+                cargoBuildFlags = [ "-p" crate ]
+                  ++ lib.optionals (features != []) [ "--features" (lib.concatStringsSep "," features) ];
+                # The GPU/Wayland features need a live session/GPU to test; skip
+                # tests in the package build (CI runs the pure test suite).
+                doCheck = !native;
+                cargoTestFlags = lib.optionals (!native) [ "-p" crate ];
+                meta = {
+                  inherit description mainProgram;
+                  license = lib.licenses.mit;
+                  platforms = systems;
+                };
+              }
+            );
         in
         rec {
-          ord-cli = pkgs.rustPlatform.buildRustPackage (common // {
+          ord-cli = mkPkg {
             pname = "ord-cli";
-            cargoBuildFlags = [ "-p" "ord-cli" ];
-            cargoTestFlags = [ "-p" "ord-cli" "-p" "ord-common" "-p" "ord-core" ];
-            # CLI + pure crates have no system deps.
-            doCheck = true;
+            crate = "ord-cli";
+            mainProgram = "ord";
+            description = "open-recorder control CLI (ord)";
+          };
+
+          ordd = mkPkg {
+            pname = "ordd";
+            crate = "ord-daemon";
+            features = [ "waycap" ]; # implies mux
+            native = true;
+            mainProgram = "ordd";
+            description = "open-recorder capture daemon (NVENC)";
+          };
+
+          ord-hud = mkPkg {
+            pname = "ord-hud";
+            crate = "ord-overlay";
+            features = [ "layershell" ];
+            native = true;
+            mainProgram = "ord-hud";
+            description = "open-recorder wlr-layer-shell HUD";
+          };
+
+          ord-ui = mkPkg {
+            pname = "ord-ui";
+            crate = "ord-ui";
+            features = [ "gui" ];
+            native = true;
+            mainProgram = "ord-ui";
+            description = "open-recorder egui clip library";
+          };
+
+          # Bundle all binaries into one output for easy install.
+          default = pkgs.symlinkJoin {
+            name = "open-recorder-0.1.0";
+            paths = [ ord-cli ordd ord-hud ord-ui ];
             meta = {
-              description = "open-recorder control CLI (ord)";
-              mainProgram = "ord";
-              license = nixpkgs.lib.licenses.mit;
+              description = "open-recorder — native NVENC game clipper (all binaries)";
+              license = lib.licenses.mit;
               platforms = systems;
             };
-          });
-          default = ord-cli;
+          };
         });
 
-      # Home Manager module: installs the CLI and (optionally) runs ordd as a
-      # user service. The daemon package itself is supplied by the user (the GPU
-      # build from the devshell) via `services.ordd.package`.
+      # Home Manager module: installs all open-recorder binaries (prebuilt from
+      # the cache) and optionally runs ordd + the HUD as user services.
       homeManagerModules.default = { config, lib, pkgs, ... }:
         let
           cfg = config.programs.open-recorder;
+          pkgsFor = self.packages.${pkgs.stdenv.hostPlatform.system};
         in
         {
           options.programs.open-recorder = {
             enable = lib.mkEnableOption "open-recorder clip recorder";
             package = lib.mkOption {
               type = lib.types.package;
-              default = self.packages.${pkgs.stdenv.hostPlatform.system}.ord-cli;
-              defaultText = lib.literalExpression "open-recorder.packages.\${system}.ord-cli";
-              description = "The `ord` CLI package to install.";
+              default = pkgsFor.default;
+              defaultText = lib.literalExpression "open-recorder.packages.\${system}.default";
+              description = "open-recorder package bundle (ord, ordd, ord-hud, ord-ui).";
             };
-            daemon = {
-              enable = lib.mkEnableOption "the ordd user service";
-              package = lib.mkOption {
-                type = lib.types.nullOr lib.types.package;
-                default = null;
-                description = ''
-                  The `ordd` daemon package (built with the `waycap` feature from
-                  the project devshell). Required if `daemon.enable` is true.
-                '';
-              };
-            };
+            daemon.enable =
+              lib.mkEnableOption "the ordd capture daemon user service" // { default = true; };
+            hud.enable =
+              lib.mkEnableOption "the ord-hud overlay user service" // { default = true; };
           };
           config = lib.mkIf cfg.enable {
-            home.packages = [ cfg.package ]
-              ++ lib.optional (cfg.daemon.enable && cfg.daemon.package != null) cfg.daemon.package;
+            home.packages = [ cfg.package ];
 
             systemd.user.services.ordd = lib.mkIf cfg.daemon.enable {
               Unit = {
@@ -102,7 +192,21 @@
                 PartOf = [ "graphical-session.target" ];
               };
               Service = {
-                ExecStart = "${cfg.daemon.package}/bin/ordd";
+                ExecStart = "${cfg.package}/bin/ordd";
+                Restart = "on-failure";
+                RestartSec = 3;
+              };
+              Install.WantedBy = [ "graphical-session.target" ];
+            };
+
+            systemd.user.services.ord-hud = lib.mkIf cfg.hud.enable {
+              Unit = {
+                Description = "open-recorder HUD overlay";
+                After = [ "graphical-session.target" "ordd.service" ];
+                PartOf = [ "graphical-session.target" ];
+              };
+              Service = {
+                ExecStart = "${cfg.package}/bin/ord-hud";
                 Restart = "on-failure";
                 RestartSec = 3;
               };

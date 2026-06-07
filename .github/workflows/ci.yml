@@ -5,31 +5,62 @@ on:
     branches: [master]
     tags: ["v*"]
   pull_request:
-    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  # Pure-logic gate: fmt + clippy + tests for the default (no-GPU) feature set.
-  # The waycap/mux/gui features need system libs (CUDA/ffmpeg/GL) and a GPU, so
-  # they are validated in the nix devshell on the dev box, not in CI.
+  build:
+    name: build + cache (x86_64-linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+
+      # Configures the 0xfell cache as a substituter AND pushes every newly
+      # built store path to it (using the CACHIX_AUTH_TOKEN secret). nix-community
+      # is pulled so CUDA/ffmpeg build deps come from cache. With this, NixOS
+      # users who add the 0xfell substituter never compile open-recorder.
+      - name: Set up Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: 0xfell
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          extraPullNames: nix-community
+
+      # Build every published binary so all closures land in the cache:
+      #   ord (CLI), ordd (NVENC daemon), ord-hud (layer-shell HUD),
+      #   ord-ui (egui library), and the bundled default.
+      - name: Build all packages
+        run: |
+          nix build .#ord-cli -L
+          nix build .#ordd -L
+          nix build .#ord-hud -L
+          nix build .#ord-ui -L
+          nix build .#default -L
+
+      - name: Flake check
+        run: nix flake check -L
+
+  # The Rust quality gate runs on the default (no-GPU) feature set with plain
+  # cargo, so fmt/clippy/test stay fast and independent of the nix build.
   rust:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Format check
-        run: cargo fmt --all --check
-
-      - name: Clippy (warnings = errors)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
