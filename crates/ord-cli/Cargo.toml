@@ -1,0 +1,16 @@
+[package]
+name = "ord-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "open-recorder CLI (ord): control the daemon over its socket"
+
+[[bin]]
+name = "ord"
+path = "src/main.rs"
+
+[dependencies]
+ord-common.workspace = true
+thiserror.workspace = true

@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/ord-common",
     "crates/ord-core",
+    "crates/ord-daemon",
+    "crates/ord-cli",
 ]
 # The Phase-1 spike is a throwaway with heavy GPU/CUDA deps; keep it out of the
 # workspace so the testable core builds with plain cargo (and in CI without a GPU).
@@ -22,3 +24,4 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1"
 thiserror = "2"
 ord-common = { path = "crates/ord-common" }
+ord-core = { path = "crates/ord-core" }

@@ -1090,6 +1090,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "ord-cli"
+version = "0.1.0"
+dependencies = [
+ "ord-common",
+ "thiserror",
+]
+
+[[package]]
 name = "ord-common"
 version = "0.1.0"
 dependencies = [
@@ -1107,6 +1115,15 @@ dependencies = [
  "ord-common",
  "thiserror",
  "waycap-rs",
+]
+
+[[package]]
+name = "ord-daemon"
+version = "0.1.0"
+dependencies = [
+ "ord-common",
+ "ord-core",
+ "thiserror",
 ]
 
 [[package]]
