@@ -180,6 +180,9 @@ pub struct Player {
     render_gl: bool,
     /// Display dims of the most recent frame (for aspect-fit), either path.
     frame_size: Option<[usize; 2]>,
+    /// True while a freshly-seeked frame hasn't been displayed yet. Drives
+    /// repaints when paused so a scrub/seek shows promptly, then we go idle.
+    needs_frame: bool,
     shown_pts: f64,
     duration: f64,
     fps: f64,
@@ -260,6 +263,7 @@ impl Player {
             gl_pending: Arc::new(Mutex::new(None)),
             render_gl,
             frame_size: None,
+            needs_frame: true,
             shown_pts: -1.0,
             duration,
             fps,
@@ -357,6 +361,8 @@ impl Player {
         *self.shared.seek_base.lock().unwrap() = t;
         self.shared.samples_played.store(0, Ordering::Relaxed);
         *self.shared.seek_to.lock().unwrap() = Some(t);
+        // Drive repaints until the seeked frame is shown (then we idle if paused).
+        self.needs_frame = true;
         if !self.has_audio() {
             let playing = self.is_playing();
             *self.shared.play_anchor.lock().unwrap() = playing.then(Instant::now);
@@ -453,11 +459,16 @@ impl Player {
                     }
                 }
                 self.shown_pts = pts;
+                self.needs_frame = false;
             }
         }
 
-        // Keep polling so playback advances and post-seek frames appear.
-        ctx.request_repaint_after(Duration::from_millis(16));
+        // Only drive continuous repaints while playing or while a seeked frame is
+        // still pending; otherwise stay reactive so a paused/idle (or hidden)
+        // editor doesn't render at 60fps for nothing.
+        if self.is_playing() || self.needs_frame {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
         if self.render_gl {
             if self.gl_pending.lock().unwrap().is_some() {
                 PreviewFrame::Gl
@@ -540,6 +551,16 @@ fn build_audio_stream(shared: &Arc<Shared>) -> Result<(cpal::Stream, u32, u16), 
         .build_output_stream(
             &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                // `playing` is authoritative: when paused, output silence and do
+                // NOT drain the buffer or advance the clock. cpal's stream.pause()
+                // is a no-op on some hosts (ALSA/PipeWire `snd_pcm_pause` is often
+                // unsupported), so without this gate the stream keeps draining on
+                // open and the editor "auto-plays". Gating here makes paused mean
+                // paused regardless of backend pause support.
+                if !shared_cb.playing.load(Ordering::Acquire) {
+                    data.iter_mut().for_each(|s| *s = 0.0);
+                    return;
+                }
                 let vol = *shared_cb.volume.lock().unwrap();
                 let mut buf = shared_cb.audio_buf.lock().unwrap();
                 let mut consumed = 0u64;

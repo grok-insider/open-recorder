@@ -8,7 +8,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
@@ -69,6 +71,11 @@ pub struct LibraryApp {
     watchdog: crate::diag::Watchdog,
     /// One-shot: honor `ORD_OPEN=<clip>` (debug) to open straight into the editor.
     auto_open_tried: bool,
+    /// Window focus tracking, to pause + idle when hidden (e.g. special workspace
+    /// toggled away). `visible` is shared with the loader thread so it doesn't
+    /// drive repaints while hidden.
+    was_focused: bool,
+    visible: Arc<AtomicBool>,
 }
 
 impl LibraryApp {
@@ -93,6 +100,8 @@ impl LibraryApp {
             editor: None,
             watchdog: crate::diag::Watchdog::start(std::time::Duration::from_secs(4)),
             auto_open_tried: false,
+            was_focused: true,
+            visible: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -113,22 +122,31 @@ impl LibraryApp {
         let clips = self.clips.clone();
         let tx = self.loader_tx.clone();
         let ctx = ctx.clone();
+        let visible = Arc::clone(&self.visible);
         self.loading = true;
         std::thread::spawn(move || {
+            // Only nudge a repaint when the window is visible; while hidden the
+            // data is still queued and gets drained/shown on the next re-show, so
+            // a hidden, loading library doesn't drive (blocking-on-hidden) renders.
+            let repaint = |ctx: &egui::Context| {
+                if visible.load(Ordering::Relaxed) {
+                    ctx.request_repaint();
+                }
+            };
             for clip in clips {
                 let meta = meta::load_meta(&clip.path);
                 let _ = tx.send(Loaded::Meta {
                     path: clip.path.clone(),
                     meta,
                 });
-                ctx.request_repaint();
+                repaint(&ctx);
                 if let Some(thumb) = meta::ensure_thumbnail(&clip.path) {
                     if let Some(image) = decode_image(&thumb) {
                         let _ = tx.send(Loaded::Thumb {
                             path: clip.path.clone(),
                             image,
                         });
-                        ctx.request_repaint();
+                        repaint(&ctx);
                     }
                 }
             }
@@ -286,6 +304,24 @@ impl eframe::App for LibraryApp {
         }
         self.drain_channels(ctx);
 
+        // Pause + idle when our window isn't focused (e.g. its Hyprland special
+        // workspace was toggled away). Pausing stops audio playing into a hidden
+        // window; going reactive (no repaint requests here) lets eframe answer
+        // compositor pings so it can't be flagged "not responding". `visible`
+        // also stops the loader thread from driving repaints while hidden.
+        let focused = ctx.input(|i| i.focused);
+        self.visible.store(focused, Ordering::Relaxed);
+        if focused != self.was_focused {
+            self.was_focused = focused;
+            if !focused {
+                if let Some(ed) = self.editor.as_mut() {
+                    ed.pause_player();
+                }
+            } else {
+                ctx.request_repaint(); // redraw once on re-show
+            }
+        }
+
         // Debug: ORD_OPEN=<path> opens straight into the editor (skips the grid),
         // for screenshotting/validating the preview render path.
         if !self.auto_open_tried {
@@ -373,7 +409,9 @@ impl eframe::App for LibraryApp {
                     });
                     ui.add_space(4.0);
                 });
-                ctx.request_repaint_after(Duration::from_millis(500));
+                if focused {
+                    ctx.request_repaint_after(Duration::from_millis(500));
+                }
             } else {
                 self.status = None;
             }
@@ -583,6 +621,14 @@ pub fn run(clips_dir: PathBuf) -> eframe::Result<()> {
             .with_title("open-recorder")
             .with_inner_size([920.0, 640.0])
             .with_min_inner_size([420.0, 320.0]),
+        // Disable vsync so eframe's swap_buffers never BLOCKS waiting for a frame
+        // callback. On Wayland a hidden surface (e.g. this window's Hyprland
+        // special workspace toggled away) stops getting frame callbacks, so a
+        // blocking swap freezes the winit thread → it can't answer the xdg ping →
+        // the compositor shows "Application Not Responding". DontWait avoids the
+        // block. No tearing results: Hyprland composites windowed surfaces with
+        // its own vsync, and we still self-cap repaints to ~60fps.
+        vsync: false,
         ..Default::default()
     };
     eframe::run_native(
