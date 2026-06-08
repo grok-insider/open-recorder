@@ -53,7 +53,23 @@ fn make_writer() -> ClipWriter {
 #[cfg(feature = "waycap")]
 fn make_engine() -> Engine<ord_core::waycap_backend::WaycapBackend> {
     use ord_core::waycap_backend::{Quality, WaycapBackend};
-    Engine::new(WaycapBackend::new(Quality::High, FPS), BUFFER_SECONDS)
+    Engine::new(
+        WaycapBackend::new(Quality::High, FPS).with_restore_token_path(restore_token_path()),
+        BUFFER_SECONDS,
+    )
+}
+
+/// Where the XDG screencast restore token is cached, so the daemon skips the
+/// "Select what to share" picker after the first authorized run.
+#[cfg(feature = "waycap")]
+fn restore_token_path() -> PathBuf {
+    let base = std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            PathBuf::from(home).join(".local/state")
+        });
+    base.join("open-recorder/portal-restore-token")
 }
 
 #[cfg(not(feature = "waycap"))]

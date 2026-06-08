@@ -63,6 +63,13 @@ nix profile install github:0xfell/open-recorder   # all of: ord, ordd, ord-hud, 
 Runtime needs the NVIDIA driver (`/run/opengl-driver`, present on any NixOS
 NVIDIA host) and a Wayland session with a working screencast portal.
 
+**Skip the picker after the first run:** the first time `ordd` captures, the
+screencast portal shows "Select what to share" — pick your monitor and **tick
+"Allow a restore token"**, then Share. `ordd` saves the granted token to
+`$XDG_STATE_HOME/open-recorder/portal-restore-token` and reuses it on every
+later start, so the picker never appears again. (Without the restore-token tick
+the portal re-prompts each start.)
+
 ## Build from source
 
 ```sh
