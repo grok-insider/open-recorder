@@ -6,12 +6,37 @@
 
 use std::path::PathBuf;
 
+use ord_common::config::Config;
 use ord_core::{Engine, PreparedClip};
 use ord_daemon::handler::ClipWriter;
 use ord_daemon::{serve, server::bind, socket_path, Handler};
 
-const BUFFER_SECONDS: u32 = 60;
-const FPS: u32 = 60;
+/// Load the user config, writing a default file on first run. `ord-common` is
+/// I/O-free, so the file read/parse lives here in the binary.
+fn load_config() -> Config {
+    let path = ord_common::config::default_config_path();
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match Config::from_toml_str(&s) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "ordd: invalid config at {} ({e}); using defaults",
+                    path.display()
+                );
+                Config::default()
+            }
+        },
+        Err(_) => {
+            // No config yet: drop a default one so it is discoverable/editable.
+            let c = Config::default();
+            if let (Some(parent), Ok(toml)) = (path.parent(), c.to_toml_string()) {
+                let _ = std::fs::create_dir_all(parent);
+                let _ = std::fs::write(&path, toml);
+            }
+            c
+        }
+    }
+}
 
 fn clips_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -50,13 +75,28 @@ fn make_writer() -> ClipWriter {
     })
 }
 
+/// Map the on-disk quality enum onto the waycap backend's preset.
 #[cfg(feature = "waycap")]
-fn make_engine() -> Engine<ord_core::waycap_backend::WaycapBackend> {
-    use ord_core::waycap_backend::{Quality, WaycapBackend};
-    Engine::new(
-        WaycapBackend::new(Quality::High, FPS).with_restore_token_path(restore_token_path()),
-        BUFFER_SECONDS,
-    )
+fn map_quality(q: ord_common::config::Quality) -> ord_core::waycap_backend::Quality {
+    use ord_common::config::Quality as C;
+    use ord_core::waycap_backend::Quality as W;
+    match q {
+        C::Low => W::Low,
+        C::Medium => W::Medium,
+        C::High => W::High,
+        C::Ultra => W::Ultra,
+    }
+}
+
+#[cfg(feature = "waycap")]
+fn make_engine(config: &Config) -> Engine<ord_core::waycap_backend::WaycapBackend> {
+    use ord_core::waycap_backend::WaycapBackend;
+    // Mic mixing needs the waycap-rs fork (pending); for now `desktop` drives the
+    // single desktop-monitor track.
+    let backend = WaycapBackend::new(map_quality(config.capture.quality), config.capture.fps)
+        .with_audio(config.audio.desktop)
+        .with_restore_token_path(restore_token_path());
+    Engine::new(backend, config.capture.buffer_seconds)
 }
 
 /// Where the XDG screencast restore token is cached, so the daemon skips the
@@ -73,18 +113,18 @@ fn restore_token_path() -> PathBuf {
 }
 
 #[cfg(not(feature = "waycap"))]
-fn make_engine() -> Engine<ord_core::MockBackend> {
+fn make_engine(config: &Config) -> Engine<ord_core::MockBackend> {
     // Dev daemon: a long mock capture so the socket/CLI can be exercised.
-    Engine::new(
-        ord_core::MockBackend::new(FPS, FPS * BUFFER_SECONDS, FPS),
-        BUFFER_SECONDS,
-    )
+    let fps = config.capture.fps;
+    let buffer = config.capture.buffer_seconds;
+    Engine::new(ord_core::MockBackend::new(fps, fps * buffer, fps), buffer)
 }
 
 fn main() {
     let path = socket_path();
+    let config = load_config();
 
-    let mut engine = make_engine();
+    let mut engine = make_engine(&config);
     if let Err(e) = engine.start() {
         eprintln!("ordd: failed to start capture: {e}");
         std::process::exit(1);
