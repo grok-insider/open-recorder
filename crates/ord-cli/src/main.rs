@@ -10,6 +10,8 @@ use std::process::ExitCode;
 
 use ord_common::{read_frame, write_frame, ClipDuration, Command, Event};
 
+mod export_cmd;
+
 fn socket_path() -> PathBuf {
     let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(dir).join("open-recorder.sock")
@@ -23,7 +25,8 @@ fn usage() -> &'static str {
        ord record            toggle manual recording\n  \
        ord status            show daemon status\n  \
        ord buffer on|off     enable/disable the replay buffer\n  \
-       ord subscribe         stream daemon events (for the HUD)\n"
+       ord subscribe         stream daemon events (for the HUD)\n  \
+       ord export <in> ...   transcode/trim a clip (see `ord export --help`)\n"
 }
 
 fn parse() -> Result<Command, String> {
@@ -99,6 +102,15 @@ fn render(event: Event) -> String {
 }
 
 fn run() -> Result<(), String> {
+    // `export` is a local operation (transcode a file), not a daemon command, so
+    // handle it before any socket connection.
+    let mut top = std::env::args().skip(1);
+    if let Some(first) = top.next() {
+        if first == "export" {
+            return export_cmd::run_export(top);
+        }
+    }
+
     let cmd = parse()?;
     let path = socket_path();
     let mut stream = UnixStream::connect(&path).map_err(|e| {

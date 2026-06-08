@@ -13,4 +13,5 @@ path = "src/main.rs"
 
 [dependencies]
 ord-common.workspace = true
+ord-export.workspace = true
 thiserror.workspace = true
