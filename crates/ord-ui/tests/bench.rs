@@ -97,6 +97,7 @@ fn bench_player_decode_and_seek() {
     let mut cases: Vec<(String, PathBuf, bool, Option<&str>)> = Vec::new();
     if let Some(c) = real {
         cases.push(("real[nvdec]".to_string(), c.clone(), false, Some("nvdec")));
+        cases.push(("real[gl]".to_string(), c.clone(), false, Some("gl")));
         cases.push(("real[sw]".to_string(), c, false, Some("sw")));
     }
     for &(w, h, fps) in &[(1280u32, 720u32, 60u32), (1920, 1080, 60), (2560, 1440, 60)] {

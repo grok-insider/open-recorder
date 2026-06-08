@@ -92,6 +92,45 @@ struct VideoFrame {
     pts: f64,
 }
 
+/// A queued preview frame: CPU RGBA (default render path → egui texture) or NV12
+/// planes (GPU shader render path). Both carry a presentation time.
+enum Frame {
+    Rgba(VideoFrame),
+    Nv12(crate::glvideo::Nv12),
+}
+
+impl Frame {
+    fn pts(&self) -> f64 {
+        match self {
+            Frame::Rgba(f) => f.pts,
+            Frame::Nv12(f) => f.pts,
+        }
+    }
+    fn size(&self) -> [usize; 2] {
+        match self {
+            Frame::Rgba(f) => [f.width, f.height],
+            Frame::Nv12(f) => [f.w, f.h],
+        }
+    }
+}
+
+/// What [`Player::frame`] wants the editor to draw this repaint.
+pub enum PreviewFrame {
+    /// Nothing decoded yet.
+    None,
+    /// CPU path: draw this egui texture (cheap clone of an `Arc`).
+    Texture(egui::TextureHandle),
+    /// GPU path: draw via [`Player::gl_callback`] (NV12 → RGB shader).
+    Gl,
+}
+
+impl PreviewFrame {
+    /// True once there's something to draw (texture or GPU frame).
+    pub fn is_some(&self) -> bool {
+        !matches!(self, PreviewFrame::None)
+    }
+}
+
 /// State shared between the UI, the decode thread, and the audio callback.
 struct Shared {
     playing: AtomicBool,
@@ -117,7 +156,7 @@ struct Shared {
     /// Wall-clock anchor used as the master clock when there is no audio.
     play_anchor: Mutex<Option<Instant>>,
     audio_buf: Mutex<VecDeque<f32>>,
-    frames: Mutex<VecDeque<VideoFrame>>,
+    frames: Mutex<VecDeque<Frame>>,
 }
 
 impl Shared {
@@ -135,9 +174,25 @@ pub struct Player {
     _stream: Option<cpal::Stream>,
     decode_thread: Option<JoinHandle<()>>,
     texture: Option<egui::TextureHandle>,
+    /// GPU render path: the latest NV12 frame for the paint callback.
+    gl_pending: Arc<Mutex<Option<crate::glvideo::Nv12>>>,
+    /// Whether this player uses the GPU NV12 shader render path.
+    render_gl: bool,
+    /// Display dims of the most recent frame (for aspect-fit), either path.
+    frame_size: Option<[usize; 2]>,
     shown_pts: f64,
     duration: f64,
     fps: f64,
+}
+
+/// True when the GPU NV12 shader render path is requested (`ORD_RENDER=gl` or
+/// `ORD_DECODE=gl|zerocopy`). Default is the CPU RGBA path.
+fn render_gl_enabled() -> bool {
+    matches!(std::env::var("ORD_RENDER").as_deref(), Ok("gl"))
+        || matches!(
+            std::env::var("ORD_DECODE").as_deref(),
+            Ok("gl") | Ok("zerocopy")
+        )
 }
 
 impl Player {
@@ -187,12 +242,13 @@ impl Player {
             None
         };
 
+        let render_gl = render_gl_enabled();
         let decode_thread = {
             let shared = Arc::clone(&shared);
             let path = PathBuf::from(path);
             std::thread::Builder::new()
                 .name("ord-preview-decode".into())
-                .spawn(move || decode_loop(path, shared))
+                .spawn(move || decode_loop(path, shared, render_gl))
                 .map_err(|e| e.to_string())?
         };
 
@@ -201,10 +257,23 @@ impl Player {
             _stream: stream,
             decode_thread: Some(decode_thread),
             texture: None,
+            gl_pending: Arc::new(Mutex::new(None)),
+            render_gl,
+            frame_size: None,
             shown_pts: -1.0,
             duration,
             fps,
         })
+    }
+
+    /// Display size (w, h) of the current preview frame, for aspect-fit.
+    pub fn video_size(&self) -> Option<[usize; 2]> {
+        self.frame_size
+    }
+
+    /// Build the GPU paint callback for the current NV12 frame over `rect`.
+    pub fn gl_callback(&self, rect: egui::Rect) -> egui::PaintCallback {
+        crate::glvideo::paint_callback(rect, Arc::clone(&self.gl_pending))
     }
 
     pub fn duration(&self) -> f64 {
@@ -335,7 +404,7 @@ impl Player {
 
     /// Advance one UI frame: enforce the loop range, pick the video frame for the
     /// current clock, and return the texture to draw. Call every repaint.
-    pub fn frame(&mut self, ctx: &egui::Context) -> Option<&egui::TextureHandle> {
+    pub fn frame(&mut self, ctx: &egui::Context) -> PreviewFrame {
         // Loop / stop at the out-point when playing the selection.
         if self.is_playing() {
             let (in_s, out_s) = self.shared.range();
@@ -351,32 +420,55 @@ impl Player {
 
         let pos = self.position();
         // Pick the newest decoded frame at or before the clock.
-        let mut chosen: Option<VideoFrame> = None;
+        let mut chosen: Option<Frame> = None;
         {
             let mut q = self.shared.frames.lock().unwrap();
-            while q.front().map(|f| f.pts <= pos + 0.005).unwrap_or(false) {
+            while q.front().map(|f| f.pts() <= pos + 0.005).unwrap_or(false) {
                 chosen = q.pop_front();
             }
             // Right after a seek the queue may only hold frames slightly ahead;
             // show the closest upcoming one so a paused scrub isn't blank.
-            if chosen.is_none() && self.texture.is_none() {
-                if let Some(f) = q.pop_front() {
-                    chosen = Some(f);
-                }
+            if chosen.is_none() && self.shown_pts < 0.0 {
+                chosen = q.pop_front();
             }
         }
         if let Some(f) = chosen {
-            if (f.pts - self.shown_pts).abs() > f64::EPSILON {
-                let img = egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.rgba);
-                self.texture =
-                    Some(ctx.load_texture("editor-preview", img, egui::TextureOptions::LINEAR));
-                self.shown_pts = f.pts;
+            let pts = f.pts();
+            if (pts - self.shown_pts).abs() > f64::EPSILON {
+                self.frame_size = Some(f.size());
+                match f {
+                    Frame::Rgba(vf) => {
+                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                            [vf.width, vf.height],
+                            &vf.rgba,
+                        );
+                        self.texture = Some(ctx.load_texture(
+                            "editor-preview",
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                    Frame::Nv12(nv) => {
+                        *self.gl_pending.lock().unwrap() = Some(nv);
+                    }
+                }
+                self.shown_pts = pts;
             }
         }
 
         // Keep polling so playback advances and post-seek frames appear.
         ctx.request_repaint_after(Duration::from_millis(16));
-        self.texture.as_ref()
+        if self.render_gl {
+            if self.gl_pending.lock().unwrap().is_some() {
+                PreviewFrame::Gl
+            } else {
+                PreviewFrame::None
+            }
+        } else if let Some(t) = &self.texture {
+            PreviewFrame::Texture(t.clone())
+        } else {
+            PreviewFrame::None
+        }
     }
 }
 
@@ -474,8 +566,10 @@ fn build_audio_stream(shared: &Arc<Shared>) -> Result<(cpal::Stream, u32, u16), 
     Ok((stream, rate, channels))
 }
 
-/// The decode thread: demux + decode video/audio, honoring seek/stop/loop.
-fn decode_loop(path: PathBuf, shared: Arc<Shared>) {
+/// The decode thread: demux + decode video/audio, honoring seek/stop/loop. When
+/// `render_gl` is set, video frames are produced as NV12 (for the GPU shader);
+/// otherwise as RGBA (for the egui texture path).
+fn decode_loop(path: PathBuf, shared: Arc<Shared>, render_gl: bool) {
     let Ok(mut ictx) = ff::format::input(&path) else {
         return;
     };
@@ -503,9 +597,10 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>) {
     };
     shared.dec_kind.store(kind.as_u8(), Ordering::Relaxed);
 
-    // Preview RGBA scaler, built lazily from the FIRST decoded frame: cuvid only
-    // reports its real output format/size after the first frame, and software
-    // frames are source-sized so we cap width here. Lazy init handles both.
+    // Preview scaler, built lazily from the FIRST decoded frame (cuvid only
+    // reports its real output format/size after the first frame; software frames
+    // are source-sized so we cap width here). Targets RGBA (CPU path) or NV12
+    // (GPU path). Skipped entirely when cuvid already gives preview-sized NV12.
     let mut scaler: Option<ff::software::scaling::context::Context> = None;
 
     // Audio decoder + resampler to the device's F32 format.
@@ -589,41 +684,18 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>) {
                     let pts =
                         frame.pts().or_else(|| frame.timestamp()).unwrap_or(0) as f64 * video_tb;
 
-                    // Build the preview scaler from the first real frame (cap to
-                    // preview width, keep aspect, even dims).
-                    if scaler.is_none() {
-                        let inw = frame.width();
-                        let inh = frame.height();
-                        let out_w = inw.clamp(2, PREVIEW_MAX_W) & !1;
-                        let out_h =
-                            (((inh as u64 * out_w as u64) / inw.max(1) as u64) as u32).max(2) & !1;
-                        scaler = ff::software::scaling::context::Context::get(
-                            frame.format(),
-                            inw,
-                            inh,
-                            ff::format::Pixel::RGBA,
-                            out_w,
-                            out_h,
-                            ff::software::scaling::flag::Flags::LANCZOS,
-                        )
-                        .ok();
-                    }
-                    let Some(sc) = scaler.as_mut() else { continue };
-
-                    // Skip the scale+pack entirely when the queue is full — we'd
-                    // only drop the result. (We still drained `receive_frame`, so
-                    // the decoder keeps flowing for audio.) This removes the
-                    // wasted CPU that showed up as a huge `drop` count.
+                    // Skip convert+pack when the queue is full — we'd only drop
+                    // the result. (We still drained `receive_frame`, so the
+                    // decoder keeps flowing.) Pacing makes this rare; it's a
+                    // safety valve against bursts.
                     if shared.frames.lock().unwrap().len() >= VIDEO_QUEUE_MAX {
                         shared.dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
 
-                    let mut rgba = ff::frame::Video::empty();
-                    if sc.run(&frame, &mut rgba).is_ok() {
-                        let vf = pack_rgba(&rgba, pts);
+                    if let Some(f) = make_frame(&frame, &mut scaler, render_gl, pts) {
                         shared.decoded.fetch_add(1, Ordering::Relaxed);
-                        shared.frames.lock().unwrap().push_back(vf);
+                        shared.frames.lock().unwrap().push_back(f);
                     }
                 }
             }
@@ -741,6 +813,102 @@ fn open_cuvid(
 
     let opened = ctx.decoder().open_as_with(codec, opts).ok()?;
     opened.video().ok()
+}
+
+/// Convert one decoded video frame into a queued [`Frame`]: NV12 (GPU path) or
+/// RGBA (CPU path), scaled to preview width. cuvid already emits preview-sized
+/// NV12, so the GPU path packs it directly with no swscale.
+fn make_frame(
+    frame: &ff::frame::Video,
+    scaler: &mut Option<ff::software::scaling::context::Context>,
+    render_gl: bool,
+    pts: f64,
+) -> Option<Frame> {
+    let (full_range, bt601) = color_flags(frame);
+
+    // Fast path: GPU render + cuvid's native NV12 → pack planes directly.
+    if render_gl && frame.format() == ff::format::Pixel::NV12 {
+        return Some(Frame::Nv12(pack_nv12(frame, pts, full_range, bt601)));
+    }
+
+    // Otherwise swscale to the target format at preview width (built lazily).
+    if scaler.is_none() {
+        let inw = frame.width();
+        let inh = frame.height();
+        let out_w = inw.clamp(2, PREVIEW_MAX_W) & !1;
+        let out_h = (((inh as u64 * out_w as u64) / inw.max(1) as u64) as u32).max(2) & !1;
+        let dst = if render_gl {
+            ff::format::Pixel::NV12
+        } else {
+            ff::format::Pixel::RGBA
+        };
+        *scaler = ff::software::scaling::context::Context::get(
+            frame.format(),
+            inw,
+            inh,
+            dst,
+            out_w,
+            out_h,
+            ff::software::scaling::flag::Flags::LANCZOS,
+        )
+        .ok();
+    }
+    let sc = scaler.as_mut()?;
+    let mut out = ff::frame::Video::empty();
+    sc.run(frame, &mut out).ok()?;
+    if render_gl {
+        Some(Frame::Nv12(pack_nv12(&out, pts, full_range, bt601)))
+    } else {
+        Some(Frame::Rgba(pack_rgba(&out, pts)))
+    }
+}
+
+/// Read colour range/matrix from a decoded frame (defaults: limited-range BT.709,
+/// the norm for our HD captures, when the stream leaves them unspecified).
+fn color_flags(frame: &ff::frame::Video) -> (bool, bool) {
+    let full_range = frame.color_range() == ff::util::color::Range::JPEG;
+    let bt601 = matches!(
+        frame.color_space(),
+        ff::util::color::Space::BT470BG | ff::util::color::Space::SMPTE170M
+    );
+    (full_range, bt601)
+}
+
+/// Copy an NV12 frame's Y and interleaved-UV planes into tight (unpadded) buffers.
+fn pack_nv12(
+    src: &ff::frame::Video,
+    pts: f64,
+    full_range: bool,
+    bt601: bool,
+) -> crate::glvideo::Nv12 {
+    let w = src.width() as usize;
+    let h = src.height() as usize;
+
+    let ys = src.stride(0);
+    let yd = src.data(0);
+    let mut y = vec![0u8; w * h];
+    for r in 0..h {
+        y[r * w..(r + 1) * w].copy_from_slice(&yd[r * ys..r * ys + w]);
+    }
+
+    // NV12 chroma: h/2 rows of w bytes (w/2 interleaved Cb,Cr pairs).
+    let ch = h / 2;
+    let us = src.stride(1);
+    let ud = src.data(1);
+    let mut uv = vec![0u8; w * ch];
+    for r in 0..ch {
+        uv[r * w..(r + 1) * w].copy_from_slice(&ud[r * us..r * us + w]);
+    }
+
+    crate::glvideo::Nv12 {
+        w,
+        h,
+        y,
+        uv,
+        pts,
+        full_range,
+        bt601,
+    }
 }
 
 /// Copy a scaled RGBA frame into a tight (no row padding) buffer.

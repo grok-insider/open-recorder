@@ -67,6 +67,8 @@ pub struct LibraryApp {
     /// When `Some`, the trim editor is shown instead of the library grid.
     editor: Option<EditorState>,
     watchdog: crate::diag::Watchdog,
+    /// One-shot: honor `ORD_OPEN=<clip>` (debug) to open straight into the editor.
+    auto_open_tried: bool,
 }
 
 impl LibraryApp {
@@ -90,6 +92,7 @@ impl LibraryApp {
             loading: false,
             editor: None,
             watchdog: crate::diag::Watchdog::start(std::time::Duration::from_secs(4)),
+            auto_open_tried: false,
         }
     }
 
@@ -282,6 +285,24 @@ impl eframe::App for LibraryApp {
             self.styled = true;
         }
         self.drain_channels(ctx);
+
+        // Debug: ORD_OPEN=<path> opens straight into the editor (skips the grid),
+        // for screenshotting/validating the preview render path.
+        if !self.auto_open_tried {
+            self.auto_open_tried = true;
+            if let Ok(path) = std::env::var("ORD_OPEN") {
+                let path = PathBuf::from(path);
+                if path.is_file() {
+                    let label = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if let Ok(ed) = EditorState::new(path, label, ctx) {
+                        self.editor = Some(ed);
+                    }
+                }
+            }
+        }
 
         // Trim editor takes over the whole window when open.
         if self.editor.is_some() {
