@@ -5,9 +5,11 @@
 //! filmstrip and markers, keyboard shortcuts, and an "Export selection" that
 //! hands the trim to `ord-export`.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 use ord_export::{Preset, Trim};
@@ -50,6 +52,8 @@ pub struct EditorState {
     drag: Option<Drag>,
     strip_rx: Receiver<(usize, egui::ColorImage)>,
     strip: Vec<Option<egui::TextureHandle>>,
+    debug: bool,
+    dbg_log_at: Instant,
 }
 
 impl EditorState {
@@ -71,6 +75,8 @@ impl EditorState {
             drag: None,
             strip_rx,
             strip: vec![None; FILMSTRIP_TILES],
+            debug: std::env::var("ORD_DEBUG").is_ok(),
+            dbg_log_at: Instant::now(),
         })
     }
 
@@ -140,6 +146,10 @@ impl EditorState {
             .show(ctx, |ui| {
                 self.preview_ui(ui, ctx);
             });
+
+        if self.debug {
+            self.debug_tick(ctx);
+        }
 
         action
     }
@@ -223,8 +233,51 @@ impl EditorState {
         if mkey {
             self.markers.push(ph);
         }
+        if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
+            self.debug = !self.debug;
+        }
         let _ = &mut action;
         action
+    }
+
+    /// Debug overlay + throttled log to `/tmp/ord-ui-debug.log` (toggle: F3 or
+    /// the `ORD_DEBUG` env var). Surfaces clock vs audio-buffer vs queue state so
+    /// A/V-sync and decode/throughput issues are visible.
+    fn debug_tick(&mut self, ctx: &egui::Context) {
+        let s = self.player.stats();
+        let dur = self.player.duration();
+        let fps = self.player.fps();
+        egui::Area::new(egui::Id::new("ord-debug"))
+            .fixed_pos(egui::pos2(14.0, 60.0))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.monospace(format!(
+                        "pos {:.2}/{:.2}  audio:{}  play:{}",
+                        s.position, dur, s.has_audio, s.playing
+                    ));
+                    ui.monospace(format!(
+                        "abuf {:.0}ms  vq {}  dec {}  drop {}",
+                        s.audio_buf_ms, s.frames_queued, s.decoded, s.dropped
+                    ));
+                    ui.monospace(format!("src_fps {fps:.2}  zoom {:.1}", self.zoom));
+                    ui.monospace("F3: toggle debug");
+                });
+            });
+
+        if self.dbg_log_at.elapsed() >= Duration::from_millis(1000) {
+            self.dbg_log_at = Instant::now();
+            let line = format!(
+                "[ord-ui] pos={:.2} dur={:.2} audio={} play={} abuf_ms={:.0} vq={} dec={} drop={}\n",
+                s.position, dur, s.has_audio, s.playing, s.audio_buf_ms, s.frames_queued, s.decoded, s.dropped
+            );
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/ord-ui-debug.log")
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
     }
 
     fn preview_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
