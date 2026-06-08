@@ -53,27 +53,16 @@ fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {
     }
 }
 
-fn main() {
-    let path = socket_path();
-    let mut stream = match UnixStream::connect(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("ord-hud: cannot reach ordd at {} ({e})", path.display());
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = write_frame(&mut stream, &Command::Subscribe.encode().unwrap()) {
-        eprintln!("ord-hud: subscribe failed: {e}");
-        std::process::exit(1);
-    }
-
+/// Connect to the daemon and subscribe, returning a receiver of events. The
+/// reader thread ends (dropping the sender) when the daemon disconnects.
+fn subscribe(path: &PathBuf) -> Option<mpsc::Receiver<Event>> {
+    let mut stream = UnixStream::connect(path).ok()?;
+    write_frame(&mut stream, &Command::Subscribe.encode().ok()?).ok()?;
+    let (tx, rx) = mpsc::channel::<Event>();
     // Read events on a background thread; the main thread owns the Wayland
     // connection and renders (Wayland client objects are not Send).
-    let (tx, rx) = mpsc::channel::<Event>();
     std::thread::spawn(move || {
         let mut s = stream;
-        // Reads frames until the daemon closes (read_frame Err) or the main
-        // thread drops the receiver (send Err). Dropping tx signals EOF.
         while let Ok(bytes) = read_frame(&mut s) {
             if let Ok(ev) = Event::decode(&bytes) {
                 if tx.send(ev).is_err() {
@@ -82,7 +71,14 @@ fn main() {
             }
         }
     });
+    Some(rx)
+}
 
+fn main() {
+    let path = socket_path();
+
+    // The overlay is created once and persists for the whole process; only the
+    // daemon connection is re-established. A missing overlay is fatal.
     let mut overlay = LayerShellOverlay::new();
     if let Err(e) = overlay.create() {
         eprintln!("ord-hud: overlay unavailable: {e}");
@@ -93,21 +89,40 @@ fn main() {
     let start = Instant::now();
     let now_ms = || start.elapsed().as_millis() as u64;
 
+    // Outer loop: (re)connect to ordd and stream its events. The daemon restarts
+    // on every rebuild, so the HUD must survive a dropped connection by
+    // reconnecting rather than exiting (which systemd's on-failure would ignore).
     loop {
-        // Drain any pending events; stop the HUD if the daemon disconnected.
-        let mut disconnected = false;
-        while let Ok(ev) = rx.try_recv() {
-            apply(&mut hud, &ev, now_ms());
+        let Some(rx) = subscribe(&path) else {
+            // Daemon not up yet; keep the overlay alive and retry shortly.
+            hud.tick(now_ms());
+            overlay.render(&hud);
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+
+        // Inner loop: render + drain events until the daemon disconnects.
+        loop {
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(ev) => apply(&mut hud, &ev, now_ms()),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            if disconnected {
+                break; // reconnect, keeping the overlay up
+            }
+            hud.tick(now_ms());
+            overlay.render(&hud);
+            std::thread::sleep(Duration::from_millis(100));
         }
-        if let Err(TryRecvError::Disconnected) = rx.try_recv() {
-            disconnected = true;
-        }
-        if disconnected {
-            overlay.destroy();
-            return;
-        }
-        hud.tick(now_ms());
-        overlay.render(&hud);
-        std::thread::sleep(Duration::from_millis(100));
+
+        // Brief backoff before reconnecting to the (restarting) daemon.
+        std::thread::sleep(Duration::from_millis(500));
     }
 }

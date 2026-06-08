@@ -207,7 +207,9 @@
               };
               Service = {
                 ExecStart = "${cfg.package}/bin/ord-hud";
-                Restart = "on-failure";
+                # The HUD reconnects to ordd internally; `always` also covers a
+                # transient overlay-create failure at session start.
+                Restart = "always";
                 RestartSec = 3;
               };
               Install.WantedBy = [ "graphical-session.target" ];
