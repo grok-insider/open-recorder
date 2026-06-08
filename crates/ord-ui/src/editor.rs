@@ -302,7 +302,7 @@ impl EditorState {
 
             ui.separator();
             let mut looping = self.player.looping();
-            if ui.selectable_label(looping, "🔁 Loop").clicked() {
+            if ui.selectable_label(looping, "↻ Loop").clicked() {
                 looping = !looping;
                 self.player.set_loop(looping);
             }
