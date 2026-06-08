@@ -10,17 +10,22 @@
 //! `CaptureBuilder::build()`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use waycap_rs::pipeline::builder::CaptureBuilder;
-use waycap_rs::types::config::{QualityPreset, VideoEncoder};
+use waycap_rs::types::config::{AudioEncoder, QualityPreset, VideoEncoder};
 use waycap_rs::Capture;
 
-use crate::backend::{BackendError, CaptureBackend, Codec, StreamParams};
+use crate::audio::{AudioCodec, AudioParams, EncodedAudioFrame};
+use crate::backend::{BackendError, CaptureBackend, CaptureStreams, Codec, StreamParams};
 use crate::ring::EncodedFrame;
+
+/// waycap-rs emits Opus at 48 kHz stereo (see its `OpusEncoder`).
+const AUDIO_SAMPLE_RATE: u32 = 48_000;
+const AUDIO_CHANNELS: u16 = 2;
 
 /// Quality knob mapped onto waycap-rs presets.
 #[derive(Debug, Clone, Copy)]
@@ -48,9 +53,11 @@ pub struct WaycapBackend {
     fps: u32,
     width: u32,
     height: u32,
+    audio_enabled: bool,
     restore_token_path: Option<std::path::PathBuf>,
     capture: Option<Capture<waycap_rs::DynamicEncoder>>,
     forwarder: Option<JoinHandle<()>>,
+    audio_forwarder: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
     running: bool,
 }
@@ -58,16 +65,19 @@ pub struct WaycapBackend {
 impl WaycapBackend {
     /// Create a backend (does not start capture or prompt the portal yet). The
     /// width/height are container hints; actual dimensions come from the H.264
-    /// SPS in the stream.
+    /// SPS in the stream. Desktop audio (the default sink monitor) is captured by
+    /// default; toggle with [`with_audio`](Self::with_audio).
     pub fn new(quality: Quality, fps: u32) -> Self {
         Self {
             quality,
             fps,
             width: 2560,
             height: 1440,
+            audio_enabled: true,
             restore_token_path: None,
             capture: None,
             forwarder: None,
+            audio_forwarder: None,
             stop: Arc::new(AtomicBool::new(false)),
             running: false,
         }
@@ -77,6 +87,14 @@ impl WaycapBackend {
     pub fn with_dimensions(mut self, width: u32, height: u32) -> Self {
         self.width = width;
         self.height = height;
+        self
+    }
+
+    /// Enable or disable desktop audio capture (default: enabled). When enabled,
+    /// waycap-rs captures the default sink monitor (game + voice chat playback)
+    /// and encodes it to Opus.
+    pub fn with_audio(mut self, enabled: bool) -> Self {
+        self.audio_enabled = enabled;
         self
     }
 
@@ -91,7 +109,7 @@ impl WaycapBackend {
 }
 
 impl CaptureBackend for WaycapBackend {
-    fn start(&mut self) -> Result<Receiver<EncodedFrame>, BackendError> {
+    fn start(&mut self) -> Result<CaptureStreams, BackendError> {
         if self.running {
             return Err(BackendError::AlreadyRunning);
         }
@@ -111,6 +129,9 @@ impl CaptureBackend for WaycapBackend {
             .with_quality_preset(self.quality.into())
             .with_target_fps(self.fps as u64)
             .with_cursor_shown();
+        if self.audio_enabled {
+            builder = builder.with_audio().with_audio_encoder(AudioEncoder::Opus);
+        }
         if let Some(token) = saved_token {
             builder = builder.with_restore_token(token);
         }
@@ -131,6 +152,16 @@ impl CaptureBackend for WaycapBackend {
         }
 
         let video_recv = capture.get_video_receiver();
+        // Grab the audio receiver before starting so we never miss early frames.
+        let audio_recv = if self.audio_enabled {
+            Some(
+                capture
+                    .get_audio_receiver()
+                    .map_err(|e| BackendError::Init(format!("audio receiver: {e:?}")))?,
+            )
+        } else {
+            None
+        };
         capture
             .start()
             .map_err(|e| BackendError::Init(format!("{e:?}")))?;
@@ -142,8 +173,9 @@ impl CaptureBackend for WaycapBackend {
         // Forward waycap-rs (crossbeam) frames onto our mpsc channel, converting
         // each into our EncodedFrame. Exits when stop is set or either channel
         // closes.
+        let video_stop = Arc::clone(&stop);
         let forwarder = std::thread::spawn(move || {
-            while !stop.load(Ordering::Acquire) {
+            while !video_stop.load(Ordering::Acquire) {
                 match video_recv.recv_timeout(Duration::from_millis(100)) {
                     Ok(f) => {
                         let frame = EncodedFrame::new(f.data, f.is_keyframe, f.pts, f.dts);
@@ -157,10 +189,41 @@ impl CaptureBackend for WaycapBackend {
             }
         });
 
+        // Forward + convert audio. waycap-rs stamps audio frames with a
+        // CLOCK_MONOTONIC **nanosecond** capture time (its field doc saying
+        // "micro seconds" is wrong: it comes from `pw_stream_get_nsec`), the same
+        // clock as the video pts. Our engine correlates A/V in microseconds, so
+        // divide by 1000 here to land in that domain.
+        let audio_out = if let Some(audio_recv) = audio_recv {
+            let (atx, arx) = mpsc::channel();
+            let audio_stop = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                while !audio_stop.load(Ordering::Acquire) {
+                    match audio_recv.recv_timeout(Duration::from_millis(100)) {
+                        Ok(f) => {
+                            let frame = EncodedAudioFrame::new(f.data, f.pts, f.timestamp / 1000);
+                            if atx.send(frame).is_err() {
+                                break;
+                            }
+                        }
+                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            });
+            self.audio_forwarder = Some(handle);
+            Some(arx)
+        } else {
+            None
+        };
+
         self.capture = Some(capture);
         self.forwarder = Some(forwarder);
         self.running = true;
-        Ok(rx)
+        Ok(CaptureStreams {
+            video: rx,
+            audio: audio_out,
+        })
     }
 
     fn stop(&mut self) -> Result<(), BackendError> {
@@ -172,6 +235,9 @@ impl CaptureBackend for WaycapBackend {
             let _ = cap.finish();
         }
         if let Some(handle) = self.forwarder.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.audio_forwarder.take() {
             let _ = handle.join();
         }
         self.capture = None;
@@ -190,6 +256,14 @@ impl CaptureBackend for WaycapBackend {
             codec: Codec::H264,
             time_base_den: crate::backend::NANOS_PER_SEC, // waycap pts are nanoseconds
         }
+    }
+
+    fn audio_params(&self) -> Option<AudioParams> {
+        self.audio_enabled.then_some(AudioParams {
+            sample_rate: AUDIO_SAMPLE_RATE,
+            channels: AUDIO_CHANNELS,
+            codec: AudioCodec::Opus,
+        })
     }
 
     fn is_running(&self) -> bool {
