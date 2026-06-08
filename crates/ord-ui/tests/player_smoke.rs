@@ -55,7 +55,7 @@ fn make_clip() -> PathBuf {
 fn player_decodes_audio_advances_and_seeks() {
     let clip = make_clip();
     let ctx = egui::Context::default();
-    let mut p = Player::open(&clip, &ctx).expect("open player");
+    let mut p = Player::open(&clip).expect("open player");
     p.set_volume(0.0); // don't blip the speakers during the test
     assert!(p.duration() > 0.0, "duration should be known");
     assert!(p.has_audio(), "clip has audio");

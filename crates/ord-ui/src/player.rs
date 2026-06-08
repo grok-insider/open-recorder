@@ -25,9 +25,9 @@ use ffmpeg_next as ff;
 /// Decode preview at most this wide (keeps memory/CPU sane; export is full-res).
 /// 1440 is crisp on a 1440p display while keeping the frame queue bounded.
 const PREVIEW_MAX_W: u32 = 1440;
-/// Bounded look-ahead video queue (frames). ~0.2s at 60fps; smaller because
-/// frames are larger at 1440px (1440x810 RGBA ≈ 4.7 MB each).
-const VIDEO_QUEUE_MAX: usize = 12;
+/// Bounded look-ahead video queue (frames). ~0.27s at 60fps; frames are large at
+/// 1440px (1440x810 RGBA ≈ 4.7 MB each), so this also caps memory (~75 MB).
+const VIDEO_QUEUE_MAX: usize = 16;
 /// Audio look-ahead cap (interleaved f32 samples) ≈ 2s stereo @ 48k.
 const AUDIO_BUF_MAX: usize = 48_000 * 2 * 2;
 
@@ -99,7 +99,7 @@ pub struct Player {
 
 impl Player {
     /// Open `path` and start the decode thread + audio output (paused).
-    pub fn open(path: &Path, ctx: &egui::Context) -> Result<Self, String> {
+    pub fn open(path: &Path) -> Result<Self, String> {
         ff::init().map_err(|e| format!("ffmpeg init: {e}"))?;
         let info = ord_export::probe::probe(path).map_err(|e| e.to_string())?;
         let duration = info.duration_secs.max(0.0);
@@ -145,11 +145,10 @@ impl Player {
 
         let decode_thread = {
             let shared = Arc::clone(&shared);
-            let ctx = ctx.clone();
             let path = PathBuf::from(path);
             std::thread::Builder::new()
                 .name("ord-preview-decode".into())
-                .spawn(move || decode_loop(path, shared, ctx))
+                .spawn(move || decode_loop(path, shared))
                 .map_err(|e| e.to_string())?
         };
 
@@ -423,7 +422,7 @@ fn build_audio_stream(shared: &Arc<Shared>) -> Result<(cpal::Stream, u32, u16), 
 }
 
 /// The decode thread: demux + decode video/audio, honoring seek/stop/loop.
-fn decode_loop(path: PathBuf, shared: Arc<Shared>, ctx: egui::Context) {
+fn decode_loop(path: PathBuf, shared: Arc<Shared>) {
     let Ok(mut ictx) = ff::format::input(&path) else {
         return;
     };
@@ -441,12 +440,23 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>, ctx: egui::Context) {
         .best(ff::media::Type::Audio)
         .map(|s| (s.index(), s.parameters()));
 
-    let mut vdec = match ff::codec::context::Context::from_parameters(video_params)
-        .and_then(|c| c.decoder().video())
-    {
-        Ok(d) => d,
-        Err(_) => return,
-    };
+    // Frame-threaded software decode so 1440p60 keeps up in real time. Cap the
+    // thread count so the UI + audio threads keep cores (avoids the decode
+    // thread pegging every core, which froze the UI → ANR).
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(2, 8))
+        .unwrap_or(4);
+    let mut vdec =
+        match ff::codec::context::Context::from_parameters(video_params).and_then(|mut c| {
+            c.set_threading(ff::codec::threading::Config {
+                kind: ff::codec::threading::Type::Frame,
+                count: decode_threads,
+            });
+            c.decoder().video()
+        }) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
 
     // Preview scale: cap width, keep aspect, even dims.
     let (sw, sh) = (vdec.width(), vdec.height());
@@ -557,7 +567,6 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>, ctx: egui::Context) {
                             q.push_back(vf);
                         }
                         drop(q);
-                        ctx.request_repaint();
                     }
                 }
             }
