@@ -88,23 +88,30 @@ fn bench_player_decode_and_seek() {
         println!("(no real clip found; synthetic only — set ORD_BENCH_CLIP to test one)");
     }
     println!(
-        "{:<14} {:>10} {:>10} {:>8} {:>9} {:>9} {:>11}",
-        "source", "firstframe", "realtime", "decfps", "dropped", "abuf_ms", "seek_avg"
+        "{:<16} {:>8} {:>10} {:>8} {:>9} {:>9} {:>10}",
+        "source[mode]", "decoder", "realtime", "decfps", "dropped", "abuf_ms", "seek_avg"
     );
 
-    let mut cases: Vec<(String, PathBuf, bool)> = Vec::new();
+    // (label, clip, synthetic, ORD_DECODE override). The real clip is run under
+    // BOTH NVDEC and software so we can compare A/B (GPU vs CPU) on real content.
+    let mut cases: Vec<(String, PathBuf, bool, Option<&str>)> = Vec::new();
     if let Some(c) = real {
-        cases.push(("real".to_string(), c, false));
+        cases.push(("real[nvdec]".to_string(), c.clone(), false, Some("nvdec")));
+        cases.push(("real[sw]".to_string(), c, false, Some("sw")));
     }
     for &(w, h, fps) in &[(1280u32, 720u32, 60u32), (1920, 1080, 60), (2560, 1440, 60)] {
-        cases.push((format!("{w}x{h}"), gen_clip(w, h, fps, 6), true));
+        cases.push((format!("{w}x{h}"), gen_clip(w, h, fps, 6), true, None));
     }
 
-    for (label, clip, synthetic) in cases {
+    for (label, clip, synthetic, mode) in cases {
+        match mode {
+            Some(m) => std::env::set_var("ORD_DECODE", m),
+            None => std::env::remove_var("ORD_DECODE"),
+        }
         let mut p = Player::open(&clip).expect("open");
         p.set_volume(0.0);
 
-        let first = wait_first_frame(&mut p, &ctx);
+        let _first = wait_first_frame(&mut p, &ctx);
 
         // Play ~2s and sample sustain.
         p.play();
@@ -142,9 +149,9 @@ fn bench_player_decode_and_seek() {
         let seek_avg = seek_total / seeks;
 
         println!(
-            "{:<14} {:>8.0}ms {:>9.2}x {:>8.1} {:>9} {:>8.0} {:>9.0?}",
+            "{:<16} {:>8} {:>9.2}x {:>8.1} {:>9} {:>8.0} {:>9.0?}",
             label,
-            first.as_secs_f64() * 1000.0,
+            s.decoder.label(),
             realtime,
             dec_fps,
             s.dropped,

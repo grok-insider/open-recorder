@@ -236,10 +236,7 @@ fn mux_interleaves_audio_and_video() {
             .collect();
         // Both streams must appear, and an audio packet (stream 1) must show up
         // early — not only after the entire video block.
-        assert!(
-            order.iter().any(|s| *s == "0"),
-            "no video packets: {order:?}"
-        );
+        assert!(order.contains(&"0"), "no video packets: {order:?}");
         assert!(
             order.iter().take(6).any(|s| *s == "1"),
             "audio not interleaved early (got {order:?})"
