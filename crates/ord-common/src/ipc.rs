@@ -40,6 +40,8 @@ pub enum Event {
         buffer_enabled: bool,
         recording: bool,
         buffered_seconds: u32,
+        buffered_frames: u32,
+        buffered_keyframes: u32,
     },
     /// An error occurred handling a command. User-facing, actionable text.
     Error { message: String },
@@ -116,6 +118,8 @@ mod tests {
                 buffer_enabled: true,
                 recording: false,
                 buffered_seconds: 42,
+                buffered_frames: 2520,
+                buffered_keyframes: 84,
             },
             Event::Error {
                 message: "no keyframe in window".to_string(),

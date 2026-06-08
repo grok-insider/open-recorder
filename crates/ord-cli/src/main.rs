@@ -84,11 +84,15 @@ fn render(event: Event) -> String {
             buffer_enabled,
             recording,
             buffered_seconds,
+            buffered_frames,
+            buffered_keyframes,
         } => format!(
-            "buffer: {} | recording: {} | buffered: {}s",
+            "buffer: {} | recording: {} | buffered: {}s ({} frames, {} keyframes)",
             if buffer_enabled { "on" } else { "off" },
             if recording { "yes" } else { "no" },
-            buffered_seconds
+            buffered_seconds,
+            buffered_frames,
+            buffered_keyframes
         ),
         Event::Error { message } => format!("error: {message}"),
     }
