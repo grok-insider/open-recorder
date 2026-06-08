@@ -63,7 +63,16 @@ impl eframe::App for LibraryApp {
 
 /// Launch the library window.
 pub fn run(clips_dir: PathBuf) -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        // Set the Wayland app_id (X11 WM_CLASS) so compositors can match the
+        // window — e.g. a Hyprland rule that moves it to a `special:clips`
+        // workspace. Without this the class is empty and rules never match.
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_app_id("open-recorder")
+            .with_title("open-recorder")
+            .with_inner_size([900.0, 600.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "open-recorder",
         options,
