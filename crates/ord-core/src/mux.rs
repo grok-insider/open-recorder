@@ -49,6 +49,24 @@ fn codec_id(codec: Codec) -> ffmpeg_next::codec::Id {
     }
 }
 
+/// Build a standard 19-byte `OpusHead` codec-private header (RFC 7845 §5.1).
+///
+/// Matroska and MP4 require this blob as the Opus stream's extradata. We use a
+/// mapping family of 0 (mono/stereo), a conventional 3840-sample (80ms) pre-skip,
+/// and zero output gain.
+#[cfg(feature = "mux")]
+fn build_opus_head(sample_rate: u32, channels: u16) -> Vec<u8> {
+    let mut h = Vec::with_capacity(19);
+    h.extend_from_slice(b"OpusHead");
+    h.push(1); // version
+    h.push(channels.clamp(1, 255) as u8);
+    h.extend_from_slice(&3840u16.to_le_bytes()); // pre-skip
+    h.extend_from_slice(&sample_rate.to_le_bytes()); // input sample rate
+    h.extend_from_slice(&0u16.to_le_bytes()); // output gain
+    h.push(0); // channel mapping family
+    h
+}
+
 /// Write `clip` to `path` as Matroska, stream-copying the encoded packets.
 ///
 /// pts/dts are rebased so the first frame starts at 0. The first frame must be a
@@ -124,6 +142,53 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
         }
     }
 
+    // Optional audio stream (Opus passthrough). Added before write_header so the
+    // muxer knows about both streams. The audio packets carry a microsecond
+    // capture timestamp which we rebase to the same millisecond timeline as
+    // video, keeping A/V in sync.
+    let audio_stream_index = if clip.has_audio() {
+        let ap = clip.audio_params.expect("has_audio checked");
+        let acodec = ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::OPUS)
+            .ok_or_else(|| MuxError::Ffmpeg("opus codec not found".into()))?;
+        let mut astream = octx.add_stream(acodec)?;
+        astream.set_time_base(ffmpeg_next::Rational(1, 1000));
+        let idx = astream.index();
+        // Matroska/MP4 Opus needs an `OpusHead` codec-private blob; build a
+        // standard 19-byte header from the negotiated sample rate / channels.
+        let opus_head = build_opus_head(ap.sample_rate, ap.channels);
+        // SAFETY: codecpar is valid for the lifetime of the stream; we set the
+        // fields the Opus muxer needs for a copy stream plus OpusHead extradata
+        // (allocated with av_malloc so ffmpeg frees it).
+        unsafe {
+            let par = (*astream.as_ptr()).codecpar;
+            if par.is_null() {
+                return Err(MuxError::Ffmpeg("audio stream has no codecpar".into()));
+            }
+            (*par).codec_type = ffmpeg_next::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO;
+            (*par).codec_id = ffmpeg_next::ffi::AVCodecID::AV_CODEC_ID_OPUS;
+            (*par).sample_rate = ap.sample_rate as i32;
+            (*par).ch_layout.nb_channels = ap.channels as i32;
+            let size = opus_head.len();
+            let buf = ffmpeg_next::ffi::av_malloc(
+                size + ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
+            ) as *mut u8;
+            if buf.is_null() {
+                return Err(MuxError::Ffmpeg("av_malloc failed for OpusHead".into()));
+            }
+            std::ptr::copy_nonoverlapping(opus_head.as_ptr(), buf, size);
+            std::ptr::write_bytes(
+                buf.add(size),
+                0,
+                ffmpeg_next::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
+            );
+            (*par).extradata = buf;
+            (*par).extradata_size = size as i32;
+        }
+        Some(idx)
+    } else {
+        None
+    };
+
     octx.write_header()?;
 
     // Order packets by DTS (the muxer requires monotonic DTS) and rebase by the
@@ -136,6 +201,11 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
     let base = ordered.iter().map(|f| f.dts.min(f.pts)).min().unwrap_or(0);
     let den = clip.params.time_base_den.max(1);
     let to_ms = |t: i64| -> i64 { (t - base) * 1000 / den };
+
+    // Audio rebasing: audio frames carry a microsecond capture timestamp. Rebase
+    // by the clip's first video frame so audio and video share t=0.
+    let video_base_us = base * 1000 / den;
+    let audio_to_ms = |ts_us: i64| -> i64 { (ts_us - video_base_us) / 1000 };
 
     // Keep DTS strictly increasing: when two frames round to the same
     // millisecond, bump the later one by 1ms so the muxer accepts the stream.
@@ -167,6 +237,28 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
         packet.write_interleaved(&mut octx)?;
     }
 
+    // Write audio packets (Opus passthrough) on the audio stream, if present.
+    if let Some(astream) = audio_stream_index {
+        let mut audio: Vec<&crate::audio::EncodedAudioFrame> = clip.audio.iter().collect();
+        audio.sort_by_key(|f| f.timestamp_micros);
+        let mut last_audio_dts = i64::MIN;
+        for frame in audio {
+            if frame.data.is_empty() {
+                continue;
+            }
+            let mut ts = audio_to_ms(frame.timestamp_micros);
+            if ts <= last_audio_dts {
+                ts = last_audio_dts + 1;
+            }
+            last_audio_dts = ts;
+            let mut packet = ffmpeg_next::codec::packet::Packet::copy(&frame.data);
+            packet.set_pts(Some(ts));
+            packet.set_dts(Some(ts));
+            packet.set_stream(astream);
+            packet.write_interleaved(&mut octx)?;
+        }
+    }
+
     octx.write_trailer()?;
     Ok(())
 }
@@ -187,6 +279,7 @@ mod tests {
     fn empty_clip() -> PreparedClip {
         PreparedClip {
             frames: vec![],
+            audio: vec![],
             params: StreamParams {
                 width: 1920,
                 height: 1080,
@@ -194,6 +287,7 @@ mod tests {
                 codec: Codec::H264,
                 time_base_den: crate::MICROS_PER_SEC,
             },
+            audio_params: None,
         }
     }
 

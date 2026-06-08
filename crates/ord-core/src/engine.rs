@@ -7,33 +7,44 @@
 
 use std::sync::mpsc::Receiver;
 
+use crate::audio::{AudioParams, AudioRingBuffer, EncodedAudioFrame};
 use crate::backend::{BackendError, CaptureBackend, StreamParams};
 use crate::clip::{select_clip, ClipError};
 use crate::ring::{EncodedFrame, RingBuffer};
 
-/// A clip ready to be muxed: ordered encoded frames (first is a keyframe) plus
-/// the stream params they were captured with.
+/// A clip ready to be muxed: ordered encoded video frames (first is a keyframe),
+/// the audio frames covering the same window (may be empty), and the stream
+/// params they were captured with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedClip {
     pub frames: Vec<EncodedFrame>,
+    pub audio: Vec<EncodedAudioFrame>,
     pub params: StreamParams,
+    pub audio_params: Option<AudioParams>,
 }
 
 impl PreparedClip {
-    /// Covered span in microseconds (first to last frame pts).
-    pub fn span_micros(&self) -> i64 {
+    /// Covered span in the video pts time base (first to last frame pts).
+    pub fn span_ticks(&self) -> i64 {
         match (self.frames.first(), self.frames.last()) {
             (Some(a), Some(b)) => b.pts - a.pts,
             _ => 0,
         }
     }
+
+    /// Whether the clip carries an audio track.
+    pub fn has_audio(&self) -> bool {
+        !self.audio.is_empty() && self.audio_params.is_some()
+    }
 }
 
-/// Drives capture into the ring buffer and produces clips on demand.
+/// Drives capture into the ring buffers and produces clips on demand.
 pub struct Engine<B: CaptureBackend> {
     backend: B,
     ring: RingBuffer,
+    audio_ring: AudioRingBuffer,
     rx: Option<Receiver<EncodedFrame>>,
+    audio_rx: Option<Receiver<EncodedAudioFrame>>,
 }
 
 impl<B: CaptureBackend> Engine<B> {
@@ -45,16 +56,19 @@ impl<B: CaptureBackend> Engine<B> {
         let ticks_per_sec = backend.params().time_base_den;
         Self {
             ring: RingBuffer::with_time_base(capacity_seconds, ticks_per_sec),
+            audio_ring: AudioRingBuffer::new(capacity_seconds),
             backend,
             rx: None,
+            audio_rx: None,
         }
     }
 
-    /// Start capture; frames begin flowing into the ring buffer on
+    /// Start capture; frames begin flowing into the ring buffers on
     /// [`drain_available`](Engine::drain_available).
     pub fn start(&mut self) -> Result<(), BackendError> {
-        let rx = self.backend.start()?;
-        self.rx = Some(rx);
+        let streams = self.backend.start()?;
+        self.rx = Some(streams.video);
+        self.audio_rx = streams.audio;
         Ok(())
     }
 
@@ -62,12 +76,18 @@ impl<B: CaptureBackend> Engine<B> {
     pub fn stop(&mut self) -> Result<(), BackendError> {
         self.backend.stop()?;
         self.rx = None;
+        self.audio_rx = None;
         Ok(())
     }
 
-    /// Pull all currently-available frames from the backend into the ring buffer.
-    /// Returns how many frames were ingested. Non-blocking.
+    /// Pull all currently-available video+audio frames from the backend into the
+    /// ring buffers. Returns how many video frames were ingested. Non-blocking.
     pub fn drain_available(&mut self) -> usize {
+        if let Some(arx) = self.audio_rx.as_ref() {
+            while let Ok(frame) = arx.try_recv() {
+                self.audio_ring.push(frame);
+            }
+        }
         let Some(rx) = self.rx.as_ref() else {
             return 0;
         };
@@ -80,8 +100,8 @@ impl<B: CaptureBackend> Engine<B> {
     }
 
     /// Select and copy the last `seconds` of buffered frames into a
-    /// [`PreparedClip`] (the clip starts on a keyframe). The ring buffer is left
-    /// intact (replay continues).
+    /// [`PreparedClip`] (the clip starts on a keyframe). The audio track covering
+    /// the same time window is included. The ring buffers are left intact.
     pub fn take_clip(&self, seconds: u32) -> Result<PreparedClip, ClipError> {
         let selection = select_clip(&self.ring, seconds)?;
         let frames: Vec<EncodedFrame> = self
@@ -91,9 +111,19 @@ impl<B: CaptureBackend> Engine<B> {
             .take(selection.frame_count)
             .cloned()
             .collect();
+
+        // Map the video window (in the video pts time base) to microseconds and
+        // pull the audio frames that fall inside it, keeping A/V aligned.
+        let den = self.backend.params().time_base_den.max(1);
+        let start_us = selection.start_pts * 1_000_000 / den;
+        let end_us = selection.end_pts * 1_000_000 / den;
+        let audio = self.audio_ring.select_window(start_us, end_us);
+
         Ok(PreparedClip {
             frames,
+            audio,
             params: self.backend.params(),
+            audio_params: self.backend.audio_params(),
         })
     }
 
@@ -118,9 +148,10 @@ impl<B: CaptureBackend> Engine<B> {
         self.backend.is_running()
     }
 
-    /// Drop all buffered frames.
+    /// Drop all buffered frames (video + audio).
     pub fn clear(&mut self) {
         self.ring.clear();
+        self.audio_ring.clear();
     }
 }
 
@@ -149,8 +180,29 @@ mod tests {
         let clip = eng.take_clip(3).unwrap();
         assert!(clip.frames.first().unwrap().is_keyframe);
         // Covers at least the requested 3s.
-        assert!(clip.span_micros() >= 3 * MICROS_PER_SEC);
+        assert!(clip.span_ticks() >= 3 * MICROS_PER_SEC);
         assert_eq!(clip.params.fps, 60);
+        assert!(!clip.has_audio()); // no audio on a video-only mock
+    }
+
+    #[test]
+    fn take_clip_includes_audio_window() {
+        // 60fps, 600 frames = 10s, keyframe every 60 (1s), with audio.
+        let mut eng = Engine::new(MockBackend::new(60, 600, 60).with_audio(), 60);
+        eng.start().unwrap();
+        eng.drain_available();
+        let clip = eng.take_clip(3).unwrap();
+        assert!(clip.has_audio());
+        // ~3s of 20ms audio frames -> roughly 150 (allow slack for keyframe
+        // window reaching back a little further).
+        assert!(clip.audio.len() >= 140, "got {}", clip.audio.len());
+        // Audio stays within the clip's microsecond window.
+        let den = clip.params.time_base_den;
+        let end_us = clip.frames.last().unwrap().pts * 1_000_000 / den;
+        assert!(clip
+            .audio
+            .iter()
+            .all(|a| a.timestamp_micros <= end_us + 20_000));
     }
 
     #[test]

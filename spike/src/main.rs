@@ -77,6 +77,7 @@ fn main() -> waycap_rs::types::error::Result<()> {
     let first_kf = frames.iter().position(|f| f.is_keyframe).unwrap_or(0);
     let clip = PreparedClip {
         frames: frames[first_kf..].to_vec(),
+        audio: vec![],
         params: StreamParams {
             width: 2560,
             height: 1440,
@@ -84,6 +85,7 @@ fn main() -> waycap_rs::types::error::Result<()> {
             codec: Codec::H264,
             time_base_den: ord_core::backend::NANOS_PER_SEC, // waycap pts are nanos
         },
+        audio_params: None,
     };
 
     eprintln!("Muxing {OUT} via ord_core::write_clip ...");
