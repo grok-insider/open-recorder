@@ -12,7 +12,7 @@ ord-common.workspace = true
 thiserror.workspace = true
 ffmpeg-next = { version = "8", optional = true }
 crossbeam = { version = "0.8", optional = true }
-waycap-rs = { git = "https://github.com/0xfell/waycap-rs.git", rev = "efb6a7878bda35c66390a2698a47443bc09023de", default-features = false, features = ["nvidia", "egl"], optional = true }
+waycap-rs = { git = "https://github.com/0xfell/waycap-rs.git", rev = "c9e7b66abd8bdbf00161c6886d43641fc1da9b1d", default-features = false, features = ["nvidia", "egl"], optional = true }
 
 [features]
 # `mux` pulls in ffmpeg-next (needs the system ffmpeg libs at build time). Off by
