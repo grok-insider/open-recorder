@@ -59,7 +59,7 @@ pub struct EditorState {
 impl EditorState {
     /// Open the editor for `clip`. Returns an error if the media can't be opened.
     pub fn new(clip: PathBuf, label: String, ctx: &egui::Context) -> Result<Self, String> {
-        let player = Player::open(&clip, ctx)?;
+        let player = Player::open(&clip)?;
         let timeline = Timeline::new(player.duration());
         let strip_rx = spawn_filmstrip(&clip, player.duration(), ctx.clone());
         Ok(Self {

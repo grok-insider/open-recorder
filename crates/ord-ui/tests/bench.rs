@@ -59,19 +59,49 @@ fn wait_first_frame(p: &mut Player, ctx: &egui::Context) -> Duration {
     t0.elapsed()
 }
 
+/// Newest real recording, if any (real decode complexity), else None.
+fn newest_real_clip() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("ORD_BENCH_CLIP") {
+        return Some(PathBuf::from(p));
+    }
+    let dir = PathBuf::from(std::env::var("HOME").ok()?).join("Videos/open-recorder");
+    let mut clips: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("mkv"))
+        .collect();
+    clips.sort();
+    clips.pop()
+}
+
 #[test]
 #[ignore = "needs ffmpeg; run in devshell with --ignored --nocapture"]
 fn bench_player_decode_and_seek() {
     let ctx = egui::Context::default();
     println!("\n=== ord-ui player benchmark ===");
+    // A real recording (true H.264 decode load) plus synthetic baselines.
+    let real = newest_real_clip();
+    if let Some(c) = &real {
+        println!("real clip: {}", c.display());
+    } else {
+        println!("(no real clip found; synthetic only — set ORD_BENCH_CLIP to test one)");
+    }
     println!(
-        "{:<11} {:>10} {:>10} {:>8} {:>9} {:>9} {:>11}",
+        "{:<14} {:>10} {:>10} {:>8} {:>9} {:>9} {:>11}",
         "source", "firstframe", "realtime", "decfps", "dropped", "abuf_ms", "seek_avg"
     );
 
+    let mut cases: Vec<(String, PathBuf, bool)> = Vec::new();
+    if let Some(c) = real {
+        cases.push(("real".to_string(), c, false));
+    }
     for &(w, h, fps) in &[(1280u32, 720u32, 60u32), (1920, 1080, 60), (2560, 1440, 60)] {
-        let clip = gen_clip(w, h, fps, 6);
-        let mut p = Player::open(&clip, &ctx).expect("open");
+        cases.push((format!("{w}x{h}"), gen_clip(w, h, fps, 6), true));
+    }
+
+    for (label, clip, synthetic) in cases {
+        let mut p = Player::open(&clip).expect("open");
         p.set_volume(0.0);
 
         let first = wait_first_frame(&mut p, &ctx);
@@ -112,8 +142,8 @@ fn bench_player_decode_and_seek() {
         let seek_avg = seek_total / seeks;
 
         println!(
-            "{:<11} {:>8.0}ms {:>9.2}x {:>8.1} {:>9} {:>8.0} {:>9.0?}",
-            format!("{w}x{h}"),
+            "{:<14} {:>8.0}ms {:>9.2}x {:>8.1} {:>9} {:>8.0} {:>9.0?}",
+            label,
             first.as_secs_f64() * 1000.0,
             realtime,
             dec_fps,
@@ -123,7 +153,9 @@ fn bench_player_decode_and_seek() {
         );
 
         drop(p);
-        let _ = std::fs::remove_file(&clip);
+        if synthetic {
+            let _ = std::fs::remove_file(&clip);
+        }
     }
     println!("(realtime ~1.00x and abuf_ms > 0 => smooth playback)\n");
 }
