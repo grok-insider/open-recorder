@@ -13,7 +13,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -25,11 +25,51 @@ use ffmpeg_next as ff;
 /// Decode preview at most this wide (keeps memory/CPU sane; export is full-res).
 /// 1440 is crisp on a 1440p display while keeping the frame queue bounded.
 const PREVIEW_MAX_W: u32 = 1440;
-/// Bounded look-ahead video queue (frames). ~0.27s at 60fps; frames are large at
-/// 1440px (1440x810 RGBA ≈ 4.7 MB each), so this also caps memory (~75 MB).
-const VIDEO_QUEUE_MAX: usize = 16;
-/// Audio look-ahead cap (interleaved f32 samples) ≈ 2s stereo @ 48k.
+/// Bounded look-ahead video queue (frames) ≈ 0.5s at 60fps. This is the demuxer
+/// pacer: it must hold a comparable DURATION to the audio buffer below, otherwise
+/// the demuxer races ahead to fill audio and the video queue overflows → video
+/// freezes while audio plays. ~0.5s @1440p RGBA ≈ 140 MB transient (cheaper once
+/// the NV12/GL path is active).
+const VIDEO_QUEUE_MAX: usize = 30;
+/// Audio look-ahead ceiling (interleaved f32 samples) ≈ 2s stereo @ 48k. In
+/// practice the video queue fills first and paces the demuxer, so audio settles
+/// well under this; it's just an upper bound.
 const AUDIO_BUF_MAX: usize = 48_000 * 2 * 2;
+
+/// Which video decoder the decode thread ended up using.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecKind {
+    /// Not chosen yet (decode thread still starting up).
+    Unknown,
+    /// NVIDIA NVDEC via ffmpeg `*_cuvid` (GPU decode + GPU resize).
+    Nvdec,
+    /// Frame-threaded software decode (fallback / non-NVIDIA).
+    Software,
+}
+
+impl DecKind {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => DecKind::Nvdec,
+            2 => DecKind::Software,
+            _ => DecKind::Unknown,
+        }
+    }
+    fn as_u8(self) -> u8 {
+        match self {
+            DecKind::Unknown => 0,
+            DecKind::Nvdec => 1,
+            DecKind::Software => 2,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            DecKind::Unknown => "…",
+            DecKind::Nvdec => "nvdec",
+            DecKind::Software => "sw",
+        }
+    }
+}
 
 /// Live player diagnostics (debug overlay).
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +81,7 @@ pub struct Stats {
     pub frames_queued: usize,
     pub decoded: u64,
     pub dropped: u64,
+    pub decoder: DecKind,
 }
 
 /// A decoded RGBA video frame tagged with its presentation time (seconds).
@@ -66,6 +107,8 @@ struct Shared {
     /// Diagnostics (debug mode).
     decoded: AtomicU64,
     dropped: AtomicU64,
+    /// Which decoder the decode thread selected ([`DecKind`] as u8).
+    dec_kind: AtomicU8,
     seek_base: Mutex<f64>,
     seek_to: Mutex<Option<f64>>,
     in_secs: Mutex<f64>,
@@ -115,6 +158,7 @@ impl Player {
             samples_played: AtomicU64::new(0),
             decoded: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            dec_kind: AtomicU8::new(0),
             seek_base: Mutex::new(0.0),
             seek_to: Mutex::new(Some(0.0)),
             in_secs: Mutex::new(0.0),
@@ -185,7 +229,13 @@ impl Player {
             frames_queued: self.shared.frames.lock().unwrap().len(),
             decoded: self.shared.decoded.load(Ordering::Relaxed),
             dropped: self.shared.dropped.load(Ordering::Relaxed),
+            decoder: self.decoder_kind(),
         }
+    }
+
+    /// Which video decoder is active (NVDEC / software), for the debug overlay.
+    pub fn decoder_kind(&self) -> DecKind {
+        DecKind::from_u8(self.shared.dec_kind.load(Ordering::Relaxed))
     }
 
     pub fn has_audio(&self) -> bool {
@@ -332,13 +382,16 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
+        // Signal stop and pause audio, but DON'T join the decode thread on the UI
+        // thread — joining could block the UI for the time a slow decode call
+        // takes to return (this was the ~4s "UI STALL" after closing the editor
+        // in the watchdog log). The thread observes `stop` and exits on its own,
+        // dropping its ffmpeg context; detaching keeps window close instant.
         self.shared.stop.store(true, Ordering::Release);
         if let Some(s) = &self._stream {
             let _ = s.pause();
         }
-        if let Some(h) = self.decode_thread.take() {
-            let _ = h.join();
-        }
+        drop(self.decode_thread.take());
     }
 }
 
@@ -440,40 +493,20 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>) {
         .best(ff::media::Type::Audio)
         .map(|s| (s.index(), s.parameters()));
 
-    // Frame-threaded software decode so 1440p60 keeps up in real time. Cap the
-    // thread count so the UI + audio threads keep cores (avoids the decode
-    // thread pegging every core, which froze the UI → ANR).
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).clamp(2, 8))
-        .unwrap_or(4);
-    let mut vdec =
-        match ff::codec::context::Context::from_parameters(video_params).and_then(|mut c| {
-            c.set_threading(ff::codec::threading::Config {
-                kind: ff::codec::threading::Type::Frame,
-                count: decode_threads,
-            });
-            c.decoder().video()
-        }) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-
-    // Preview scale: cap width, keep aspect, even dims.
-    let (sw, sh) = (vdec.width(), vdec.height());
-    let out_w = sw.clamp(2, PREVIEW_MAX_W) & !1;
-    let out_h = (((sh as u64 * out_w as u64) / sw.max(1) as u64) as u32).max(2) & !1;
-    let mut scaler = match ff::software::scaling::context::Context::get(
-        vdec.format(),
-        sw,
-        sh,
-        ff::format::Pixel::RGBA,
-        out_w,
-        out_h,
-        ff::software::scaling::flag::Flags::LANCZOS,
-    ) {
-        Ok(s) => s,
-        Err(_) => return,
+    // Choose the video decoder: NVDEC (GPU decode + GPU downscale) when available,
+    // else frame-threaded software decode. NVDEC moves the expensive 1440p60
+    // decode off the CPU — the software path pegging cores was the stutter + the
+    // "UI STALL" ANR seen in the watchdog log.
+    let (mut vdec, kind) = match open_video_decoder(video_params) {
+        Some(v) => v,
+        None => return,
     };
+    shared.dec_kind.store(kind.as_u8(), Ordering::Relaxed);
+
+    // Preview RGBA scaler, built lazily from the FIRST decoded frame: cuvid only
+    // reports its real output format/size after the first frame, and software
+    // frames are source-sized so we cap width here. Lazy init handles both.
+    let mut scaler: Option<ff::software::scaling::context::Context> = None;
 
     // Audio decoder + resampler to the device's F32 format.
     let out_rate = shared.sample_rate.load(Ordering::Relaxed) as u32;
@@ -516,19 +549,20 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>) {
             shared.audio_buf.lock().unwrap().clear();
         }
 
-        // Backpressure: sleep when our pacing buffer is full. With audio, the
-        // audio buffer paces (video is bounded separately by dropping when its
-        // queue is full, so demux keeps flowing for audio); without audio, the
-        // video queue paces. This keeps memory bounded — the old `v_full &&
-        // a_full` let the video queue grow unboundedly (1440p RGBA ≈ 4.7 MB
-        // each), which exhausted memory and hung the app.
-        let full = if audio.is_some() {
-            shared.audio_buf.lock().unwrap().len() >= AUDIO_BUF_MAX
-        } else {
-            shared.frames.lock().unwrap().len() >= VIDEO_QUEUE_MAX
-        };
-        if full {
-            std::thread::sleep(Duration::from_millis(4));
+        // Backpressure: pace the demuxer so it stays only a small, BALANCED
+        // amount ahead of the master clock — sleep when EITHER buffer is full.
+        //
+        // The previous "sleep only when audio is full" let the demuxer read ~2s
+        // ahead to fill the audio buffer while the small video queue overflowed
+        // and dropped most frames; video then starved (the same frame held for
+        // seconds) while audio kept playing. Because video frames arrive at the
+        // frame rate, the video queue fills first and becomes the pacer, so the
+        // demuxer stays ~0.5s ahead, audio settles at a similar depth, and no
+        // video is dropped in steady state.
+        let video_full = shared.frames.lock().unwrap().len() >= VIDEO_QUEUE_MAX;
+        let audio_full = audio.is_some() && shared.audio_buf.lock().unwrap().len() >= AUDIO_BUF_MAX;
+        if video_full || audio_full {
+            std::thread::sleep(Duration::from_millis(3));
             continue;
         }
 
@@ -554,19 +588,42 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>) {
                 while vdec.receive_frame(&mut frame).is_ok() {
                     let pts =
                         frame.pts().or_else(|| frame.timestamp()).unwrap_or(0) as f64 * video_tb;
+
+                    // Build the preview scaler from the first real frame (cap to
+                    // preview width, keep aspect, even dims).
+                    if scaler.is_none() {
+                        let inw = frame.width();
+                        let inh = frame.height();
+                        let out_w = inw.clamp(2, PREVIEW_MAX_W) & !1;
+                        let out_h =
+                            (((inh as u64 * out_w as u64) / inw.max(1) as u64) as u32).max(2) & !1;
+                        scaler = ff::software::scaling::context::Context::get(
+                            frame.format(),
+                            inw,
+                            inh,
+                            ff::format::Pixel::RGBA,
+                            out_w,
+                            out_h,
+                            ff::software::scaling::flag::Flags::LANCZOS,
+                        )
+                        .ok();
+                    }
+                    let Some(sc) = scaler.as_mut() else { continue };
+
+                    // Skip the scale+pack entirely when the queue is full — we'd
+                    // only drop the result. (We still drained `receive_frame`, so
+                    // the decoder keeps flowing for audio.) This removes the
+                    // wasted CPU that showed up as a huge `drop` count.
+                    if shared.frames.lock().unwrap().len() >= VIDEO_QUEUE_MAX {
+                        shared.dropped.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
                     let mut rgba = ff::frame::Video::empty();
-                    if scaler.run(&frame, &mut rgba).is_ok() {
+                    if sc.run(&frame, &mut rgba).is_ok() {
                         let vf = pack_rgba(&rgba, pts);
                         shared.decoded.fetch_add(1, Ordering::Relaxed);
-                        // Bound the queue: drop the new frame if full so the
-                        // demuxer keeps flowing (for audio) and memory stays small.
-                        let mut q = shared.frames.lock().unwrap();
-                        if q.len() >= VIDEO_QUEUE_MAX {
-                            shared.dropped.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            q.push_back(vf);
-                        }
-                        drop(q);
+                        shared.frames.lock().unwrap().push_back(vf);
                     }
                 }
             }
@@ -597,6 +654,93 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>) {
             }
         }
     }
+}
+
+/// Map a codec id to its NVIDIA `*_cuvid` (NVDEC) decoder name, if one exists.
+fn cuvid_name(id: ff::codec::Id) -> Option<&'static str> {
+    use ff::codec::Id;
+    Some(match id {
+        Id::H264 => "h264_cuvid",
+        Id::HEVC => "hevc_cuvid",
+        Id::AV1 => "av1_cuvid",
+        Id::VP9 => "vp9_cuvid",
+        Id::VP8 => "vp8_cuvid",
+        Id::MPEG2VIDEO => "mpeg2_cuvid",
+        Id::MPEG4 => "mpeg4_cuvid",
+        Id::VC1 => "vc1_cuvid",
+        _ => return None,
+    })
+}
+
+/// Open the video decoder for `params`: prefer NVDEC (GPU decode + GPU resize to
+/// preview width), fall back to frame-threaded software decode. Honors
+/// `ORD_DECODE`: `sw` forces software; `nvdec`/`gl`/`zerocopy` force-or-warn
+/// hardware; unset = auto (NVDEC if available).
+fn open_video_decoder(params: ff::codec::Parameters) -> Option<(ff::decoder::Video, DecKind)> {
+    let want = std::env::var("ORD_DECODE").unwrap_or_default();
+    let force_sw = want == "sw";
+    let force_hw = matches!(want.as_str(), "nvdec" | "gl" | "zerocopy" | "hw");
+
+    if !force_sw {
+        if let Some(name) = cuvid_name(params.id()) {
+            // Source dims from AVCodecParameters (for the GPU resize target).
+            let (src_w, src_h) = unsafe {
+                let p = params.as_ptr();
+                ((*p).width, (*p).height)
+            };
+            if let Some(dec) = open_cuvid(&params, name, src_w, src_h) {
+                return Some((dec, DecKind::Nvdec));
+            }
+            if force_hw {
+                eprintln!("ord-ui: ORD_DECODE={want} but NVDEC unavailable; using software");
+            }
+        } else if force_hw {
+            eprintln!("ord-ui: no NVDEC decoder for this codec; using software");
+        }
+    }
+
+    // Frame-threaded software decode, capped so the UI + audio threads keep cores.
+    let threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(2, 8))
+        .unwrap_or(4);
+    let dec = ff::codec::context::Context::from_parameters(params)
+        .ok()
+        .and_then(|mut c| {
+            c.set_threading(ff::codec::threading::Config {
+                kind: ff::codec::threading::Type::Frame,
+                count: threads,
+            });
+            c.decoder().video().ok()
+        })?;
+    Some((dec, DecKind::Software))
+}
+
+/// Open an NVDEC (`*_cuvid`) decoder, asking the GPU to also downscale to preview
+/// width (`resize`) and bounding VRAM (`surfaces`). Returns None if NVDEC is
+/// unavailable (no driver / unsupported codec) so the caller can fall back. The
+/// decoder outputs NV12 in system memory (no `hw_device_ctx`), which the lazy
+/// swscale converts to RGBA like any software frame.
+fn open_cuvid(
+    params: &ff::codec::Parameters,
+    name: &str,
+    src_w: i32,
+    src_h: i32,
+) -> Option<ff::decoder::Video> {
+    let codec = ff::codec::decoder::find_by_name(name)?;
+    let ctx = ff::codec::context::Context::from_parameters(params.clone()).ok()?;
+
+    let mut opts = ff::Dictionary::new();
+    // GPU downscale to preview width only when the source is larger (never upscale).
+    if src_w > PREVIEW_MAX_W as i32 && src_h > 0 {
+        let out_w = (PREVIEW_MAX_W as i32) & !1;
+        let out_h = (((src_h as i64 * out_w as i64) / src_w.max(1) as i64) as i32).max(2) & !1;
+        opts.set("resize", &format!("{out_w}x{out_h}"));
+    }
+    // Small surface pool: bounds VRAM, ample for preview look-ahead.
+    opts.set("surfaces", "8");
+
+    let opened = ctx.decoder().open_as_with(codec, opts).ok()?;
+    opened.video().ok()
 }
 
 /// Copy a scaled RGBA frame into a tight (no row padding) buffer.

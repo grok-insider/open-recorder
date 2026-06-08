@@ -261,7 +261,11 @@ impl EditorState {
                         "abuf {:.0}ms  vq {}  dec {}  drop {}",
                         s.audio_buf_ms, s.frames_queued, s.decoded, s.dropped
                     ));
-                    ui.monospace(format!("src_fps {fps:.2}  zoom {:.1}", self.zoom));
+                    ui.monospace(format!(
+                        "decoder {}  src_fps {fps:.2}  zoom {:.1}",
+                        s.decoder.label(),
+                        self.zoom
+                    ));
                     ui.monospace("F3: toggle debug");
                 });
             });
@@ -269,8 +273,8 @@ impl EditorState {
         if self.dbg_log_at.elapsed() >= Duration::from_millis(1000) {
             self.dbg_log_at = Instant::now();
             let line = format!(
-                "[ord-ui] pos={:.2} dur={:.2} audio={} play={} abuf_ms={:.0} vq={} dec={} drop={}\n",
-                s.position, dur, s.has_audio, s.playing, s.audio_buf_ms, s.frames_queued, s.decoded, s.dropped
+                "[ord-ui] decoder={} pos={:.2} dur={:.2} audio={} play={} abuf_ms={:.0} vq={} dec={} drop={}\n",
+                s.decoder.label(), s.position, dur, s.has_audio, s.playing, s.audio_buf_ms, s.frames_queued, s.decoded, s.dropped
             );
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
