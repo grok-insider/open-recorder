@@ -11,7 +11,7 @@
 //! the shortest decodable clip that covers the requested window.
 
 use crate::ring::{EncodedFrame, RingBuffer};
-use crate::{Micros, MICROS_PER_SEC};
+use crate::Micros;
 
 /// The selected clip: indices into the buffer's frame sequence (oldest = 0) plus
 /// derived timing. `start_index` always points at a keyframe.
@@ -61,9 +61,12 @@ pub fn select_clip(
     }
 
     let newest_pts = frames.last().expect("non-empty").pts;
-    let requested_micros = requested_seconds as i64 * MICROS_PER_SEC;
+    // Convert the requested seconds into the buffer's pts time base (waycap uses
+    // nanoseconds, the mock uses microseconds) — using the wrong base here makes
+    // the window microscopic and the clip far too short.
+    let requested_ticks = requested_seconds as i64 * buffer.ticks_per_sec();
     // The ideal start of the requested window (may be before the oldest frame).
-    let window_start = newest_pts - requested_micros;
+    let window_start = newest_pts - requested_ticks;
 
     // Find the newest keyframe whose pts <= window_start. If none (the requested
     // window starts before the first keyframe), fall back to the oldest keyframe
@@ -104,6 +107,7 @@ pub fn select_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MICROS_PER_SEC;
 
     fn frame(sec: f64, keyframe: bool) -> EncodedFrame {
         let pts = (sec * MICROS_PER_SEC as f64) as i64;
@@ -117,6 +121,30 @@ mod tests {
             rb.push(frame(sec, kf));
         }
         rb
+    }
+
+    #[test]
+    fn nanosecond_time_base_selects_correct_window() {
+        // Regression: with a NANOSECOND-pts buffer (as waycap-rs delivers), a
+        // "save last N seconds" must convert N into nanoseconds. A previous bug
+        // used microseconds, making the window ~1000x too small so clips were a
+        // fraction of a second. Build 10s of 60fps frames (nanos), keyframe every
+        // 30 frames (~0.5s), and request the last 5s.
+        let ns = crate::backend::NANOS_PER_SEC;
+        let step = ns / 60;
+        let mut rb = RingBuffer::with_time_base(60, ns);
+        for i in 0..600 {
+            let pts = i as i64 * step;
+            rb.push(EncodedFrame::new(vec![0u8; 4], i % 30 == 0, pts, pts));
+        }
+        let sel = select_clip(&rb, 5).unwrap();
+        // The clip must cover ~5s worth of frames (~300), not a handful.
+        assert!(
+            sel.frame_count >= 290,
+            "expected ~300 frames for 5s, got {}",
+            sel.frame_count
+        );
+        assert!(sel.span_micros() >= 4 * ns); // span is in pts ticks (nanos here)
     }
 
     #[test]
