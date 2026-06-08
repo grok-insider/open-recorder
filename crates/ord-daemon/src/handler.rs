@@ -109,6 +109,8 @@ impl<B: CaptureBackend> Handler<B> {
             buffer_enabled: self.buffer_enabled,
             recording: self.recording,
             buffered_seconds: self.engine.buffered_seconds(),
+            buffered_frames: self.engine.buffered_frames() as u32,
+            buffered_keyframes: self.engine.buffered_keyframes() as u32,
         }
     }
 }
@@ -208,10 +210,14 @@ mod tests {
                 buffer_enabled,
                 recording,
                 buffered_seconds,
+                buffered_frames,
+                buffered_keyframes,
             } => {
                 assert!(buffer_enabled);
                 assert!(!recording);
                 assert!(buffered_seconds >= 9);
+                assert!(buffered_frames > 0);
+                assert!(buffered_keyframes > 0);
             }
             other => panic!("expected Status, got {other:?}"),
         }

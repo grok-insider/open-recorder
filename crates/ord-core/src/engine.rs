@@ -102,6 +102,17 @@ impl<B: CaptureBackend> Engine<B> {
         self.ring.buffered_seconds()
     }
 
+    /// Number of frames currently buffered (diagnostic).
+    pub fn buffered_frames(&self) -> usize {
+        self.ring.len()
+    }
+
+    /// Number of keyframes currently buffered. With few keyframes, "save last N"
+    /// can only reach back to the newest one — useful for spotting GOP issues.
+    pub fn buffered_keyframes(&self) -> usize {
+        self.ring.frames().filter(|f| f.is_keyframe).count()
+    }
+
     /// Whether capture is running.
     pub fn is_running(&self) -> bool {
         self.backend.is_running()
