@@ -12,6 +12,7 @@
 //! The actual capture/encode (waycap-rs / NVENC) is wired in later behind a
 //! `CaptureBackend` trait; it feeds [`EncodedFrame`]s into the [`ring::RingBuffer`].
 
+pub mod audio;
 pub mod backend;
 pub mod clip;
 pub mod engine;
@@ -20,7 +21,8 @@ pub mod ring;
 #[cfg(feature = "waycap")]
 pub mod waycap_backend;
 
-pub use backend::{BackendError, CaptureBackend, Codec, MockBackend, StreamParams};
+pub use audio::{AudioCodec, AudioParams, AudioRingBuffer, EncodedAudioFrame};
+pub use backend::{BackendError, CaptureBackend, CaptureStreams, Codec, MockBackend, StreamParams};
 pub use clip::{select_clip, ClipError, ClipSelection};
 pub use engine::{Engine, PreparedClip};
 pub use mux::{write_clip, MuxError};
