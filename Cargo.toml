@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ord-common",
     "crates/ord-core",
+    "crates/ord-export",
     "crates/ord-daemon",
     "crates/ord-cli",
     "crates/ord-overlay",
@@ -23,8 +24,10 @@ repository = "https://github.com/0xfell/open-recorder"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 bincode = "1"
 thiserror = "2"
 toml = "0.8"
 ord-common = { path = "crates/ord-common" }
 ord-core = { path = "crates/ord-core" }
+ord-export = { path = "crates/ord-export" }
