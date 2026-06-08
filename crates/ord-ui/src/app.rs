@@ -164,11 +164,20 @@ impl LibraryApp {
     }
 
     fn start_export(&mut self, clip: &Clip, preset: Preset, ctx: &egui::Context) {
-        self.run_export(&clip.path, &clip.stem, clip.label(), preset, None, ctx);
+        self.run_export(
+            &clip.path,
+            &clip.stem,
+            clip.label(),
+            preset,
+            None,
+            false,
+            ctx,
+        );
     }
 
-    /// Export `input` with `preset`, optionally trimmed. Runs off-thread and
-    /// reports via the export channel; ignores a duplicate in-flight export.
+    /// Export `input` with `preset`, optionally trimmed/muted. Runs off-thread
+    /// and reports via the export channel; ignores a duplicate in-flight export.
+    #[allow(clippy::too_many_arguments)]
     fn run_export(
         &mut self,
         input: &Path,
@@ -176,12 +185,14 @@ impl LibraryApp {
         label: &str,
         preset: Preset,
         trim: Option<Trim>,
+        mute: bool,
         ctx: &egui::Context,
     ) {
         if self.exporting.contains(input) {
             return;
         }
-        let profile = preset.profile();
+        let mut profile = preset.profile();
+        profile.mute = mute;
         let ext = profile.container.extension();
         let preset_name = preset_label(preset);
         let suffix = if trim.is_some() { "-trim" } else { "" };
@@ -274,13 +285,13 @@ impl eframe::App for LibraryApp {
             match action {
                 EditorAction::None => {}
                 EditorAction::Back => self.editor = None,
-                EditorAction::Export { preset, trim } => {
+                EditorAction::Export { preset, trim, mute } => {
                     let clip = self.editor.as_ref().unwrap().clip().clone();
                     let stem = clip
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| "clip".to_string());
-                    self.run_export(&clip, &stem, &stem, preset, trim, ctx);
+                    self.run_export(&clip, &stem, &stem, preset, trim, mute, ctx);
                     self.editor = None;
                 }
             }
@@ -455,17 +466,10 @@ impl LibraryApp {
     }
 
     fn open_editor(&mut self, clip: &Clip, ctx: &egui::Context) {
-        let duration = self
-            .states
-            .get(&clip.path)
-            .and_then(|s| s.meta.as_ref())
-            .map(|m| m.duration_secs);
-        self.editor = Some(EditorState::new(
-            clip.path.clone(),
-            clip.label().to_string(),
-            duration,
-            ctx,
-        ));
+        match EditorState::new(clip.path.clone(), clip.label().to_string(), ctx) {
+            Ok(ed) => self.editor = Some(ed),
+            Err(e) => self.set_status(format!("Can't open editor: {e}")),
+        }
     }
 
     fn actions(&mut self, ui: &mut egui::Ui, clip: &Clip, ctx: &egui::Context) {

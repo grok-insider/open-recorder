@@ -16,4 +16,4 @@ pub mod editor;
 #[cfg(feature = "gui")]
 pub mod meta;
 #[cfg(feature = "gui")]
-pub mod preview;
+pub mod player;

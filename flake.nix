@@ -60,6 +60,7 @@
             mesa
             dbus
             libxkbcommon
+            alsa-lib # cpal audio output for the ord-ui editor preview
           ];
 
           # cust's build script (find_cuda_helper) wants a unified CUDA toolkit
@@ -245,6 +246,7 @@
             mesa
             dbus           # portal screencast (libdbus-sys)
             libxkbcommon   # smithay-client-toolkit (layer-shell HUD)
+            alsa-lib       # cpal audio output (ord-ui editor preview)
           ];
 
           # The waycap-rs `nvidia` feature pulls in `cust`, whose build script
