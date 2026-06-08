@@ -152,6 +152,11 @@ impl RingBuffer {
         (self.span_ticks() / self.ticks_per_sec) as u32
     }
 
+    /// Ticks per second for this buffer's frame pts (the time-base denominator).
+    pub fn ticks_per_sec(&self) -> i64 {
+        self.ticks_per_sec
+    }
+
     /// The pts of the newest buffered frame, if any.
     pub fn newest_pts(&self) -> Option<Micros> {
         self.frames.back().map(|f| f.pts)
