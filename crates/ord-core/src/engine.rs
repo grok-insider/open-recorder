@@ -113,10 +113,11 @@ impl<B: CaptureBackend> Engine<B> {
             .collect();
 
         // Map the video window (in the video pts time base) to microseconds and
-        // pull the audio frames that fall inside it, keeping A/V aligned.
-        let den = self.backend.params().time_base_den.max(1);
-        let start_us = selection.start_pts * 1_000_000 / den;
-        let end_us = selection.end_pts * 1_000_000 / den;
+        // pull the audio frames that fall inside it, keeping A/V aligned. The
+        // conversion is 128-bit-safe: waycap pts are raw monotonic nanoseconds.
+        let den = self.backend.params().time_base_den;
+        let start_us = crate::ticks_to_micros(selection.start_pts, den);
+        let end_us = crate::ticks_to_micros(selection.end_pts, den);
         let audio = self.audio_ring.select_window(start_us, end_us);
 
         Ok(PreparedClip {

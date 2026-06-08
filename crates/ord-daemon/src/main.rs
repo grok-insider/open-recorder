@@ -91,10 +91,12 @@ fn map_quality(q: ord_common::config::Quality) -> ord_core::waycap_backend::Qual
 #[cfg(feature = "waycap")]
 fn make_engine(config: &Config) -> Engine<ord_core::waycap_backend::WaycapBackend> {
     use ord_core::waycap_backend::WaycapBackend;
-    // Mic mixing needs the waycap-rs fork (pending); for now `desktop` drives the
-    // single desktop-monitor track.
+    // desktop and mic are mixed into one Opus track on a shared PipeWire clock.
+    // Enabling the mic implies audio; mic capture also includes desktop audio.
+    let audio_any = config.audio.desktop || config.audio.mic;
     let backend = WaycapBackend::new(map_quality(config.capture.quality), config.capture.fps)
-        .with_audio(config.audio.desktop)
+        .with_audio(audio_any)
+        .with_mic(config.audio.mic)
         .with_restore_token_path(restore_token_path());
     Engine::new(backend, config.capture.buffer_seconds)
 }

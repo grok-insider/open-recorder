@@ -3003,6 +3003,7 @@ name = "ord-cli"
 version = "0.1.0"
 dependencies = [
  "ord-common",
+ "ord-export",
  "thiserror 2.0.18",
 ]
 
@@ -4453,7 +4454,7 @@ dependencies = [
 [[package]]
 name = "waycap-rs"
 version = "3.0.0"
-source = "git+https://github.com/Adonca2203/waycap-rs.git?rev=493c1c6898afa941978d2d09fccd12b10fa6b27f#493c1c6898afa941978d2d09fccd12b10fa6b27f"
+source = "git+https://github.com/0xfell/waycap-rs.git?rev=b8ed2a0ab7bbd5b5de231205e0fc8210dbec775f#b8ed2a0ab7bbd5b5de231205e0fc8210dbec775f"
 dependencies = [
  "bytemuck",
  "crossbeam",

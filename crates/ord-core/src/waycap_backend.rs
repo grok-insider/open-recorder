@@ -54,6 +54,7 @@ pub struct WaycapBackend {
     width: u32,
     height: u32,
     audio_enabled: bool,
+    mic_enabled: bool,
     restore_token_path: Option<std::path::PathBuf>,
     capture: Option<Capture<waycap_rs::DynamicEncoder>>,
     forwarder: Option<JoinHandle<()>>,
@@ -74,6 +75,7 @@ impl WaycapBackend {
             width: 2560,
             height: 1440,
             audio_enabled: true,
+            mic_enabled: false,
             restore_token_path: None,
             capture: None,
             forwarder: None,
@@ -90,11 +92,23 @@ impl WaycapBackend {
         self
     }
 
-    /// Enable or disable desktop audio capture (default: enabled). When enabled,
+    /// Enable or disable audio capture (default: enabled). When enabled,
     /// waycap-rs captures the default sink monitor (game + voice chat playback)
     /// and encodes it to Opus.
     pub fn with_audio(mut self, enabled: bool) -> Self {
         self.audio_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable mixing the default microphone into the audio track
+    /// (default: disabled). Mic capture rides the same PipeWire clock as the
+    /// desktop monitor, so it stays in A/V sync; the two are summed into one
+    /// Opus track. Enabling the mic implies audio capture.
+    pub fn with_mic(mut self, enabled: bool) -> Self {
+        self.mic_enabled = enabled;
+        if enabled {
+            self.audio_enabled = true;
+        }
         self
     }
 
@@ -129,7 +143,12 @@ impl CaptureBackend for WaycapBackend {
             .with_quality_preset(self.quality.into())
             .with_target_fps(self.fps as u64)
             .with_cursor_shown();
-        if self.audio_enabled {
+        if self.mic_enabled {
+            // with_microphone() implies audio; mixes mic + desktop into one track.
+            builder = builder
+                .with_microphone()
+                .with_audio_encoder(AudioEncoder::Opus);
+        } else if self.audio_enabled {
             builder = builder.with_audio().with_audio_encoder(AudioEncoder::Opus);
         }
         if let Some(token) = saved_token {
