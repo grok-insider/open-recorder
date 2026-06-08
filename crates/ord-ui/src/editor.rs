@@ -90,7 +90,7 @@ impl EditorState {
     }
 
     /// Render the editor; returns the action the user took (if any).
-    pub fn ui(&mut self, ctx: &egui::Context) -> EditorAction {
+    pub fn ui(&mut self, ctx: &egui::Context, wd: &crate::diag::Watchdog) -> EditorAction {
         // Pull in any decoded filmstrip tiles.
         while let Ok((i, img)) = self.strip_rx.try_recv() {
             if let Some(slot) = self.strip.get_mut(i) {
@@ -139,6 +139,7 @@ impl EditorState {
             ui.add_space(8.0);
         });
 
+        wd.beat("editor:preview");
         let panel_frame =
             egui::Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::same(8.0));
         egui::CentralPanel::default()
@@ -146,6 +147,7 @@ impl EditorState {
             .show(ctx, |ui| {
                 self.preview_ui(ui, ctx);
             });
+        wd.beat("editor:done");
 
         if self.debug {
             self.debug_tick(ctx);

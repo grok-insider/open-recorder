@@ -66,6 +66,7 @@ pub struct LibraryApp {
     loading: bool,
     /// When `Some`, the trim editor is shown instead of the library grid.
     editor: Option<EditorState>,
+    watchdog: crate::diag::Watchdog,
 }
 
 impl LibraryApp {
@@ -88,6 +89,7 @@ impl LibraryApp {
             styled: false,
             loading: false,
             editor: None,
+            watchdog: crate::diag::Watchdog::start(std::time::Duration::from_secs(4)),
         }
     }
 
@@ -273,6 +275,7 @@ fn apply_theme(ctx: &egui::Context) {
 
 impl eframe::App for LibraryApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.watchdog.beat("update");
         if !self.styled {
             crate::fonts::install(ctx);
             apply_theme(ctx);
@@ -282,7 +285,9 @@ impl eframe::App for LibraryApp {
 
         // Trim editor takes over the whole window when open.
         if self.editor.is_some() {
-            let action = self.editor.as_mut().unwrap().ui(ctx);
+            self.watchdog.beat("editor");
+            let wd = self.watchdog.clone();
+            let action = self.editor.as_mut().unwrap().ui(ctx, &wd);
             match action {
                 EditorAction::None => {}
                 EditorAction::Back => self.editor = None,
@@ -299,6 +304,7 @@ impl eframe::App for LibraryApp {
             return;
         }
 
+        self.watchdog.beat("library");
         if !self.loading {
             self.start_loading(ctx);
         }

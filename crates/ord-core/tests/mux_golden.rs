@@ -178,6 +178,77 @@ fn mux_with_audio_produces_two_streams() {
 }
 
 #[test]
+fn mux_interleaves_audio_and_video() {
+    // Video + audio covering the same 0.5s. A correct mux interleaves them by
+    // timestamp; the old bug wrote [all video][all audio], so players had to
+    // read the whole video block before any audio (audio appeared delayed).
+    let step = NANOS_PER_SEC / 60;
+    let frames: Vec<EncodedFrame> = (0..30)
+        .map(|i| {
+            let kf = i % 10 == 0;
+            let pts = i as i64 * step;
+            EncodedFrame::new(access_unit(kf), kf, pts, pts)
+        })
+        .collect();
+    let audio: Vec<EncodedAudioFrame> = (0..25)
+        .map(|i| EncodedAudioFrame::new(vec![0xfcu8; 40], i as i64 * 960, i as i64 * 20_000))
+        .collect();
+
+    let clip = PreparedClip {
+        frames,
+        audio,
+        params: StreamParams {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            codec: Codec::H264,
+            time_base_den: NANOS_PER_SEC,
+        },
+        audio_params: Some(AudioParams {
+            sample_rate: 48000,
+            channels: 2,
+            codec: AudioCodec::Opus,
+        }),
+    };
+
+    let out = std::env::temp_dir().join(format!("ord-mux-interleave-{}.mkv", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    ord_core::write_clip(&clip, &out).expect("write_clip");
+
+    if ffprobe_available() {
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "packet=stream_index",
+                "-of",
+                "csv=p=0",
+                "-read_intervals",
+                "%+#12",
+            ])
+            .arg(&out)
+            .output()
+            .expect("run ffprobe");
+        let order: Vec<&str> = std::str::from_utf8(&probe.stdout)
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        // Both streams must appear, and an audio packet (stream 1) must show up
+        // early — not only after the entire video block.
+        assert!(
+            order.iter().any(|s| *s == "0"),
+            "no video packets: {order:?}"
+        );
+        assert!(
+            order.iter().take(6).any(|s| *s == "1"),
+            "audio not interleaved early (got {order:?})"
+        );
+    }
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn mux_with_large_monotonic_base_stays_synced() {
     // waycap pts are raw CLOCK_MONOTONIC nanoseconds (~10^14). The clip's video
     // and audio share that epoch; muxing must (a) not overflow and (b) rebase

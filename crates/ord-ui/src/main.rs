@@ -9,8 +9,12 @@ fn clips_dir() -> PathBuf {
 
 #[cfg(feature = "gui")]
 fn main() {
+    // Record panics + UI stalls to the diagnostics log so crashes/ANRs are
+    // captured by the program itself.
+    ord_ui::diag::install_panic_hook();
     if let Err(e) = ord_ui::app::run(clips_dir()) {
         eprintln!("ord-ui: {e}");
+        ord_ui::diag::log_line(&format!("ord-ui exited with error: {e}"));
         std::process::exit(1);
     }
 }
