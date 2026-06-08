@@ -15,7 +15,7 @@ use eframe::egui;
 use ord_export::{Preset, Trim};
 
 use crate::format::human_duration;
-use crate::player::Player;
+use crate::player::{Player, PreviewFrame};
 use crate::timeline::{Timeline, View};
 
 const FILMSTRIP_TILES: usize = 14;
@@ -287,21 +287,25 @@ impl EditorState {
     }
 
     fn preview_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let tex = self.player.frame(ctx).cloned();
         let avail = ui.available_size();
-        match tex {
-            Some(tex) => {
+        // Aspect-fit (w, h) inside the available area for source dims (tw, th).
+        let fit = |tw: usize, th: usize| -> egui::Vec2 {
+            let ar = (tw.max(1) as f32) / (th.max(1) as f32);
+            let mut w = avail.x;
+            let mut h = w / ar;
+            if h > avail.y {
+                h = avail.y;
+                w = h * ar;
+            }
+            egui::vec2(w, h)
+        };
+        match self.player.frame(ctx) {
+            PreviewFrame::Texture(tex) => {
                 let [tw, th] = tex.size();
-                let ar = (tw.max(1) as f32) / (th.max(1) as f32);
-                let mut w = avail.x;
-                let mut h = w / ar;
-                if h > avail.y {
-                    h = avail.y;
-                    w = h * ar;
-                }
+                let size = fit(tw, th);
                 ui.vertical_centered(|ui| {
                     let img = egui::Image::new(&tex)
-                        .fit_to_exact_size(egui::vec2(w, h))
+                        .fit_to_exact_size(size)
                         .rounding(8.0)
                         .sense(egui::Sense::click());
                     if ui.add(img).clicked() {
@@ -309,7 +313,19 @@ impl EditorState {
                     }
                 });
             }
-            None => {
+            PreviewFrame::Gl => {
+                let [tw, th] = self.player.video_size().unwrap_or([16, 9]);
+                let size = fit(tw, th);
+                ui.vertical_centered(|ui| {
+                    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                    // Draw the NV12 frame on the GPU into this rect.
+                    ui.painter().add(self.player.gl_callback(rect));
+                    if resp.clicked() {
+                        self.player.toggle();
+                    }
+                });
+            }
+            PreviewFrame::None => {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         egui::RichText::new("decoding preview…")

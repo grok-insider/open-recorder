@@ -18,6 +18,8 @@ pub mod editor;
 #[cfg(feature = "gui")]
 pub mod fonts;
 #[cfg(feature = "gui")]
+pub mod glvideo;
+#[cfg(feature = "gui")]
 pub mod meta;
 #[cfg(feature = "gui")]
 pub mod player;
