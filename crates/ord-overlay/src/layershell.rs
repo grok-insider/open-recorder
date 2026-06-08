@@ -201,21 +201,11 @@ impl State {
             px.copy_from_slice(&[0, 0, 0, 0]);
         }
 
-        if self.visible && hud.has_content() {
-            let mut row = 0u32;
-
-            // Buffer-active indicator as the first slim bar.
-            if hud.buffer_active {
-                fill_bar(canvas, w, row, 0x66000000 | 0x004CAF50); // translucent green
-                row += 1;
-            }
-            for toast in hud
-                .toasts()
-                .iter()
-                .take((MAX_ROWS.saturating_sub(row)) as usize)
-            {
-                fill_bar(canvas, w, row, Self::color(toast.kind));
-                row += 1;
+        if self.visible {
+            // Only transient toasts are drawn; the replay buffer being armed is
+            // not shown as a persistent bar (it floated over everything).
+            for (row, toast) in hud.toasts().iter().take(MAX_ROWS as usize).enumerate() {
+                fill_bar(canvas, w, row as u32, Self::color(toast.kind));
             }
         }
 

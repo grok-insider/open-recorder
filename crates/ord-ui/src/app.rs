@@ -274,6 +274,7 @@ fn apply_theme(ctx: &egui::Context) {
 impl eframe::App for LibraryApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.styled {
+            crate::fonts::install(ctx);
             apply_theme(ctx);
             self.styled = true;
         }

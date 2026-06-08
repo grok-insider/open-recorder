@@ -23,9 +23,11 @@ use eframe::egui;
 use ffmpeg_next as ff;
 
 /// Decode preview at most this wide (keeps memory/CPU sane; export is full-res).
-const PREVIEW_MAX_W: u32 = 960;
-/// Bounded look-ahead video queue (frames). ~0.4s at 60fps.
-const VIDEO_QUEUE_MAX: usize = 24;
+/// 1440 is crisp on a 1440p display while keeping the frame queue bounded.
+const PREVIEW_MAX_W: u32 = 1440;
+/// Bounded look-ahead video queue (frames). ~0.2s at 60fps; smaller because
+/// frames are larger at 1440px (1440x810 RGBA ≈ 4.7 MB each).
+const VIDEO_QUEUE_MAX: usize = 12;
 /// Audio look-ahead cap (interleaved f32 samples) ≈ 2s stereo @ 48k.
 const AUDIO_BUF_MAX: usize = 48_000 * 2 * 2;
 
@@ -415,7 +417,7 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>, ctx: egui::Context) {
         ff::format::Pixel::RGBA,
         out_w,
         out_h,
-        ff::software::scaling::flag::Flags::BILINEAR,
+        ff::software::scaling::flag::Flags::LANCZOS,
     ) {
         Ok(s) => s,
         Err(_) => return,
