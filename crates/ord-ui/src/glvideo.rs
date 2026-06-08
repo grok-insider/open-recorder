@@ -142,6 +142,7 @@ impl GlVideo {
                 glow::PixelUnpackData::Slice(&f.y),
             );
         }
+        gl.generate_mipmap(glow::TEXTURE_2D);
 
         let cw = (f.w / 2) as i32;
         let ch = (f.h / 2) as i32;
@@ -171,6 +172,7 @@ impl GlVideo {
                 glow::PixelUnpackData::Slice(&f.uv),
             );
         }
+        gl.generate_mipmap(glow::TEXTURE_2D);
 
         self.dims = (f.w, f.h);
         self.uploaded_pts = f.pts;
@@ -207,10 +209,12 @@ impl GlVideo {
 unsafe fn make_tex(gl: &glow::Context) -> Option<glow::Texture> {
     let tex = gl.create_texture().ok()?;
     gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    // Trilinear min filter: with mipmaps this makes downscaling the full-res
+    // frame to the (smaller) preview widget crisp + alias-free at any window size.
     gl.tex_parameter_i32(
         glow::TEXTURE_2D,
         glow::TEXTURE_MIN_FILTER,
-        glow::LINEAR as i32,
+        glow::LINEAR_MIPMAP_LINEAR as i32,
     );
     gl.tex_parameter_i32(
         glow::TEXTURE_2D,

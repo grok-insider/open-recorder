@@ -22,9 +22,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use ffmpeg_next as ff;
 
-/// Decode preview at most this wide (keeps memory/CPU sane; export is full-res).
-/// 1440 is crisp on a 1440p display while keeping the frame queue bounded.
-const PREVIEW_MAX_W: u32 = 1440;
+/// Decode/scale cap for the preview. With the GPU render path the GPU scales the
+/// full-res frame down to the preview widget in one pass (crisp), so we keep the
+/// decode at (near) source resolution: 1440p decodes full-res; only >2560-wide
+/// sources (4K) are downscaled by NVDEC to bound VRAM/queue memory. The old 1440
+/// cap caused a soft "downscale to 1440 then upscale to the widget" double pass.
+const PREVIEW_MAX_W: u32 = 2560;
 /// Bounded look-ahead video queue (frames) ≈ 0.5s at 60fps. This is the demuxer
 /// pacer: it must hold a comparable DURATION to the audio buffer below, otherwise
 /// the demuxer races ahead to fill audio and the video queue overflows → video
@@ -188,14 +191,11 @@ pub struct Player {
     fps: f64,
 }
 
-/// True when the GPU NV12 shader render path is requested (`ORD_RENDER=gl` or
-/// `ORD_DECODE=gl|zerocopy`). Default is the CPU RGBA path.
+/// The GPU NV12 shader render path is the DEFAULT: it scales the full-res frame
+/// to the preview widget in one pass (crisp) with ~0 CPU. Opt out with
+/// `ORD_RENDER=cpu` (falls back to the egui-texture path with a CPU scale).
 fn render_gl_enabled() -> bool {
-    matches!(std::env::var("ORD_RENDER").as_deref(), Ok("gl"))
-        || matches!(
-            std::env::var("ORD_DECODE").as_deref(),
-            Ok("gl") | Ok("zerocopy")
-        )
+    !matches!(std::env::var("ORD_RENDER").as_deref(), Ok("cpu"))
 }
 
 impl Player {
