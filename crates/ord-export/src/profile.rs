@@ -71,6 +71,8 @@ pub struct ExportProfile {
     /// Audio output bitrate in kbps (used when transcoding to AAC). Opus copy
     /// ignores this.
     pub audio_kbps: u32,
+    /// Drop the audio track entirely (`-an`).
+    pub mute: bool,
 }
 
 impl Default for ExportProfile {
@@ -91,6 +93,7 @@ impl ExportProfile {
             rate_control: RateControl::Quality(20),
             hardware: true,
             audio_kbps: 192,
+            mute: false,
         }
     }
 
@@ -105,6 +108,7 @@ impl ExportProfile {
             rate_control: RateControl::TargetSize { mib: 9.0 },
             hardware: true,
             audio_kbps: 128,
+            mute: false,
         }
     }
 
@@ -119,6 +123,7 @@ impl ExportProfile {
             rate_control: RateControl::Copy,
             hardware: false,
             audio_kbps: 0,
+            mute: false,
         }
     }
 

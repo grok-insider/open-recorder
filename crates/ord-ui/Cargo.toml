@@ -17,10 +17,14 @@ ord-export = { workspace = true, optional = true }
 thiserror.workspace = true
 eframe = { version = "0.29", optional = true }
 image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
+# Inline A/V preview player (decode via ffmpeg-next, audio out via cpal).
+ffmpeg-next = { version = "8", optional = true }
+cpal = { version = "0.15", optional = true }
 
 [features]
-# `gui` pulls in eframe/egui (needs system GL/Wayland libs) plus image decoding
-# for thumbnails and ord-export for the Export action. Off in CI so the pure
-# clip-library scanning + formatting logic builds and tests without a display.
+# `gui` pulls in eframe/egui (needs system GL/Wayland libs), image decoding for
+# thumbnails, ord-export for the Export action, and ffmpeg-next + cpal for the
+# inline editor preview/playback. Off in CI so the pure clip-library scanning +
+# formatting logic builds and tests without a display or media libs.
 default = []
-gui = ["dep:eframe", "dep:image", "dep:ord-export"]
+gui = ["dep:eframe", "dep:image", "dep:ord-export", "dep:ffmpeg-next", "dep:cpal"]

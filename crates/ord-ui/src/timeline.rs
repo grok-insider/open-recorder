@@ -92,12 +92,55 @@ impl Timeline {
     }
 }
 
+/// A zoom/scroll window over the clip, mapping time <-> on-track fraction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct View {
+    pub start: f64,
+    pub span: f64,
+}
+
+impl View {
+    /// Window for `duration` at `zoom` (>=1; 1 = whole clip) scrolled to
+    /// `scroll_frac` in `[0,1]` of the available range.
+    pub fn new(duration: f64, zoom: f32, scroll_frac: f32) -> Self {
+        let zoom = (zoom as f64).max(1.0);
+        let span = (duration / zoom).max(1e-6);
+        let max_start = (duration - span).max(0.0);
+        let start = (scroll_frac.clamp(0.0, 1.0) as f64) * max_start;
+        Self { start, span }
+    }
+
+    /// Fraction across the view for a time (may be <0 or >1 if off-screen).
+    pub fn frac_of(&self, t: f64) -> f32 {
+        ((t - self.start) / self.span) as f32
+    }
+
+    /// Time at a fraction across the view.
+    pub fn time_at(&self, frac: f32) -> f64 {
+        self.start + (frac as f64) * self.span
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn approx(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn view_zoom_and_scroll() {
+        let v = View::new(30.0, 1.0, 0.0);
+        assert!(approx(v.start, 0.0) && approx(v.span, 30.0));
+        let v = View::new(30.0, 2.0, 0.0);
+        assert!(approx(v.start, 0.0) && approx(v.span, 15.0));
+        let v = View::new(30.0, 2.0, 1.0);
+        assert!(approx(v.start, 15.0) && approx(v.span, 15.0));
+        // round-trip
+        let v = View::new(30.0, 3.0, 0.5);
+        assert!(approx(v.time_at(v.frac_of(12.0)), 12.0));
+        assert!((v.frac_of(v.start) - 0.0).abs() < 1e-6);
     }
 
     #[test]

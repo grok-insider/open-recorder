@@ -178,7 +178,7 @@ fn scale_filter(scale: Scale, src: &SourceInfo) -> Option<String> {
 
 /// Audio output flags for a re-encode (the copy path sets `-c copy` globally).
 fn audio_args(profile: &ExportProfile, src: &SourceInfo) -> Vec<String> {
-    if !src.has_audio {
+    if profile.mute || !src.has_audio {
         return vec!["-an".into()];
     }
     // Target-size must control audio size, so it always transcodes.
@@ -246,8 +246,14 @@ pub fn build_plan(
 
     if !profile.reencodes() {
         // Stream copy: instant, lossless remux.
-        args.push("-c".into());
-        args.push("copy".into());
+        if profile.mute {
+            args.push("-c:v".into());
+            args.push("copy".into());
+            args.push("-an".into());
+        } else {
+            args.push("-c".into());
+            args.push("copy".into());
+        }
         if profile.container == Container::Mp4 {
             args.push("-movflags".into());
             args.push("+faststart".into());
