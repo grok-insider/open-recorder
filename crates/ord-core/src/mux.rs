@@ -203,8 +203,10 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
     let to_ms = |t: i64| -> i64 { (t - base) * 1000 / den };
 
     // Audio rebasing: audio frames carry a microsecond capture timestamp. Rebase
-    // by the clip's first video frame so audio and video share t=0.
-    let video_base_us = base * 1000 / den;
+    // by the clip's first video frame (converted to microseconds, 128-bit-safe)
+    // so audio and video share t=0, then express in milliseconds (the stream
+    // time base) to match the video packets.
+    let video_base_us = crate::ticks_to_micros(base, den);
     let audio_to_ms = |ts_us: i64| -> i64 { (ts_us - video_base_us) / 1000 };
 
     // Keep DTS strictly increasing: when two frames round to the same

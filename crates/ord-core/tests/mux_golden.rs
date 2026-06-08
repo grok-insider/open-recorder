@@ -178,6 +178,82 @@ fn mux_with_audio_produces_two_streams() {
 }
 
 #[test]
+fn mux_with_large_monotonic_base_stays_synced() {
+    // waycap pts are raw CLOCK_MONOTONIC nanoseconds (~10^14). The clip's video
+    // and audio share that epoch; muxing must (a) not overflow and (b) rebase
+    // both to ~0 so the audio is not flung hours away from the video.
+    let base_ns: i64 = 100_000_000_000_000; // ~27.7 hours of uptime
+    let step = NANOS_PER_SEC / 60;
+    let frames: Vec<EncodedFrame> = (0..30)
+        .map(|i| {
+            let kf = i % 10 == 0;
+            let pts = base_ns + i as i64 * step;
+            EncodedFrame::new(access_unit(kf), kf, pts, pts)
+        })
+        .collect();
+    // Audio timestamps in microseconds on the same monotonic epoch.
+    let base_us = base_ns / 1000;
+    let audio: Vec<EncodedAudioFrame> = (0..25)
+        .map(|i| {
+            EncodedAudioFrame::new(
+                vec![0xfcu8; 40],
+                i as i64 * 960,
+                base_us + i as i64 * 20_000,
+            )
+        })
+        .collect();
+
+    let clip = PreparedClip {
+        frames,
+        audio,
+        params: StreamParams {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            codec: Codec::H264,
+            time_base_den: NANOS_PER_SEC,
+        },
+        audio_params: Some(AudioParams {
+            sample_rate: 48000,
+            channels: 2,
+            codec: AudioCodec::Opus,
+        }),
+    };
+
+    let out = std::env::temp_dir().join(format!("ord-mux-bigbase-{}.mkv", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    // Must not panic with "attempt to multiply with overflow".
+    ord_core::write_clip(&clip, &out).expect("write_clip with large base should succeed");
+
+    if ffprobe_available() {
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=start_time",
+                "-of",
+                "default=nokey=1:noprint_wrappers=1",
+            ])
+            .arg(&out)
+            .output()
+            .expect("run ffprobe");
+        let start: f64 = String::from_utf8_lossy(&probe.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(f64::MAX);
+        // Rebased audio starts near 0, not hours in (the old ms/us bug).
+        assert!(
+            start.abs() < 2.0,
+            "audio start_time should be ~0 after rebase, got {start}"
+        );
+    }
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn mux_rejects_clip_without_keyframe() {
     // No keyframe -> cannot build avcC -> error (never a silent bad file).
     let frames = vec![EncodedFrame::new(access_unit(false), false, 0, 1)];
