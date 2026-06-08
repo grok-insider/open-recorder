@@ -13,7 +13,7 @@ use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
 use smithay_client_toolkit::reexports::client::protocol::{wl_output, wl_shm, wl_surface};
-use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
+use smithay_client_toolkit::reexports::client::{Connection, EventQueue, QueueHandle};
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
     LayerSurfaceConfigure,
@@ -37,13 +37,21 @@ const MAX_ROWS: u32 = 6;
 
 /// A live wlr-layer-shell HUD surface.
 pub struct LayerShellOverlay {
-    state: Option<State>,
+    inner: Option<Inner>,
+}
+
+/// The connected surface plus its event queue. The queue must be pumped every
+/// frame; otherwise `wl_buffer.release` events are never received and the shm
+/// [`SlotPool`] allocates a fresh buffer on every draw (a steady memory leak).
+struct Inner {
+    state: State,
+    event_queue: EventQueue<State>,
 }
 
 impl LayerShellOverlay {
     /// Construct (does not connect yet; call [`Overlay::create`]).
     pub fn new() -> Self {
-        Self { state: None }
+        Self { inner: None }
     }
 }
 
@@ -55,25 +63,30 @@ impl Default for LayerShellOverlay {
 
 impl Overlay for LayerShellOverlay {
     fn create(&mut self) -> Result<(), OverlayError> {
-        let state = State::connect().map_err(OverlayError::Create)?;
-        self.state = Some(state);
+        let (state, event_queue) = State::connect().map_err(OverlayError::Create)?;
+        self.inner = Some(Inner { state, event_queue });
         Ok(())
     }
 
     fn set_visible(&mut self, visible: bool) {
-        if let Some(s) = self.state.as_mut() {
-            s.visible = visible;
+        if let Some(inner) = self.inner.as_mut() {
+            inner.state.visible = visible;
         }
     }
 
     fn render(&mut self, hud: &Hud) {
-        if let Some(s) = self.state.as_mut() {
-            s.draw(hud);
+        if let Some(inner) = self.inner.as_mut() {
+            // Process queued events (configure/close) before drawing.
+            let _ = inner.event_queue.dispatch_pending(&mut inner.state);
+            inner.state.draw(hud);
+            // Round-trip so the compositor's buffer-release events come back and
+            // the SlotPool recycles buffers instead of growing every frame.
+            let _ = inner.event_queue.roundtrip(&mut inner.state);
         }
     }
 
     fn destroy(&mut self) {
-        self.state = None;
+        self.inner = None;
     }
 }
 
@@ -92,7 +105,7 @@ struct State {
 }
 
 impl State {
-    fn connect() -> Result<State, String> {
+    fn connect() -> Result<(State, EventQueue<State>), String> {
         let conn = Connection::connect_to_env().map_err(|e| e.to_string())?;
         let (globals, mut event_queue) =
             registry_queue_init::<State>(&conn).map_err(|e| e.to_string())?;
@@ -155,7 +168,7 @@ impl State {
         if !state.configured {
             return Err("layer surface was not configured".into());
         }
-        Ok(state)
+        Ok((state, event_queue))
     }
 
     fn color(kind: ToastKind) -> u32 {
