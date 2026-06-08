@@ -12,8 +12,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use ord_export::{export, ExportSummary, Preset};
+use ord_export::{export, ExportSummary, Preset, Trim};
 
+use crate::editor::{EditorAction, EditorState};
 use crate::format::{human_duration, human_size, relative_time, resolution};
 use crate::library::{scan_dir, Clip};
 use crate::meta::{self, ClipMeta};
@@ -63,6 +64,8 @@ pub struct LibraryApp {
     status: Option<(String, Instant)>,
     styled: bool,
     loading: bool,
+    /// When `Some`, the trim editor is shown instead of the library grid.
+    editor: Option<EditorState>,
 }
 
 impl LibraryApp {
@@ -84,6 +87,7 @@ impl LibraryApp {
             status: None,
             styled: false,
             loading: false,
+            editor: None,
         }
     }
 
@@ -160,21 +164,36 @@ impl LibraryApp {
     }
 
     fn start_export(&mut self, clip: &Clip, preset: Preset, ctx: &egui::Context) {
-        if self.exporting.contains(&clip.path) {
+        self.run_export(&clip.path, &clip.stem, clip.label(), preset, None, ctx);
+    }
+
+    /// Export `input` with `preset`, optionally trimmed. Runs off-thread and
+    /// reports via the export channel; ignores a duplicate in-flight export.
+    fn run_export(
+        &mut self,
+        input: &Path,
+        stem: &str,
+        label: &str,
+        preset: Preset,
+        trim: Option<Trim>,
+        ctx: &egui::Context,
+    ) {
+        if self.exporting.contains(input) {
             return;
         }
         let profile = preset.profile();
         let ext = profile.container.extension();
         let preset_name = preset_label(preset);
+        let suffix = if trim.is_some() { "-trim" } else { "" };
         let out =
-            meta::exports_dir(&self.clips_dir).join(format!("{}-{preset_name}.{ext}", clip.stem));
-        let input = clip.path.clone();
+            meta::exports_dir(&self.clips_dir).join(format!("{stem}-{preset_name}{suffix}.{ext}"));
+        let input = input.to_path_buf();
         let tx = self.export_tx.clone();
         let ctx = ctx.clone();
-        self.exporting.insert(clip.path.clone());
-        self.set_status(format!("Exporting {} as {preset_name}…", clip.label()));
+        self.exporting.insert(input.clone());
+        self.set_status(format!("Exporting {label} as {preset_name}…"));
         std::thread::spawn(move || {
-            let result = export(&input, &out, &profile, None).map_err(|e| e.to_string());
+            let result = export(&input, &out, &profile, trim).map_err(|e| e.to_string());
             let _ = tx.send(ExportMsg {
                 clip: input,
                 result,
@@ -247,10 +266,30 @@ impl eframe::App for LibraryApp {
             apply_theme(ctx);
             self.styled = true;
         }
+        self.drain_channels(ctx);
+
+        // Trim editor takes over the whole window when open.
+        if self.editor.is_some() {
+            let action = self.editor.as_mut().unwrap().ui(ctx);
+            match action {
+                EditorAction::None => {}
+                EditorAction::Back => self.editor = None,
+                EditorAction::Export { preset, trim } => {
+                    let clip = self.editor.as_ref().unwrap().clip().clone();
+                    let stem = clip
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "clip".to_string());
+                    self.run_export(&clip, &stem, &stem, preset, trim, ctx);
+                    self.editor = None;
+                }
+            }
+            return;
+        }
+
         if !self.loading {
             self.start_loading(ctx);
         }
-        self.drain_channels(ctx);
 
         let now = now_epoch();
         let total_size: u64 = self
@@ -348,7 +387,9 @@ impl LibraryApp {
             .show(ui, |ui| {
                 ui.set_width(CARD_INNER_W);
                 ui.vertical(|ui| {
-                    self.thumbnail(ui, clip);
+                    if self.thumbnail(ui, clip) {
+                        self.open_editor(clip, ctx);
+                    }
                     ui.add_space(8.0);
 
                     ui.label(egui::RichText::new(clip.label()).strong().size(15.0));
@@ -384,14 +425,21 @@ impl LibraryApp {
             });
     }
 
-    fn thumbnail(&self, ui: &mut egui::Ui, clip: &Clip) {
+    /// Render the thumbnail; returns true if it was clicked (opens the editor).
+    fn thumbnail(&self, ui: &mut egui::Ui, clip: &Clip) -> bool {
         let size = egui::vec2(THUMB_W, THUMB_H);
         match self.states.get(&clip.path).and_then(|s| s.texture.as_ref()) {
-            Some(tex) => {
-                ui.add(egui::Image::new(tex).fit_to_exact_size(size).rounding(8.0));
-            }
+            Some(tex) => ui
+                .add(
+                    egui::Image::new(tex)
+                        .fit_to_exact_size(size)
+                        .rounding(8.0)
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text("Edit / trim")
+                .clicked(),
             None => {
-                let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                 ui.painter()
                     .rect_filled(rect, 8.0, egui::Color32::from_rgb(18, 18, 23));
                 ui.painter().text(
@@ -401,8 +449,23 @@ impl LibraryApp {
                     egui::FontId::proportional(28.0),
                     egui::Color32::from_rgb(70, 70, 86),
                 );
+                resp.on_hover_text("Edit / trim").clicked()
             }
         }
+    }
+
+    fn open_editor(&mut self, clip: &Clip, ctx: &egui::Context) {
+        let duration = self
+            .states
+            .get(&clip.path)
+            .and_then(|s| s.meta.as_ref())
+            .map(|m| m.duration_secs);
+        self.editor = Some(EditorState::new(
+            clip.path.clone(),
+            clip.label().to_string(),
+            duration,
+            ctx,
+        ));
     }
 
     fn actions(&mut self, ui: &mut egui::Ui, clip: &Clip, ctx: &egui::Context) {
@@ -410,6 +473,9 @@ impl LibraryApp {
         ui.horizontal(|ui| {
             if ui.button("▶  Open").clicked() {
                 open_clip(&clip.path);
+            }
+            if ui.button("Edit").clicked() {
+                self.open_editor(clip, ctx);
             }
             let exporting = self.exporting.contains(&clip.path);
             ui.add_enabled_ui(!exporting, |ui| {
