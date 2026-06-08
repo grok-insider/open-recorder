@@ -84,6 +84,13 @@ impl EditorState {
         &self.clip
     }
 
+    /// Pause playback (used when the window loses focus / is hidden).
+    pub fn pause_player(&mut self) {
+        if self.player.is_playing() {
+            self.player.pause();
+        }
+    }
+
     fn seek_to(&mut self, t: f64) {
         self.timeline.set_playhead(t);
         self.player.seek(t);

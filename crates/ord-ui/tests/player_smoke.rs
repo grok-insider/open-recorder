@@ -71,6 +71,20 @@ fn player_decodes_audio_advances_and_seeks() {
     }
     assert!(got, "no preview frame decoded");
 
+    // Opens PAUSED: without play(), the master clock must not advance (no
+    // auto-play, even though cpal's stream.pause() is a no-op on some hosts).
+    let p0 = p.position();
+    for _ in 0..15 {
+        let _ = p.frame(&ctx);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let p1 = p.position();
+    assert!(!p.is_playing(), "should not be playing on open");
+    assert!(
+        (p1 - p0).abs() < 0.05,
+        "clock advanced while paused (auto-play): {p0} -> {p1}"
+    );
+
     // Playback fills the audio buffer and advances the master clock.
     p.play();
     let mut audio_seen = false;
