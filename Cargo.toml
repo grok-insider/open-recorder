@@ -25,5 +25,6 @@ repository = "https://github.com/0xfell/open-recorder"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 thiserror = "2"
+toml = "0.8"
 ord-common = { path = "crates/ord-common" }
 ord-core = { path = "crates/ord-core" }
