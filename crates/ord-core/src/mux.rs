@@ -209,8 +209,27 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
     let video_base_us = crate::ticks_to_micros(base, den);
     let audio_to_ms = |ts_us: i64| -> i64 { (ts_us - video_base_us) / 1000 };
 
-    // Keep DTS strictly increasing: when two frames round to the same
-    // millisecond, bump the later one by 1ms so the muxer accepts the stream.
+    // Build every packet with a per-stream-monotonic millisecond timestamp, then
+    // write them MERGED in timestamp order. Writing an entire stream before the
+    // other defeats av_interleaved_write_frame and yields a [all video][all
+    // audio] file: players must read the whole video block before reaching any
+    // audio, so audio appears delayed (and seeking/streaming suffer).
+    enum Pkt {
+        Video {
+            dts: i64,
+            pts: i64,
+            key: bool,
+            data: Vec<u8>,
+        },
+        Audio {
+            ts: i64,
+            data: Vec<u8>,
+        },
+    }
+
+    let mut packets: Vec<Pkt> = Vec::with_capacity(ordered.len() + clip.audio.len());
+
+    // Video: keep DTS strictly increasing (bump ties by 1ms).
     let mut last_dts = i64::MIN;
     for frame in ordered {
         // Convert Annex-B -> AVCC (length-prefixed, SPS/PPS stripped) for H.264.
@@ -228,36 +247,67 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
         }
         last_dts = dts;
         let pts = to_ms(frame.pts).max(dts);
-
-        let mut packet = ffmpeg_next::codec::packet::Packet::copy(&payload);
-        packet.set_pts(Some(pts));
-        packet.set_dts(Some(dts));
-        packet.set_stream(stream_index);
-        if frame.is_keyframe {
-            packet.set_flags(ffmpeg_next::codec::packet::Flags::KEY);
-        }
-        packet.write_interleaved(&mut octx)?;
+        packets.push(Pkt::Video {
+            dts,
+            pts,
+            key: frame.is_keyframe,
+            data: payload,
+        });
     }
 
-    // Write audio packets (Opus passthrough) on the audio stream, if present.
-    if let Some(astream) = audio_stream_index {
+    // Audio (Opus passthrough), if present.
+    if audio_stream_index.is_some() {
         let mut audio: Vec<&crate::audio::EncodedAudioFrame> = clip.audio.iter().collect();
         audio.sort_by_key(|f| f.timestamp_micros);
-        let mut last_audio_dts = i64::MIN;
+        let mut last_audio_ts = i64::MIN;
         for frame in audio {
             if frame.data.is_empty() {
                 continue;
             }
             let mut ts = audio_to_ms(frame.timestamp_micros);
-            if ts <= last_audio_dts {
-                ts = last_audio_dts + 1;
+            if ts <= last_audio_ts {
+                ts = last_audio_ts + 1;
             }
-            last_audio_dts = ts;
-            let mut packet = ffmpeg_next::codec::packet::Packet::copy(&frame.data);
-            packet.set_pts(Some(ts));
-            packet.set_dts(Some(ts));
-            packet.set_stream(astream);
-            packet.write_interleaved(&mut octx)?;
+            last_audio_ts = ts;
+            packets.push(Pkt::Audio {
+                ts,
+                data: frame.data.clone(),
+            });
+        }
+    }
+
+    // Merge by timestamp (video before audio on ties) for interleaved output.
+    packets.sort_by_key(|p| match p {
+        Pkt::Video { dts, .. } => (*dts, 0u8),
+        Pkt::Audio { ts, .. } => (*ts, 1u8),
+    });
+
+    for p in packets {
+        match p {
+            Pkt::Video {
+                dts,
+                pts,
+                key,
+                data,
+            } => {
+                let mut packet = ffmpeg_next::codec::packet::Packet::copy(&data);
+                packet.set_pts(Some(pts));
+                packet.set_dts(Some(dts));
+                packet.set_stream(stream_index);
+                if key {
+                    packet.set_flags(ffmpeg_next::codec::packet::Flags::KEY);
+                }
+                packet.write_interleaved(&mut octx)?;
+            }
+            Pkt::Audio { ts, data } => {
+                let astream =
+                    audio_stream_index.expect("audio packets only built when the stream exists");
+                let mut packet = ffmpeg_next::codec::packet::Packet::copy(&data);
+                packet.set_pts(Some(ts));
+                packet.set_dts(Some(ts));
+                packet.set_stream(astream);
+                packet.write_interleaved(&mut octx)?;
+            }
         }
     }
 

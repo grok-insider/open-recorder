@@ -31,6 +31,18 @@ const VIDEO_QUEUE_MAX: usize = 12;
 /// Audio look-ahead cap (interleaved f32 samples) ≈ 2s stereo @ 48k.
 const AUDIO_BUF_MAX: usize = 48_000 * 2 * 2;
 
+/// Live player diagnostics (debug overlay).
+#[derive(Debug, Clone, Copy)]
+pub struct Stats {
+    pub position: f64,
+    pub has_audio: bool,
+    pub playing: bool,
+    pub audio_buf_ms: f64,
+    pub frames_queued: usize,
+    pub decoded: u64,
+    pub dropped: u64,
+}
+
 /// A decoded RGBA video frame tagged with its presentation time (seconds).
 struct VideoFrame {
     width: usize,
@@ -47,8 +59,13 @@ struct Shared {
     has_audio: AtomicBool,
     sample_rate: AtomicU64,
     channels: AtomicU64,
-    /// Per-channel frames output by cpal since the last seek (the audio clock).
+    /// Raw audio samples (all channels) actually consumed by cpal since the last
+    /// seek — the audio master clock. Only *real* samples count (silence on
+    /// underrun does not advance it), so video stays locked to real audio.
     samples_played: AtomicU64,
+    /// Diagnostics (debug mode).
+    decoded: AtomicU64,
+    dropped: AtomicU64,
     seek_base: Mutex<f64>,
     seek_to: Mutex<Option<f64>>,
     in_secs: Mutex<f64>,
@@ -96,6 +113,8 @@ impl Player {
             sample_rate: AtomicU64::new(48_000),
             channels: AtomicU64::new(2),
             samples_played: AtomicU64::new(0),
+            decoded: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
             seek_base: Mutex::new(0.0),
             seek_to: Mutex::new(Some(0.0)),
             in_secs: Mutex::new(0.0),
@@ -154,6 +173,22 @@ impl Player {
         self.fps
     }
 
+    /// Live diagnostics for the debug overlay.
+    pub fn stats(&self) -> Stats {
+        let sr = self.shared.sample_rate.load(Ordering::Relaxed).max(1) as f64;
+        let ch = self.shared.channels.load(Ordering::Relaxed).max(1) as f64;
+        let audio_samples = self.shared.audio_buf.lock().unwrap().len() as f64;
+        Stats {
+            position: self.position(),
+            has_audio: self.has_audio(),
+            playing: self.is_playing(),
+            audio_buf_ms: (audio_samples / (sr * ch)) * 1000.0,
+            frames_queued: self.shared.frames.lock().unwrap().len(),
+            decoded: self.shared.decoded.load(Ordering::Relaxed),
+            dropped: self.shared.dropped.load(Ordering::Relaxed),
+        }
+    }
+
     pub fn has_audio(&self) -> bool {
         self.shared.has_audio.load(Ordering::Acquire)
     }
@@ -188,8 +223,9 @@ impl Player {
         let base = *self.shared.seek_base.lock().unwrap();
         if self.has_audio() {
             let sr = self.shared.sample_rate.load(Ordering::Relaxed).max(1) as f64;
+            let ch = self.shared.channels.load(Ordering::Relaxed).max(1) as f64;
             let played = self.shared.samples_played.load(Ordering::Relaxed) as f64;
-            (base + played / sr).min(self.duration)
+            (base + played / (sr * ch)).min(self.duration)
         } else {
             match *self.shared.play_anchor.lock().unwrap() {
                 Some(t0) => (base + t0.elapsed().as_secs_f64()).min(self.duration),
@@ -362,14 +398,20 @@ fn build_audio_stream(shared: &Arc<Shared>) -> Result<(cpal::Stream, u32, u16), 
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let vol = *shared_cb.volume.lock().unwrap();
                 let mut buf = shared_cb.audio_buf.lock().unwrap();
+                let mut consumed = 0u64;
                 for s in data.iter_mut() {
-                    *s = buf.pop_front().unwrap_or(0.0) * vol;
+                    match buf.pop_front() {
+                        Some(v) => {
+                            *s = v * vol;
+                            consumed += 1;
+                        }
+                        None => *s = 0.0, // underrun: silence, do NOT advance the clock
+                    }
                 }
                 drop(buf);
-                let frames = (data.len() / channels.max(1) as usize) as u64;
                 shared_cb
                     .samples_played
-                    .fetch_add(frames, Ordering::Relaxed);
+                    .fetch_add(consumed, Ordering::Relaxed);
             },
             |e| eprintln!("ord-ui: audio stream error: {e}"),
             None,
@@ -431,26 +473,17 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>, ctx: egui::Context) {
     } else {
         ff::channel_layout::ChannelLayout::MONO
     };
-    let mut audio: Option<(
-        usize,
-        ff::decoder::Audio,
-        ff::software::resampling::context::Context,
-    )> = None;
+    // Audio decoder only; the resampler is built lazily from the FIRST decoded
+    // frame, because a decoder's channel layout / format can be unset until then
+    // (building it upfront produced a mis-configured resampler → silent audio).
+    let mut audio: Option<(usize, ff::decoder::Audio)> = None;
+    let mut resampler: Option<ff::software::resampling::context::Context> = None;
     if shared.has_audio.load(Ordering::Acquire) {
         if let Some((aidx, aparams)) = audio_info {
             if let Ok(adec) = ff::codec::context::Context::from_parameters(aparams)
                 .and_then(|c| c.decoder().audio())
             {
-                if let Ok(res) = ff::software::resampling::context::Context::get(
-                    adec.format(),
-                    adec.channel_layout(),
-                    adec.rate(),
-                    ff::format::Sample::F32(ff::format::sample::Type::Packed),
-                    out_layout,
-                    out_rate,
-                ) {
-                    audio = Some((aidx, adec, res));
-                }
+                audio = Some((aidx, adec));
             }
         }
     }
@@ -466,20 +499,25 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>, ctx: egui::Context) {
             let ts = (t * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
             let _ = ictx.seek(ts, ..ts);
             vdec.flush();
-            if let Some((_, adec, _)) = audio.as_mut() {
+            if let Some((_, adec)) = audio.as_mut() {
                 adec.flush();
             }
             shared.frames.lock().unwrap().clear();
             shared.audio_buf.lock().unwrap().clear();
         }
 
-        // Backpressure: don't run ahead unboundedly.
-        let v_full = shared.frames.lock().unwrap().len() >= VIDEO_QUEUE_MAX;
-        let a_full = audio
-            .as_ref()
-            .map(|_| shared.audio_buf.lock().unwrap().len() >= AUDIO_BUF_MAX)
-            .unwrap_or(true);
-        if v_full && a_full {
+        // Backpressure: sleep when our pacing buffer is full. With audio, the
+        // audio buffer paces (video is bounded separately by dropping when its
+        // queue is full, so demux keeps flowing for audio); without audio, the
+        // video queue paces. This keeps memory bounded — the old `v_full &&
+        // a_full` let the video queue grow unboundedly (1440p RGBA ≈ 4.7 MB
+        // each), which exhausted memory and hung the app.
+        let full = if audio.is_some() {
+            shared.audio_buf.lock().unwrap().len() >= AUDIO_BUF_MAX
+        } else {
+            shared.frames.lock().unwrap().len() >= VIDEO_QUEUE_MAX
+        };
+        if full {
             std::thread::sleep(Duration::from_millis(4));
             continue;
         }
@@ -509,18 +547,42 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>, ctx: egui::Context) {
                     let mut rgba = ff::frame::Video::empty();
                     if scaler.run(&frame, &mut rgba).is_ok() {
                         let vf = pack_rgba(&rgba, pts);
-                        shared.frames.lock().unwrap().push_back(vf);
+                        shared.decoded.fetch_add(1, Ordering::Relaxed);
+                        // Bound the queue: drop the new frame if full so the
+                        // demuxer keeps flowing (for audio) and memory stays small.
+                        let mut q = shared.frames.lock().unwrap();
+                        if q.len() >= VIDEO_QUEUE_MAX {
+                            shared.dropped.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            q.push_back(vf);
+                        }
+                        drop(q);
                         ctx.request_repaint();
                     }
                 }
             }
-        } else if let Some((aidx, adec, res)) = audio.as_mut() {
+        } else if let Some((aidx, adec)) = audio.as_mut() {
             if idx == *aidx && adec.send_packet(&packet).is_ok() {
                 let mut frame = ff::frame::Audio::empty();
                 while adec.receive_frame(&mut frame).is_ok() {
-                    let mut out = ff::frame::Audio::empty();
-                    if res.run(&frame, &mut out).is_ok() {
-                        push_audio(&shared, &out, out_ch);
+                    // Build the resampler from the actual frame format the first
+                    // time we see one (layout/rate are reliable post-decode).
+                    if resampler.is_none() {
+                        resampler = ff::software::resampling::context::Context::get(
+                            frame.format(),
+                            frame.channel_layout(),
+                            frame.rate(),
+                            ff::format::Sample::F32(ff::format::sample::Type::Packed),
+                            out_layout,
+                            out_rate,
+                        )
+                        .ok();
+                    }
+                    if let Some(res) = resampler.as_mut() {
+                        let mut out = ff::frame::Audio::empty();
+                        if res.run(&frame, &mut out).is_ok() {
+                            push_audio(&shared, &out, out_ch);
+                        }
                     }
                 }
             }
