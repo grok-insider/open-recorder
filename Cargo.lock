@@ -3062,7 +3062,9 @@ name = "ord-ui"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "image",
  "ord-common",
+ "ord-export",
  "thiserror 2.0.18",
 ]
 
@@ -4454,7 +4456,7 @@ dependencies = [
 [[package]]
 name = "waycap-rs"
 version = "3.0.0"
-source = "git+https://github.com/0xfell/waycap-rs.git?rev=b8ed2a0ab7bbd5b5de231205e0fc8210dbec775f#b8ed2a0ab7bbd5b5de231205e0fc8210dbec775f"
+source = "git+https://github.com/0xfell/waycap-rs.git?rev=efb6a7878bda35c66390a2698a47443bc09023de#efb6a7878bda35c66390a2698a47443bc09023de"
 dependencies = [
  "bytemuck",
  "crossbeam",
