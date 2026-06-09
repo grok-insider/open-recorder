@@ -34,6 +34,12 @@ const PREVIEW_MAX_W: u32 = 2560;
 /// freezes while audio plays. ~0.5s @1440p RGBA ≈ 140 MB transient (cheaper once
 /// the NV12/GL path is active).
 const VIDEO_QUEUE_MAX: usize = 30;
+/// Look-ahead depth while **paused**. The decode thread parks here instead of
+/// holding the full playback queue: we only need enough frames to show the
+/// current/seeked image and absorb a scrub. At 1440p this is the difference
+/// between ~22 MB and ~165 MB (NV12), or ~59 MB vs ~442 MB (RGBA), resident while
+/// the editor simply sits paused.
+const PAUSED_QUEUE_MAX: usize = 4;
 /// Audio look-ahead ceiling (interleaved f32 samples) ≈ 2s stereo @ 48k. In
 /// practice the video queue fills first and paces the demuxer, so audio settles
 /// well under this; it's just an upper bound.
@@ -448,11 +454,19 @@ impl Player {
                             [vf.width, vf.height],
                             &vf.rgba,
                         );
-                        self.texture = Some(ctx.load_texture(
-                            "editor-preview",
-                            img,
-                            egui::TextureOptions::LINEAR,
-                        ));
+                        // Reuse the texture allocation: `set` updates the existing
+                        // GPU texture in place instead of allocating and freeing a
+                        // whole new texture on every displayed frame.
+                        match &mut self.texture {
+                            Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+                            None => {
+                                self.texture = Some(ctx.load_texture(
+                                    "editor-preview",
+                                    img,
+                                    egui::TextureOptions::LINEAR,
+                                ));
+                            }
+                        }
                     }
                     Frame::Nv12(nv) => {
                         *self.gl_pending.lock().unwrap() = Some(nv);
@@ -675,7 +689,15 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>, render_gl: bool) {
         // frame rate, the video queue fills first and becomes the pacer, so the
         // demuxer stays ~0.5s ahead, audio settles at a similar depth, and no
         // video is dropped in steady state.
-        let video_full = shared.frames.lock().unwrap().len() >= VIDEO_QUEUE_MAX;
+        // Look-ahead target: a full queue while playing (smooth pacing), but only
+        // a few frames while paused so the decode thread parks instead of holding
+        // ~30 full-res frames resident in RAM for nothing.
+        let q_target = if shared.playing.load(Ordering::Acquire) {
+            VIDEO_QUEUE_MAX
+        } else {
+            PAUSED_QUEUE_MAX
+        };
+        let video_full = shared.frames.lock().unwrap().len() >= q_target;
         let audio_full = audio.is_some() && shared.audio_buf.lock().unwrap().len() >= AUDIO_BUF_MAX;
         if video_full || audio_full {
             std::thread::sleep(Duration::from_millis(3));
@@ -709,7 +731,7 @@ fn decode_loop(path: PathBuf, shared: Arc<Shared>, render_gl: bool) {
                     // the result. (We still drained `receive_frame`, so the
                     // decoder keeps flowing.) Pacing makes this rare; it's a
                     // safety valve against bursts.
-                    if shared.frames.lock().unwrap().len() >= VIDEO_QUEUE_MAX {
+                    if shared.frames.lock().unwrap().len() >= q_target {
                         shared.dropped.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
