@@ -198,18 +198,10 @@ fn handle_connection<B: CaptureBackend>(
         }
 
         // State-changing events are pushed to all subscribers too.
-        if should_broadcast(&event) {
+        if event.is_state_change() {
             broadcast(subs, &event);
         }
     }
-}
-
-/// Events worth pushing to subscribers (HUD-relevant state changes).
-fn should_broadcast(event: &Event) -> bool {
-    matches!(
-        event,
-        Event::ClipSaved { .. } | Event::BufferState { .. } | Event::RecordState { .. }
-    )
 }
 
 fn write_event(stream: &mut UnixStream, event: &Event) -> io::Result<()> {

@@ -13,7 +13,7 @@ pub use config::{
     default_config_path, AudioConfig, CaptureConfig, Config, ConfigError, Container, ExportCodec,
     ExportConfig, Quality,
 };
-pub use frame::{read_frame, write_frame, MAX_FRAME};
+pub use frame::{read_frame, write_frame, MAX_FRAME, PROTOCOL_VERSION};
 pub use ipc::{Command, Event, ProtocolError};
 pub use newtypes::{BufferSeconds, ClipDuration, MonitorId};
 
