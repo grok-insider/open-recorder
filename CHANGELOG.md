@@ -6,6 +6,24 @@ All notable changes to open-recorder are recorded here. The format follows
 
 ## [Unreleased]
 
+### Features
+
+- **Real full-length recording.** `ord record` now starts/stops an actual NVENC
+  recording (streaming muxer, separate from the replay buffer) written as a
+  game-named `<game>-rec-<epoch>.mkv`, instead of the old no-op that reported
+  success and wrote nothing.
+- **More export presets**: GIF, audio-only, X/Twitter, and 1080p60-HQ, plus
+  EBU R128 loudness normalization (`--normalize`) and NVENC multipass for
+  tighter size-targeted exports. `ord export --preset gif|audio|x|1080p60`.
+- **Export progress + cancel**: the library shows a live percentage and a Cancel
+  button per export; the full preset menu is available on each clip and in the
+  editor.
+- **HUD**: a subtle buffer-active indicator (top-right dot), identical toasts
+  coalesce instead of stacking, and toasts keep animating across a daemon
+  restart.
+- Steam games get readable clip/recording names (the window title, e.g.
+  `path-of-exile-2-…`, instead of `steam-app-2694490-…`).
+
 ### Performance
 
 - **Clip save is now off the daemon lock and copy-free.** Encoded frame payloads
