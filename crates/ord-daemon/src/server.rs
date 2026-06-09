@@ -404,7 +404,10 @@ mod tests {
         b.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         write_frame(&mut b, &Command::Status.encode().unwrap()).unwrap();
         let resp = read_frame(&mut b).expect("Status must return while a save is writing");
-        assert!(matches!(Event::decode(&resp).unwrap(), Event::Status { .. }));
+        assert!(matches!(
+            Event::decode(&resp).unwrap(),
+            Event::Status { .. }
+        ));
 
         // Release the writer; A now gets its ClipSaved.
         let _ = release_tx.send(());

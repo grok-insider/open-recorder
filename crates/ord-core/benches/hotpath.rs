@@ -12,8 +12,8 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use ord_core::{Engine, MockBackend, RingBuffer};
 use ord_core::{EncodedFrame, MICROS_PER_SEC};
+use ord_core::{Engine, MockBackend, RingBuffer};
 
 /// A representative encoded frame size (~16 KiB ≈ 7.9 Mbps at 60 fps). Big enough
 /// that a per-frame payload copy is measurable, small enough to keep the bench
@@ -29,7 +29,12 @@ fn bench_ring_push(c: &mut Criterion) {
     let frames: Vec<EncodedFrame> = (0..total)
         .map(|i| {
             let pts = i as i64 * step;
-            EncodedFrame::new(vec![0u8; FRAME_BYTES], (i as u32).is_multiple_of(FPS), pts, pts)
+            EncodedFrame::new(
+                vec![0u8; FRAME_BYTES],
+                (i as u32).is_multiple_of(FPS),
+                pts,
+                pts,
+            )
         })
         .collect();
 
