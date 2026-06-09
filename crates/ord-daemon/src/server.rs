@@ -9,6 +9,7 @@ use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ord_common::{read_frame, write_frame, Command, Event};
 use ord_core::CaptureBackend;
@@ -68,6 +69,25 @@ pub fn serve<B: CaptureBackend + 'static>(
 ) -> Result<(), ServerError> {
     let handler = Arc::new(Mutex::new(handler));
     let subs: Subscribers = Arc::new(Mutex::new(Vec::new()));
+
+    // Continuously drain captured frames into the (evicting) ring buffer,
+    // independent of client activity. The capture forwarder thread produces
+    // encoded frames non-stop; `pump()` (drain_available) is the only consumer,
+    // and it was previously called ONLY while handling a client command. After
+    // the HUD subscribes it stops sending commands, so during idle/gaming nothing
+    // drained the channel and it grew unbounded at the encode bitrate (~8 MB/s)
+    // until the OOM killer fired. A ~250 ms periodic pump keeps the channel
+    // drained and the ring bounded to `buffer_seconds`. `pump()` is pure
+    // ingestion (no events/side effects), so this is safe to call on a timer.
+    {
+        let handler = Arc::clone(&handler);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(250));
+            if let Ok(mut h) = handler.lock() {
+                h.pump();
+            }
+        });
+    }
 
     for conn in listener.incoming() {
         let stream = conn?;
