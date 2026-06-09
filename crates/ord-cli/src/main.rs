@@ -4,10 +4,9 @@
 //! event reply. This is what compositor keybinds call
 //! (`bind = ALT, R, exec, ord save --last 30`).
 
-use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
-use ord_common::{read_frame, socket_path, write_frame, ClipDuration, Command, Event};
+use ord_common::{socket_path, ClipDuration, Command, Event};
 
 mod export_cmd;
 
@@ -106,31 +105,18 @@ fn run() -> Result<(), String> {
     }
 
     let cmd = parse()?;
-    let path = socket_path();
-    let mut stream = UnixStream::connect(&path).map_err(|e| {
-        format!(
-            "cannot reach ordd at {} ({e}). Is the daemon running?",
-            path.display()
-        )
-    })?;
-    write_frame(&mut stream, &cmd.encode().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let mut client = ord_common::connect(socket_path()).map_err(|e| e.to_string())?;
 
     // Subscribe streams events until the daemon closes; print each as it arrives.
     if matches!(cmd, Command::Subscribe) {
-        loop {
-            match read_frame(&mut stream) {
-                Ok(bytes) => {
-                    let event = Event::decode(&bytes).map_err(|e| e.to_string())?;
-                    println!("{}", render(event));
-                }
-                Err(_) => return Ok(()), // daemon closed the stream
-            }
+        let events = client.subscribe().map_err(|e| e.to_string())?;
+        for event in events {
+            println!("{}", render(event));
         }
+        return Ok(());
     }
 
-    let bytes = read_frame(&mut stream).map_err(|e| e.to_string())?;
-    let event = Event::decode(&bytes).map_err(|e| e.to_string())?;
+    let event = client.request(&cmd).map_err(|e| e.to_string())?;
     println!("{}", render(event));
     Ok(())
 }

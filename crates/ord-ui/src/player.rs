@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use ffmpeg_next as ff;
+use ord_common::lock_tolerant;
 
 /// Decode/scale cap for the preview. With the GPU render path the GPU scales the
 /// full-res frame down to the preview widget in one pass (crisp), so we keep the
@@ -171,8 +172,8 @@ struct Shared {
 impl Shared {
     fn range(&self) -> (f64, f64) {
         (
-            *self.in_secs.lock().unwrap(),
-            *self.out_secs.lock().unwrap(),
+            *lock_tolerant(&self.in_secs),
+            *lock_tolerant(&self.out_secs),
         )
     }
 }
@@ -292,13 +293,13 @@ impl Player {
     pub fn stats(&self) -> Stats {
         let sr = self.shared.sample_rate.load(Ordering::Relaxed).max(1) as f64;
         let ch = self.shared.channels.load(Ordering::Relaxed).max(1) as f64;
-        let audio_samples = self.shared.audio_buf.lock().unwrap().len() as f64;
+        let audio_samples = lock_tolerant(&self.shared.audio_buf).len() as f64;
         Stats {
             position: self.position(),
             has_audio: self.has_audio(),
             playing: self.is_playing(),
             audio_buf_ms: (audio_samples / (sr * ch)) * 1000.0,
-            frames_queued: self.shared.frames.lock().unwrap().len(),
+            frames_queued: lock_tolerant(&self.shared.frames).len(),
             decoded: self.shared.decoded.load(Ordering::Relaxed),
             dropped: self.shared.dropped.load(Ordering::Relaxed),
             decoder: self.decoder_kind(),
@@ -326,29 +327,25 @@ impl Player {
         self.shared.looping.store(on, Ordering::Release);
     }
 
-    pub fn volume(&self) -> f32 {
-        *self.shared.volume.lock().unwrap()
-    }
-
     pub fn set_volume(&self, v: f32) {
-        *self.shared.volume.lock().unwrap() = v.clamp(0.0, 1.0);
+        *lock_tolerant(&self.shared.volume) = v.clamp(0.0, 1.0);
     }
 
     pub fn set_range(&self, in_s: f64, out_s: f64) {
-        *self.shared.in_secs.lock().unwrap() = in_s;
-        *self.shared.out_secs.lock().unwrap() = out_s;
+        *lock_tolerant(&self.shared.in_secs) = in_s;
+        *lock_tolerant(&self.shared.out_secs) = out_s;
     }
 
     /// Current playback position in seconds (the master clock).
     pub fn position(&self) -> f64 {
-        let base = *self.shared.seek_base.lock().unwrap();
+        let base = *lock_tolerant(&self.shared.seek_base);
         if self.has_audio() {
             let sr = self.shared.sample_rate.load(Ordering::Relaxed).max(1) as f64;
             let ch = self.shared.channels.load(Ordering::Relaxed).max(1) as f64;
             let played = self.shared.samples_played.load(Ordering::Relaxed) as f64;
             (base + played / (sr * ch)).min(self.duration)
         } else {
-            match *self.shared.play_anchor.lock().unwrap() {
+            match *lock_tolerant(&self.shared.play_anchor) {
                 Some(t0) => (base + t0.elapsed().as_secs_f64()).min(self.duration),
                 None => base,
             }
@@ -357,14 +354,14 @@ impl Player {
 
     pub fn seek(&mut self, t: f64) {
         let t = t.clamp(0.0, self.duration);
-        *self.shared.seek_base.lock().unwrap() = t;
+        *lock_tolerant(&self.shared.seek_base) = t;
         self.shared.samples_played.store(0, Ordering::Relaxed);
-        *self.shared.seek_to.lock().unwrap() = Some(t);
+        *lock_tolerant(&self.shared.seek_to) = Some(t);
         // Drive repaints until the seeked frame is shown (then we idle if paused).
         self.needs_frame = true;
         if !self.has_audio() {
             let playing = self.is_playing();
-            *self.shared.play_anchor.lock().unwrap() = playing.then(Instant::now);
+            *lock_tolerant(&self.shared.play_anchor) = playing.then(Instant::now);
         }
     }
 
@@ -381,7 +378,7 @@ impl Player {
                 let _ = s.play();
             }
         } else {
-            *self.shared.play_anchor.lock().unwrap() = Some(Instant::now());
+            *lock_tolerant(&self.shared.play_anchor) = Some(Instant::now());
         }
     }
 
@@ -393,8 +390,8 @@ impl Player {
         } else {
             // Freeze the wall clock at the current position.
             let pos = self.position();
-            *self.shared.seek_base.lock().unwrap() = pos;
-            *self.shared.play_anchor.lock().unwrap() = None;
+            *lock_tolerant(&self.shared.seek_base) = pos;
+            *lock_tolerant(&self.shared.play_anchor) = None;
         }
         self.shared.playing.store(false, Ordering::Release);
     }
@@ -427,7 +424,7 @@ impl Player {
         // Pick the newest decoded frame at or before the clock.
         let mut chosen: Option<Frame> = None;
         {
-            let mut q = self.shared.frames.lock().unwrap();
+            let mut q = lock_tolerant(&self.shared.frames);
             while q.front().map(|f| f.pts() <= pos + 0.005).unwrap_or(false) {
                 chosen = q.pop_front();
             }
@@ -462,7 +459,7 @@ impl Player {
                         }
                     }
                     Frame::Nv12(nv) => {
-                        *self.gl_pending.lock().unwrap() = Some(nv);
+                        *lock_tolerant(&self.gl_pending) = Some(nv);
                     }
                 }
                 self.shown_pts = pts;
@@ -477,7 +474,7 @@ impl Player {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
         if self.render_gl {
-            if self.gl_pending.lock().unwrap().is_some() {
+            if lock_tolerant(&self.gl_pending).is_some() {
                 PreviewFrame::Gl
             } else {
                 PreviewFrame::None
@@ -568,8 +565,8 @@ fn build_audio_stream(shared: &Arc<Shared>) -> Result<(cpal::Stream, u32, u16), 
                     data.iter_mut().for_each(|s| *s = 0.0);
                     return;
                 }
-                let vol = *shared_cb.volume.lock().unwrap();
-                let mut buf = shared_cb.audio_buf.lock().unwrap();
+                let vol = *lock_tolerant(&shared_cb.volume);
+                let mut buf = lock_tolerant(&shared_cb.audio_buf);
                 let mut consumed = 0u64;
                 for s in data.iter_mut() {
                     match buf.pop_front() {
@@ -594,170 +591,233 @@ fn build_audio_stream(shared: &Arc<Shared>) -> Result<(cpal::Stream, u32, u16), 
     Ok((stream, rate, channels))
 }
 
-/// The decode thread: demux + decode video/audio, honoring seek/stop/loop. When
-/// `render_gl` is set, video frames are produced as NV12 (for the GPU shader);
-/// otherwise as RGBA (for the egui texture path).
+/// The decode thread entry point: open the clip, then run the
+/// [`DecodeSession`] until stopped. When `render_gl` is set, video frames are
+/// produced as NV12 (for the GPU shader); otherwise as RGBA (egui texture path).
 fn decode_loop(path: PathBuf, shared: Arc<Shared>, render_gl: bool) {
-    let Ok(mut ictx) = ff::format::input(&path) else {
-        return;
-    };
+    if let Some(session) = DecodeSession::open(&path, shared, render_gl) {
+        session.run();
+    }
+}
 
-    let video_stream = match ictx.streams().best(ff::media::Type::Video) {
-        Some(s) => s,
-        None => return,
-    };
-    let video_index = video_stream.index();
-    let video_tb = f64::from(video_stream.time_base());
-    let video_params = video_stream.parameters();
+/// One open clip on the decode thread: the demuxer, decoders, and lazily-built
+/// converters, with each loop phase (seek, pacing, demux, decode) as its own
+/// method so the loop itself stays a readable sequence.
+struct DecodeSession {
+    shared: Arc<Shared>,
+    render_gl: bool,
+    ictx: ff::format::context::Input,
+    video_index: usize,
+    video_tb: f64,
+    vdec: ff::decoder::Video,
+    /// Preview scaler, built lazily from the FIRST decoded frame (cuvid only
+    /// reports its real output format/size after the first frame; software
+    /// frames are source-sized so we cap width there). Targets RGBA (CPU path)
+    /// or NV12 (GPU path). Skipped entirely when cuvid already gives
+    /// preview-sized NV12.
+    scaler: Option<ff::software::scaling::context::Context>,
+    audio: Option<(usize, ff::decoder::Audio)>,
+    /// Built lazily from the first decoded audio frame, because a decoder's
+    /// channel layout / format can be unset until then (building it upfront
+    /// produced a mis-configured resampler → silent audio).
+    resampler: Option<ff::software::resampling::context::Context>,
+    out_rate: u32,
+    out_ch: u16,
+    out_layout: ff::channel_layout::ChannelLayout,
+}
 
-    let audio_info = ictx
-        .streams()
-        .best(ff::media::Type::Audio)
-        .map(|s| (s.index(), s.parameters()));
+impl DecodeSession {
+    fn open(path: &Path, shared: Arc<Shared>, render_gl: bool) -> Option<Self> {
+        let ictx = ff::format::input(&path).ok()?;
 
-    // Choose the video decoder: NVDEC (GPU decode + GPU downscale) when available,
-    // else frame-threaded software decode. NVDEC moves the expensive 1440p60
-    // decode off the CPU — the software path pegging cores was the stutter + the
-    // "UI STALL" ANR seen in the watchdog log.
-    let (mut vdec, kind) = match open_video_decoder(video_params) {
-        Some(v) => v,
-        None => return,
-    };
-    shared.dec_kind.store(kind.as_u8(), Ordering::Relaxed);
+        let video_stream = ictx.streams().best(ff::media::Type::Video)?;
+        let video_index = video_stream.index();
+        let video_tb = f64::from(video_stream.time_base());
+        let video_params = video_stream.parameters();
 
-    // Preview scaler, built lazily from the FIRST decoded frame (cuvid only
-    // reports its real output format/size after the first frame; software frames
-    // are source-sized so we cap width here). Targets RGBA (CPU path) or NV12
-    // (GPU path). Skipped entirely when cuvid already gives preview-sized NV12.
-    let mut scaler: Option<ff::software::scaling::context::Context> = None;
+        let audio_info = ictx
+            .streams()
+            .best(ff::media::Type::Audio)
+            .map(|s| (s.index(), s.parameters()));
 
-    // Audio decoder + resampler to the device's F32 format.
-    let out_rate = shared.sample_rate.load(Ordering::Relaxed) as u32;
-    let out_ch = shared.channels.load(Ordering::Relaxed) as u16;
-    let out_layout = if out_ch >= 2 {
-        ff::channel_layout::ChannelLayout::STEREO
-    } else {
-        ff::channel_layout::ChannelLayout::MONO
-    };
-    // Audio decoder only; the resampler is built lazily from the FIRST decoded
-    // frame, because a decoder's channel layout / format can be unset until then
-    // (building it upfront produced a mis-configured resampler → silent audio).
-    let mut audio: Option<(usize, ff::decoder::Audio)> = None;
-    let mut resampler: Option<ff::software::resampling::context::Context> = None;
-    if shared.has_audio.load(Ordering::Acquire) {
-        if let Some((aidx, aparams)) = audio_info {
-            if let Ok(adec) = ff::codec::context::Context::from_parameters(aparams)
-                .and_then(|c| c.decoder().audio())
-            {
-                audio = Some((aidx, adec));
+        // Choose the video decoder: NVDEC (GPU decode + GPU downscale) when
+        // available, else frame-threaded software decode. NVDEC moves the
+        // expensive 1440p60 decode off the CPU — the software path pegging cores
+        // was the stutter + the "UI STALL" ANR seen in the watchdog log.
+        let (vdec, kind) = open_video_decoder(video_params)?;
+        shared.dec_kind.store(kind.as_u8(), Ordering::Relaxed);
+
+        let out_rate = shared.sample_rate.load(Ordering::Relaxed) as u32;
+        let out_ch = shared.channels.load(Ordering::Relaxed) as u16;
+        let out_layout = if out_ch >= 2 {
+            ff::channel_layout::ChannelLayout::STEREO
+        } else {
+            ff::channel_layout::ChannelLayout::MONO
+        };
+        let mut audio: Option<(usize, ff::decoder::Audio)> = None;
+        if shared.has_audio.load(Ordering::Acquire) {
+            if let Some((aidx, aparams)) = audio_info {
+                if let Ok(adec) = ff::codec::context::Context::from_parameters(aparams)
+                    .and_then(|c| c.decoder().audio())
+                {
+                    audio = Some((aidx, adec));
+                }
+            }
+        }
+
+        Some(Self {
+            shared,
+            render_gl,
+            ictx,
+            video_index,
+            video_tb,
+            vdec,
+            scaler: None,
+            audio,
+            resampler: None,
+            out_rate,
+            out_ch,
+            out_layout,
+        })
+    }
+
+    fn run(mut self) {
+        let mut packet = ff::codec::packet::Packet::empty();
+        while !self.shared.stop.load(Ordering::Acquire) {
+            self.apply_pending_seek();
+
+            if self.queues_full() {
+                std::thread::sleep(Duration::from_millis(3));
+                continue;
+            }
+
+            match packet.read(&mut self.ictx) {
+                Ok(()) => {}
+                Err(ff::Error::Eof) => {
+                    self.on_eof();
+                    continue;
+                }
+                Err(_) => continue,
+            }
+
+            let idx = packet.stream();
+            if idx == self.video_index {
+                self.on_video_packet(&packet);
+            } else {
+                self.on_audio_packet(idx, &packet);
             }
         }
     }
 
-    let mut packet = ff::codec::packet::Packet::empty();
-    loop {
-        if shared.stop.load(Ordering::Acquire) {
-            break;
-        }
-
-        // Handle a pending seek.
-        if let Some(t) = shared.seek_to.lock().unwrap().take() {
+    /// Handle a pending seek: reposition the demuxer, flush both decoders, and
+    /// drop everything queued for the old position.
+    fn apply_pending_seek(&mut self) {
+        if let Some(t) = lock_tolerant(&self.shared.seek_to).take() {
             let ts = (t * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
-            let _ = ictx.seek(ts, ..ts);
-            vdec.flush();
-            if let Some((_, adec)) = audio.as_mut() {
+            let _ = self.ictx.seek(ts, ..ts);
+            self.vdec.flush();
+            if let Some((_, adec)) = self.audio.as_mut() {
                 adec.flush();
             }
-            shared.frames.lock().unwrap().clear();
-            shared.audio_buf.lock().unwrap().clear();
+            lock_tolerant(&self.shared.frames).clear();
+            lock_tolerant(&self.shared.audio_buf).clear();
         }
+    }
 
-        // Backpressure: pace the demuxer so it stays only a small, BALANCED
-        // amount ahead of the master clock — sleep when EITHER buffer is full.
-        //
-        // The previous "sleep only when audio is full" let the demuxer read ~2s
-        // ahead to fill the audio buffer while the small video queue overflowed
-        // and dropped most frames; video then starved (the same frame held for
-        // seconds) while audio kept playing. Because video frames arrive at the
-        // frame rate, the video queue fills first and becomes the pacer, so the
-        // demuxer stays ~0.5s ahead, audio settles at a similar depth, and no
-        // video is dropped in steady state.
-        // Look-ahead target: a full queue while playing (smooth pacing), but only
-        // a few frames while paused so the decode thread parks instead of holding
-        // ~30 full-res frames resident in RAM for nothing.
-        let q_target = if shared.playing.load(Ordering::Acquire) {
+    /// Look-ahead target: a full queue while playing (smooth pacing), but only a
+    /// few frames while paused so the decode thread parks instead of holding ~30
+    /// full-res frames resident in RAM for nothing.
+    fn queue_target(&self) -> usize {
+        if self.shared.playing.load(Ordering::Acquire) {
             VIDEO_QUEUE_MAX
         } else {
             PAUSED_QUEUE_MAX
-        };
-        let video_full = shared.frames.lock().unwrap().len() >= q_target;
-        let audio_full = audio.is_some() && shared.audio_buf.lock().unwrap().len() >= AUDIO_BUF_MAX;
-        if video_full || audio_full {
-            std::thread::sleep(Duration::from_millis(3));
-            continue;
         }
+    }
 
-        match packet.read(&mut ictx) {
-            Ok(()) => {}
-            Err(ff::Error::Eof) => {
-                if shared.looping.load(Ordering::Acquire) && shared.playing.load(Ordering::Acquire)
-                {
-                    let (in_s, _) = shared.range();
-                    *shared.seek_to.lock().unwrap() = Some(in_s);
-                } else {
-                    std::thread::sleep(Duration::from_millis(15));
-                }
+    /// Backpressure: pace the demuxer so it stays only a small, BALANCED amount
+    /// ahead of the master clock — pause demuxing when EITHER buffer is full.
+    ///
+    /// A previous "sleep only when audio is full" let the demuxer read ~2s ahead
+    /// to fill the audio buffer while the small video queue overflowed and
+    /// dropped most frames; video then starved (the same frame held for seconds)
+    /// while audio kept playing. Because video frames arrive at the frame rate,
+    /// the video queue fills first and becomes the pacer, so the demuxer stays
+    /// ~0.5s ahead, audio settles at a similar depth, and no video is dropped in
+    /// steady state.
+    fn queues_full(&self) -> bool {
+        let video_full = lock_tolerant(&self.shared.frames).len() >= self.queue_target();
+        let audio_full =
+            self.audio.is_some() && lock_tolerant(&self.shared.audio_buf).len() >= AUDIO_BUF_MAX;
+        video_full || audio_full
+    }
+
+    /// End of file: loop back to the in-point when looping + playing, otherwise
+    /// idle (the UI may still seek backwards).
+    fn on_eof(&self) {
+        if self.shared.looping.load(Ordering::Acquire)
+            && self.shared.playing.load(Ordering::Acquire)
+        {
+            let (in_s, _) = self.shared.range();
+            *lock_tolerant(&self.shared.seek_to) = Some(in_s);
+        } else {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    /// Decode a video packet and queue the converted frames (RGBA or NV12).
+    fn on_video_packet(&mut self, packet: &ff::codec::packet::Packet) {
+        if self.vdec.send_packet(packet).is_err() {
+            return;
+        }
+        let q_target = self.queue_target();
+        let mut frame = ff::frame::Video::empty();
+        while self.vdec.receive_frame(&mut frame).is_ok() {
+            let pts = frame.pts().or_else(|| frame.timestamp()).unwrap_or(0) as f64 * self.video_tb;
+
+            // Skip convert+pack when the queue is full — we'd only drop the
+            // result. (We still drained `receive_frame`, so the decoder keeps
+            // flowing.) Pacing makes this rare; it's a safety valve for bursts.
+            if lock_tolerant(&self.shared.frames).len() >= q_target {
+                self.shared.dropped.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            Err(_) => continue,
-        }
 
-        let idx = packet.stream();
-        if idx == video_index {
-            if vdec.send_packet(&packet).is_ok() {
-                let mut frame = ff::frame::Video::empty();
-                while vdec.receive_frame(&mut frame).is_ok() {
-                    let pts =
-                        frame.pts().or_else(|| frame.timestamp()).unwrap_or(0) as f64 * video_tb;
-
-                    // Skip convert+pack when the queue is full — we'd only drop
-                    // the result. (We still drained `receive_frame`, so the
-                    // decoder keeps flowing.) Pacing makes this rare; it's a
-                    // safety valve against bursts.
-                    if shared.frames.lock().unwrap().len() >= q_target {
-                        shared.dropped.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-
-                    if let Some(f) = make_frame(&frame, &mut scaler, render_gl, pts) {
-                        shared.decoded.fetch_add(1, Ordering::Relaxed);
-                        shared.frames.lock().unwrap().push_back(f);
-                    }
-                }
+            if let Some(f) = make_frame(&frame, &mut self.scaler, self.render_gl, pts) {
+                self.shared.decoded.fetch_add(1, Ordering::Relaxed);
+                lock_tolerant(&self.shared.frames).push_back(f);
             }
-        } else if let Some((aidx, adec)) = audio.as_mut() {
-            if idx == *aidx && adec.send_packet(&packet).is_ok() {
-                let mut frame = ff::frame::Audio::empty();
-                while adec.receive_frame(&mut frame).is_ok() {
-                    // Build the resampler from the actual frame format the first
-                    // time we see one (layout/rate are reliable post-decode).
-                    if resampler.is_none() {
-                        resampler = ff::software::resampling::context::Context::get(
-                            frame.format(),
-                            frame.channel_layout(),
-                            frame.rate(),
-                            ff::format::Sample::F32(ff::format::sample::Type::Packed),
-                            out_layout,
-                            out_rate,
-                        )
-                        .ok();
-                    }
-                    if let Some(res) = resampler.as_mut() {
-                        let mut out = ff::frame::Audio::empty();
-                        if res.run(&frame, &mut out).is_ok() {
-                            push_audio(&shared, &out, out_ch);
-                        }
-                    }
+        }
+    }
+
+    /// Decode an audio packet, resample to the device format, and append to the
+    /// shared sample buffer (the audio clock's source).
+    fn on_audio_packet(&mut self, idx: usize, packet: &ff::codec::packet::Packet) {
+        let Some((aidx, adec)) = self.audio.as_mut() else {
+            return;
+        };
+        if idx != *aidx || adec.send_packet(packet).is_err() {
+            return;
+        }
+        let mut frame = ff::frame::Audio::empty();
+        while adec.receive_frame(&mut frame).is_ok() {
+            // Build the resampler from the actual frame format the first time we
+            // see one (layout/rate are reliable post-decode).
+            if self.resampler.is_none() {
+                self.resampler = ff::software::resampling::context::Context::get(
+                    frame.format(),
+                    frame.channel_layout(),
+                    frame.rate(),
+                    ff::format::Sample::F32(ff::format::sample::Type::Packed),
+                    self.out_layout,
+                    self.out_rate,
+                )
+                .ok();
+            }
+            if let Some(res) = self.resampler.as_mut() {
+                let mut out = ff::frame::Audio::empty();
+                if res.run(&frame, &mut out).is_ok() {
+                    push_audio(&self.shared, &out, self.out_ch);
                 }
             }
         }
@@ -971,7 +1031,7 @@ fn pack_rgba(rgba: &ff::frame::Video, pts: f64) -> VideoFrame {
 fn push_audio(shared: &Arc<Shared>, out: &ff::frame::Audio, channels: u16) {
     let n = out.samples() * channels as usize;
     let bytes = out.data(0);
-    let mut buf = shared.audio_buf.lock().unwrap();
+    let mut buf = lock_tolerant(&shared.audio_buf);
     for chunk in bytes.chunks_exact(4).take(n) {
         buf.push_back(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }

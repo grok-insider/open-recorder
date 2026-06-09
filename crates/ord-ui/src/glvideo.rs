@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use eframe::{egui, egui_glow, glow};
 use glow::HasContext;
+use ord_common::lock_tolerant;
 
 /// One NV12 frame ready to upload. Planes are tight-packed (no row padding).
 pub struct Nv12 {
@@ -58,12 +59,12 @@ pub fn paint_callback(rect: egui::Rect, pending: Arc<Mutex<Option<Nv12>>>) -> eg
     let cb = egui_glow::CallbackFn::new(move |_info, painter| {
         let gl = painter.gl();
         let cell = GL.get_or_init(|| Mutex::new(None));
-        let mut guard = cell.lock().unwrap();
+        let mut guard = lock_tolerant(cell);
         if guard.is_none() {
             *guard = unsafe { GlVideo::new(gl) };
         }
         if let Some(video) = guard.as_mut() {
-            if let Some(frame) = pending.lock().unwrap().as_ref() {
+            if let Some(frame) = lock_tolerant(&pending).as_ref() {
                 unsafe { video.draw(gl, frame) };
             }
         }

@@ -34,10 +34,11 @@ workspace member entry in the root `Cargo.toml`.
 |-------|------|
 | `crates/ord-common` | Shared types + the bincode IPC wire protocol (commands/events). No I/O. |
 | `crates/ord-core`   | The engine: wraps `waycap-rs`, owns the encoded-frame ring buffer, and the keyframe-aware "save last N seconds" muxer (ffmpeg-next, stream-copy, no re-encode). |
-| `crates/ord-daemon` | `ordd`: runs `ord-core`, supervises the buffer, exposes the Unix-socket control plane, evdev global hotkeys, game detection (`/proc` + `hyprctl`), and notifications. |
-| `crates/ord-cli`    | `ord`: thin client. Talks to the daemon socket (`save --last N`, `record toggle`, `status`, `buffer on/off`). What compositor keybinds call. |
-| `crates/ord-overlay`| Platform overlay abstraction: the `Overlay` trait + `wlr-layer-shell` (Wayland), X11, and Win32 implementations. |
-| `crates/ord-ui`     | `egui` UIs: the clip library/manager window and the click-through HUD. |
+| `crates/ord-daemon` | `ordd`: runs `ord-core`, supervises the buffer, exposes the Unix-socket control plane, game detection (`hyprctl`), and the post-save hook. Hotkeys are compositor keybinds invoking `ord` (no evdev). |
+| `crates/ord-cli`    | `ord`: thin client. Talks to the daemon socket (`save --last N`, `record toggle`, `status`, `buffer on/off`, `subscribe`). What compositor keybinds call. |
+| `crates/ord-overlay`| Platform overlay abstraction: the `Overlay` trait + `wlr-layer-shell` (Wayland) implementation + the `ord-hud` binary. X11/Win32 are future implementations of the same trait. |
+| `crates/ord-ui`     | `egui` clip library/manager window: browse, play, trim, export. |
+| `crates/ord-export` | Pure ffmpeg-arg export planning (`plan.rs`, no I/O) + ffprobe wrapper + ffmpeg runner with NVENC→software fallback. Presets (social/GIF/quality) are data, not code. |
 
 The capture/encode hot path is `ord-core` only. Everything else is control
 plane or presentation and must never block or copy frames on that path.
@@ -60,6 +61,17 @@ plane or presentation and must never block or copy frames on that path.
   up. No bare `u64` seconds floating through APIs.
 - **No comments unless they explain non-obvious intent.** The code says what;
   comments say why, only when it isn't obvious.
+- **One bitstream module, two muxers.** All per-codec bitstream logic
+  (extradata building, Annex-B→length-prefix packet transforms) lives in
+  `ord-core/src/mux/bitstream.rs` keyed by `Codec`, and is consumed by **both**
+  the clip muxer (`mux.rs`) and the streaming recorder (`record.rs`) through the
+  shared stream-setup helpers. Never duplicate codec or stream-setup logic
+  between the two, and never branch on `is_h264`-style booleans — match on
+  `Codec` (or use its strategy) so new codecs fail to compile, not silently
+  mis-mux.
+- **All `Mutex` access is lock-tolerant.** Use the shared poisoned-lock-recovery
+  helper (`lock_tolerant` pattern) everywhere — including UI crates. A panicked
+  worker thread must degrade, not cascade panics through `lock().unwrap()`.
 
 ## Testing standards (the quality guarantee)
 
@@ -72,7 +84,7 @@ green. CI has no GPU, so GPU-dependent tests are gated.
 | **Integration** | Daemon socket command/event flow driven against a **mock `CaptureBackend`** (deterministic synthetic frames, no GPU). Covers `save`, `record toggle`, `status`, buffer on/off, and error surfacing. | `crates/ord-daemon/tests/` |
 | **Golden** | Saved `.mkv` structure assertions via `ffprobe` (codec, duration ≈ requested, keyframe at start, audio track present). | `crates/ord-core/tests/` |
 | **Bench** | `criterion` benchmarks for ring-buffer push and the save-path mux latency, to catch perf regressions on the hot path. | `crates/ord-core/benches/` |
-| **GPU (real hardware)** | End-to-end capture→encode→save on actual NVENC. `#[ignore]` by default; run on the dev box behind `--features gpu`. | `crates/ord-core/tests/`, marked `#[ignore]` |
+| **GPU (real hardware)** | End-to-end capture→encode→save on actual NVENC. `#[ignore]` by default; run on the dev box behind `--features waycap` (in the devshell). | `crates/ord-core/tests/`, marked `#[ignore]` |
 
 Rules:
 
@@ -102,7 +114,7 @@ suggestions. Public items in library crates carry doc comments.
 cargo build                     # debug workspace build
 cargo build --release           # release binaries (ordd, ord)
 cargo test --all                # the CI test set
-cargo test -- --ignored --features gpu   # real-hardware GPU lane (dev box only)
+cargo test --features waycap -- --ignored   # real-hardware GPU lane (devshell, dev box only)
 nix develop                     # devshell with pipewire/ffmpeg/cuda/clang toolchain
 ```
 
@@ -124,17 +136,23 @@ nix develop                     # devshell with pipewire/ffmpeg/cuda/clang toolc
 
 ## Status
 
-In development. Implemented and tested (default, no-GPU feature set):
-`ord-common` (newtypes, IPC + `Subscribe`, framing), `ord-core` (ring buffer,
-keyframe clip selection, engine, mock backend; `mux` + `waycap` features build in
-the devshell), `ord-daemon` (`ordd` socket + handler + game detection + event
-broadcast to subscribers), `ord-cli` (`ord` incl. `subscribe`), `ord-overlay`
-(trait + HUD model + **real wlr-layer-shell surface** behind `layershell` +
-`ord-hud` binary), `ord-ui` (clip library model + egui app behind `gui`). 69
-tests pass; `nix build .#ord-cli` works; the HUD is verified end-to-end on live
-Hyprland (renders click-through over a fullscreen game).
+Working. The full pipeline is **verified end-to-end on hardware** (RTX 5070 Ti,
+Hyprland): PipeWire DMA-BUF → NVENC H.264 → encoded ring buffer →
+keyframe-aware save → valid 1440p `.mkv`, ffprobe-validated (see
+`docs/spike-results.md`). Implemented and tested: `ord-common` (newtypes, IPC +
+`Subscribe`, versioned framing, config), `ord-core` (ring buffer, keyframe clip
+selection, engine, audio ring, mock backend, codec-keyed bitstream module, clip
+muxer + streaming recorder; `mux`/`waycap` features build in the devshell),
+`ord-daemon` (`ordd` socket + handler + game detection + event broadcast +
+post-save hook), `ord-cli` (`ord` incl. `subscribe` and `export`), `ord-overlay`
+(trait + HUD model + real wlr-layer-shell surface behind `layershell` +
+`ord-hud`), `ord-ui` (clip library model + egui app behind `gui`), `ord-export`
+(pure plan + runner with NVENC→software fallback). The HUD is verified live on
+Hyprland over fullscreen games. Run `cargo test --all` for the CI set.
 
-Pending: end-to-end NVENC capture validation in a live Hyprland session (the
-spike reaches the portal `CreateSession`; needs an interactive pick — see
-`docs/spike-results.md`), and HEVC/AV1 via a waycap-rs fork (verified recipe in
-`docs/spike-results.md`).
+HEVC/AV1 capture and CBR bitrate control are wired end-to-end: the pinned
+`0xfell/waycap-rs` rev exposes `hevc_nvenc`/`av1_nvenc` and
+`RateControl::ConstantBitrate`, selected via `capture.codec` /
+`capture.bitrate_kbps` in `config.toml`, with matching `hvcC`/`av1C` extradata
+from the bitstream module. When bumping the waycap-rs rev, update both
+`crates/ord-core/Cargo.toml` and the `outputHashes` entry in `flake.nix`.

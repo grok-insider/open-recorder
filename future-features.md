@@ -18,3 +18,15 @@ Sketched module shape (when revisited): `share.rs` (upload/link) +
 card next to Open / Export / Reveal / Delete.
 
 Deferred on purpose — do not implement without an explicit ask.
+
+## Disk-backed replay buffer
+
+The storage seam exists (`ord_core::FrameStore`, engine is
+`Engine<B, S: FrameStore = RingBuffer>`; clip selection runs on the metadata
+scan). What remains is the implementation: a `DiskStore` keeping the
+`FrameMeta` index in RAM and spilling payload segments to disk, with the rule
+that `push` never blocks on I/O (stage writes on a worker thread) and eviction
+deletes whole segments. Mirrors gpu-screen-recorder's `-replay-storage disk`
+(longer windows on low-RAM boxes, at the cost of SSD wear).
+
+

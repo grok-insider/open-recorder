@@ -21,6 +21,7 @@ pub struct Config {
     pub capture: CaptureConfig,
     pub audio: AudioConfig,
     pub export: ExportConfig,
+    pub hooks: HooksConfig,
 }
 
 impl Config {
@@ -44,8 +45,15 @@ pub struct CaptureConfig {
     pub fps: u32,
     /// Replay buffer length in seconds.
     pub buffer_seconds: u32,
-    /// Encoder quality preset.
+    /// Encoder quality preset (ignored when `bitrate_kbps` is set).
     pub quality: Quality,
+    /// Capture codec (NVENC): `h264` (default, most compatible), `hevc`, or
+    /// `av1` (best compression; needs an RTX 40/50-series card to encode).
+    pub codec: CaptureCodec,
+    /// Constant-bitrate mode: target bitrate in kbit/s. `None` (the default)
+    /// records in constant-quality mode via `quality`. CBR keeps the replay
+    /// buffer's RAM use predictable in high-motion scenes.
+    pub bitrate_kbps: Option<u32>,
 }
 
 impl Default for CaptureConfig {
@@ -54,8 +62,20 @@ impl Default for CaptureConfig {
             fps: 60,
             buffer_seconds: 60,
             quality: Quality::High,
+            codec: CaptureCodec::H264,
+            bitrate_kbps: None,
         }
     }
+}
+
+/// Hook scripts run by the daemon on events.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HooksConfig {
+    /// Program run (asynchronously, off the capture path) after a clip is
+    /// saved. Receives the clip path as its first argument — use it for
+    /// notifications, renaming, uploads, or re-encodes.
+    pub on_clip_saved: Option<String>,
 }
 
 /// Audio capture settings. Both sources are mixed into one track.
@@ -113,6 +133,15 @@ pub enum Quality {
     Medium,
     High,
     Ultra,
+}
+
+/// Capture (NVENC) codec the replay buffer records in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureCodec {
+    H264,
+    Hevc,
+    Av1,
 }
 
 /// Export video codec.
@@ -173,10 +202,13 @@ mod tests {
         assert_eq!(c.capture.fps, 60);
         assert_eq!(c.capture.buffer_seconds, 60);
         assert_eq!(c.capture.quality, Quality::High);
+        assert_eq!(c.capture.codec, CaptureCodec::H264);
+        assert_eq!(c.capture.bitrate_kbps, None);
         assert!(c.audio.desktop);
         assert!(c.audio.mic);
         assert_eq!(c.export.codec, ExportCodec::Av1);
         assert_eq!(c.export.container, Container::Mp4);
+        assert_eq!(c.hooks.on_clip_saved, None);
     }
 
     #[test]
@@ -211,6 +243,8 @@ mod tests {
                 fps: 120,
                 buffer_seconds: 30,
                 quality: Quality::Ultra,
+                codec: CaptureCodec::Hevc,
+                bitrate_kbps: Some(20_000),
             },
             audio: AudioConfig {
                 desktop: false,
@@ -220,9 +254,30 @@ mod tests {
                 codec: ExportCodec::H264,
                 container: Container::Mkv,
             },
+            hooks: HooksConfig {
+                on_clip_saved: Some("/usr/bin/notify-clip".into()),
+            },
         };
         let toml = c.to_toml_string().unwrap();
         assert_eq!(Config::from_toml_str(&toml).unwrap(), c);
+    }
+
+    #[test]
+    fn capture_codec_and_hook_parse() {
+        let c = Config::from_toml_str(
+            r#"
+            [capture]
+            codec = "av1"
+            bitrate_kbps = 12000
+
+            [hooks]
+            on_clip_saved = "~/bin/clip-hook"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.capture.codec, CaptureCodec::Av1);
+        assert_eq!(c.capture.bitrate_kbps, Some(12_000));
+        assert_eq!(c.hooks.on_clip_saved.as_deref(), Some("~/bin/clip-hook"));
     }
 
     #[test]

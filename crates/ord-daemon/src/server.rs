@@ -8,10 +8,10 @@
 use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ord_common::{read_frame, write_frame, Command, Event};
+use ord_common::{lock_tolerant, read_frame, write_frame, Command, Event};
 use ord_core::{CaptureBackend, PreparedClip};
 
 use crate::handler::Handler;
@@ -24,13 +24,10 @@ pub type ClipWriter = Box<dyn FnMut(&PreparedClip) -> Result<PathBuf, String> + 
 /// Shared list of subscriber connections that receive pushed events.
 type Subscribers = Arc<Mutex<Vec<UnixStream>>>;
 
-/// Lock a mutex, recovering from poisoning instead of panicking. A daemon must
-/// not die because some other thread panicked while holding a lock — in
-/// particular the capture-drain pump must keep running, or memory grows unbounded
-/// (the OOM this project already fixed once).
-fn lock_tolerant<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+// `lock_tolerant` comes from ord-common: a daemon must not die because some
+// other thread panicked while holding a lock — in particular the capture-drain
+// pump must keep running, or memory grows unbounded (the OOM this project
+// already fixed once).
 
 /// Broadcast an event to all live subscribers, dropping any that have closed.
 fn broadcast(subs: &Subscribers, event: &Event) {

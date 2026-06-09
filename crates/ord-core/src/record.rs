@@ -59,8 +59,7 @@ mod imp {
 
     use ffmpeg_next as ff;
 
-    use crate::backend::Codec;
-    use crate::mux::{annexb, build_opus_head, codec_id};
+    use crate::mux::{bitstream, stream};
 
     /// An open recording: a live ffmpeg output context fed encoded packets.
     pub struct Recorder {
@@ -68,7 +67,6 @@ mod imp {
         path: PathBuf,
         params: StreamParams,
         audio_params: Option<AudioParams>,
-        is_h264: bool,
         video_index: usize,
         audio_index: Option<usize>,
         /// Whether the header has been written (waits for the first keyframe).
@@ -76,8 +74,8 @@ mod imp {
         /// Timestamp (ticks) of the first frame, rebased to 0.
         base: i64,
         video_base_us: i64,
-        last_dts_ms: i64,
-        last_audio_ms: i64,
+        video_dts: stream::MonotonicMs,
+        audio_ts: stream::MonotonicMs,
     }
 
     impl Recorder {
@@ -93,7 +91,6 @@ mod imp {
             Ok(Self {
                 octx,
                 path: path.to_path_buf(),
-                is_h264: matches!(params.codec, Codec::H264),
                 params,
                 audio_params,
                 video_index: 0,
@@ -101,8 +98,8 @@ mod imp {
                 started: false,
                 base: 0,
                 video_base_us: 0,
-                last_dts_ms: i64::MIN,
-                last_audio_ms: i64::MIN,
+                video_dts: stream::MonotonicMs::new(),
+                audio_ts: stream::MonotonicMs::new(),
             })
         }
 
@@ -118,19 +115,11 @@ mod imp {
             }
 
             let den = self.params.time_base_den.max(1);
-            let payload = if self.is_h264 {
-                annexb::to_avcc(&frame.data)
-            } else {
-                frame.data.to_vec()
-            };
+            let payload = bitstream::packet_payload(self.params.codec, &frame.data);
             if payload.is_empty() {
                 return Ok(());
             }
-            let mut dts = (frame.dts - self.base) * 1000 / den;
-            if dts <= self.last_dts_ms {
-                dts = self.last_dts_ms + 1;
-            }
-            self.last_dts_ms = dts;
+            let dts = self.video_dts.next((frame.dts - self.base) * 1000 / den);
             let pts = ((frame.pts - self.base) * 1000 / den).max(dts);
 
             let mut packet = ff::codec::packet::Packet::copy(&payload);
@@ -153,14 +142,11 @@ mod imp {
             if !self.started || frame.data.is_empty() {
                 return Ok(());
             }
-            let mut ts = (frame.timestamp_micros - self.video_base_us) / 1000;
+            let ts = (frame.timestamp_micros - self.video_base_us) / 1000;
             if ts < 0 {
                 return Ok(());
             }
-            if ts <= self.last_audio_ms {
-                ts = self.last_audio_ms + 1;
-            }
-            self.last_audio_ms = ts;
+            let ts = self.audio_ts.next(ts);
 
             let mut packet = ff::codec::packet::Packet::copy(&frame.data);
             packet.set_pts(Some(ts));
@@ -180,87 +166,11 @@ mod imp {
         }
 
         fn write_header(&mut self, first_keyframe: &EncodedFrame) -> Result<(), MuxError> {
-            let extradata = if self.is_h264 {
-                annexb::build_avcc(&first_keyframe.data).ok_or_else(|| {
-                    MuxError::Ffmpeg("could not build avcC (missing SPS/PPS)".into())
-                })?
-            } else {
-                Vec::new()
-            };
-
-            let codec = ff::encoder::find(codec_id(self.params.codec))
-                .ok_or_else(|| MuxError::Ffmpeg("codec not found".into()))?;
-            {
-                let mut stream = self.octx.add_stream(codec)?;
-                stream.set_time_base(ff::Rational(1, 1000));
-                self.video_index = stream.index();
-                // SAFETY: codecpar is a valid AVCodecParameters owned by the stream;
-                // we set the copy-mux fields + avcC extradata (av_malloc'd so ffmpeg
-                // frees it), mirroring the clip muxer.
-                unsafe {
-                    let par = (*stream.as_ptr()).codecpar;
-                    if par.is_null() {
-                        return Err(MuxError::Ffmpeg("stream has no codecpar".into()));
-                    }
-                    (*par).codec_type = ff::ffi::AVMediaType::AVMEDIA_TYPE_VIDEO;
-                    (*par).codec_id = codec_id(self.params.codec).into();
-                    (*par).width = self.params.width as i32;
-                    (*par).height = self.params.height as i32;
-                    if !extradata.is_empty() {
-                        let size = extradata.len();
-                        let buf = ff::ffi::av_malloc(
-                            size + ff::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
-                        ) as *mut u8;
-                        if buf.is_null() {
-                            return Err(MuxError::Ffmpeg("av_malloc failed for extradata".into()));
-                        }
-                        std::ptr::copy_nonoverlapping(extradata.as_ptr(), buf, size);
-                        std::ptr::write_bytes(
-                            buf.add(size),
-                            0,
-                            ff::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
-                        );
-                        (*par).extradata = buf;
-                        (*par).extradata_size = size as i32;
-                    }
-                }
-            }
-
+            let extradata = bitstream::extradata(self.params.codec, &first_keyframe.data)?;
+            self.video_index = stream::add_video_stream(&mut self.octx, self.params, &extradata)?;
             if let Some(ap) = self.audio_params {
-                let acodec = ff::encoder::find(ff::codec::Id::OPUS)
-                    .ok_or_else(|| MuxError::Ffmpeg("opus codec not found".into()))?;
-                let mut astream = self.octx.add_stream(acodec)?;
-                astream.set_time_base(ff::Rational(1, 1000));
-                self.audio_index = Some(astream.index());
-                let opus_head = build_opus_head(ap.sample_rate, ap.channels);
-                // SAFETY: as above, for the Opus copy stream + OpusHead extradata.
-                unsafe {
-                    let par = (*astream.as_ptr()).codecpar;
-                    if par.is_null() {
-                        return Err(MuxError::Ffmpeg("audio stream has no codecpar".into()));
-                    }
-                    (*par).codec_type = ff::ffi::AVMediaType::AVMEDIA_TYPE_AUDIO;
-                    (*par).codec_id = ff::ffi::AVCodecID::AV_CODEC_ID_OPUS;
-                    (*par).sample_rate = ap.sample_rate as i32;
-                    (*par).ch_layout.nb_channels = ap.channels as i32;
-                    let size = opus_head.len();
-                    let buf =
-                        ff::ffi::av_malloc(size + ff::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize)
-                            as *mut u8;
-                    if buf.is_null() {
-                        return Err(MuxError::Ffmpeg("av_malloc failed for OpusHead".into()));
-                    }
-                    std::ptr::copy_nonoverlapping(opus_head.as_ptr(), buf, size);
-                    std::ptr::write_bytes(
-                        buf.add(size),
-                        0,
-                        ff::ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize,
-                    );
-                    (*par).extradata = buf;
-                    (*par).extradata_size = size as i32;
-                }
+                self.audio_index = Some(stream::add_audio_stream(&mut self.octx, ap)?);
             }
-
             self.octx.write_header()?;
             self.base = first_keyframe.dts.min(first_keyframe.pts);
             self.video_base_us =

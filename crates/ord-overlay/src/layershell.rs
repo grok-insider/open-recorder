@@ -110,12 +110,6 @@ impl Overlay for LayerShellOverlay {
         Ok(())
     }
 
-    fn set_visible(&mut self, visible: bool) {
-        if let Some(inner) = self.inner.as_mut() {
-            inner.state.visible = visible;
-        }
-    }
-
     fn render(&mut self, hud: &Hud, now_ms: u64) {
         if let Some(inner) = self.inner.as_mut() {
             // Process queued events (configure/close) before drawing.
@@ -144,7 +138,6 @@ struct State {
     glyph_cache: GlyphCache,
     width: u32,
     height: u32,
-    visible: bool,
     configured: bool,
 }
 
@@ -201,7 +194,6 @@ impl State {
             glyph_cache: GlyphCache::new(),
             width,
             height,
-            visible: true,
             configured: false,
         };
 
@@ -229,13 +221,11 @@ impl State {
         // `glyph_cache` can be borrowed together (before the canvas borrows the
         // pool). The font size is constant, so each glyph is rasterized at most
         // once per process; thereafter a visible toast only blits.
-        if self.visible {
-            for toast in hud.toasts().iter().take(MAX_ROWS as usize) {
-                for ch in toast.text.chars() {
-                    if !self.glyph_cache.contains_key(&ch) {
-                        let (metrics, bitmap) = self.font.rasterize(ch, FONT_PX);
-                        self.glyph_cache.insert(ch, Glyph { metrics, bitmap });
-                    }
+        for toast in hud.toasts().iter().take(MAX_ROWS as usize) {
+            for ch in toast.text.chars() {
+                if !self.glyph_cache.contains_key(&ch) {
+                    let (metrics, bitmap) = self.font.rasterize(ch, FONT_PX);
+                    self.glyph_cache.insert(ch, Glyph { metrics, bitmap });
                 }
             }
         }
@@ -254,54 +244,52 @@ impl State {
         // Clear to fully transparent (premultiplied BGRA).
         canvas.fill(0);
 
-        if self.visible {
-            let cache = &self.glyph_cache;
-            let right = w as f32 - SHADOW as f32;
-            let mut y = SHADOW as f32;
-            for toast in hud.toasts().iter().take(MAX_ROWS as usize) {
-                // Fade + slide on appear and just before expiry.
-                let age = now_ms.saturating_sub(toast.created_at_ms) as f32;
-                let remaining = toast.expires_at_ms.saturating_sub(now_ms) as f32;
-                let fade_in = ease_out_cubic(age / FADE_IN_MS);
-                let fade_out = ease_out_cubic(remaining / FADE_OUT_MS);
-                let alpha = fade_in.min(fade_out);
-                if alpha > 0.001 {
-                    let slide = (1.0 - fade_in) * SLIDE_PX + (1.0 - fade_out) * SLIDE_PX;
-                    let text_w = measure_text(cache, &toast.text);
-                    let card_w = (PAD_X + ICON_BOX + ICON_GAP + text_w + PAD_X)
-                        .clamp(CARD_MIN_W as f32, CARD_MAX_W as f32);
-                    let x0 = right - card_w + slide;
-                    draw_card(
-                        canvas,
-                        w,
-                        h,
-                        cache,
-                        x0,
-                        y,
-                        card_w,
-                        toast.kind,
-                        &toast.text,
-                        alpha,
-                    );
-                }
-                y += (CARD_H + CARD_GAP) as f32;
-            }
-
-            // Persistent replay-buffer indicator: a small dot in the top-right
-            // corner (within the shadow margin, clear of the cards) whenever the
-            // buffer is armed. Static, so with the caller's dirty-tracking it
-            // costs nothing while idle.
-            if hud.buffer_active {
-                draw_dot(
+        let cache = &self.glyph_cache;
+        let right = w as f32 - SHADOW as f32;
+        let mut y = SHADOW as f32;
+        for toast in hud.toasts().iter().take(MAX_ROWS as usize) {
+            // Fade + slide on appear and just before expiry.
+            let age = now_ms.saturating_sub(toast.created_at_ms) as f32;
+            let remaining = toast.expires_at_ms.saturating_sub(now_ms) as f32;
+            let fade_in = ease_out_cubic(age / FADE_IN_MS);
+            let fade_out = ease_out_cubic(remaining / FADE_OUT_MS);
+            let alpha = fade_in.min(fade_out);
+            if alpha > 0.001 {
+                let slide = (1.0 - fade_in) * SLIDE_PX + (1.0 - fade_out) * SLIDE_PX;
+                let text_w = measure_text(cache, &toast.text);
+                let card_w = (PAD_X + ICON_BOX + ICON_GAP + text_w + PAD_X)
+                    .clamp(CARD_MIN_W as f32, CARD_MAX_W as f32);
+                let x0 = right - card_w + slide;
+                draw_card(
                     canvas,
                     w,
                     h,
-                    w as f32 - 11.0,
-                    11.0,
-                    4.5,
-                    accent(ToastKind::Recording),
+                    cache,
+                    x0,
+                    y,
+                    card_w,
+                    toast.kind,
+                    &toast.text,
+                    alpha,
                 );
             }
+            y += (CARD_H + CARD_GAP) as f32;
+        }
+
+        // Persistent replay-buffer indicator: a small dot in the top-right
+        // corner (within the shadow margin, clear of the cards) whenever the
+        // buffer is armed. Static, so with the caller's dirty-tracking it
+        // costs nothing while idle.
+        if hud.buffer_active {
+            draw_dot(
+                canvas,
+                w,
+                h,
+                w as f32 - 11.0,
+                11.0,
+                4.5,
+                accent(ToastKind::Recording),
+            );
         }
 
         let surface = self.layer.wl_surface();

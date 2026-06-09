@@ -46,7 +46,7 @@
             # as git deps (ord-core's `waycap` feature). Vendoring needs their
             # NAR hashes even for the pure CLI build.
             outputHashes = {
-              "waycap-rs-3.0.0" = "sha256-RS/sOAUQVH8UK+DlU2tGFTimkF/aHXv0x5wFCS78700=";
+              "waycap-rs-3.0.0" = "sha256-S5fSFyMvOLQFJiRCeSifJJyitmB1ayeQfOhp9Zzt/XI=";
               "libspa-0.9.2" = "sha256-eqHVfGpjsfXouGOwBh306/E8g0jQIE5w6cZ5a8TbOIQ=";
             };
           };

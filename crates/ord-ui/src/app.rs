@@ -14,11 +14,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
+use ord_common::{lock_tolerant, Command, Event};
 use ord_export::{export_with, ExportSummary, Preset, Trim};
 
 use crate::editor::{EditorAction, EditorState};
 use crate::format::{human_duration, human_size, relative_time, resolution};
-use crate::library::{scan_dir, Clip};
+use crate::library::{filter_sort, scan_dir, Clip, SortOrder};
 use crate::meta::{self, ClipMeta};
 
 const CARD_INNER_W: f32 = 300.0;
@@ -47,6 +48,14 @@ struct ExportMsg {
 struct ExportJob {
     progress: Arc<Mutex<f32>>,
     cancel: Arc<AtomicBool>,
+}
+
+/// Latest daemon state shown in the header (polled over the control socket).
+#[derive(Debug, Clone, Copy)]
+struct DaemonInfo {
+    buffer_enabled: bool,
+    recording: bool,
+    buffered_seconds: u32,
 }
 
 /// Per-clip async-loaded state.
@@ -82,6 +91,15 @@ pub struct LibraryApp {
     /// drive repaints while hidden.
     was_focused: bool,
     visible: Arc<AtomicBool>,
+    /// Library search query (case-insensitive substring of the clip name).
+    query: String,
+    /// Library sort order.
+    sort: SortOrder,
+    /// Latest daemon status (`None` = unreachable/offline), polled off-thread.
+    daemon: Option<DaemonInfo>,
+    daemon_rx: Receiver<Option<DaemonInfo>>,
+    daemon_tx: Sender<Option<DaemonInfo>>,
+    daemon_poll_started: bool,
 }
 
 impl LibraryApp {
@@ -90,6 +108,7 @@ impl LibraryApp {
         let clips = scan_dir(&clips_dir);
         let (loader_tx, loader_rx) = channel();
         let (export_tx, export_rx) = channel();
+        let (daemon_tx, daemon_rx) = channel();
         Self {
             clips_dir,
             clips,
@@ -108,7 +127,51 @@ impl LibraryApp {
             auto_open_tried: false,
             was_focused: true,
             visible: Arc::new(AtomicBool::new(true)),
+            query: String::new(),
+            sort: SortOrder::default(),
+            daemon: None,
+            daemon_rx,
+            daemon_tx,
+            daemon_poll_started: false,
         }
+    }
+
+    /// Poll `ordd` for status every couple of seconds (skipped while the window
+    /// is hidden), reporting into the daemon channel. Offline is a state, not an
+    /// error: the header just shows the daemon as unreachable.
+    fn start_daemon_poll(&mut self, ctx: &egui::Context) {
+        if self.daemon_poll_started {
+            return;
+        }
+        self.daemon_poll_started = true;
+        let tx = self.daemon_tx.clone();
+        let ctx = ctx.clone();
+        let visible = Arc::clone(&self.visible);
+        std::thread::spawn(move || loop {
+            if visible.load(Ordering::Relaxed) {
+                let info = ord_common::connect(ord_common::socket_path())
+                    .ok()
+                    .and_then(|mut c| c.request(&Command::Status).ok())
+                    .and_then(|ev| match ev {
+                        Event::Status {
+                            buffer_enabled,
+                            recording,
+                            buffered_seconds,
+                            ..
+                        } => Some(DaemonInfo {
+                            buffer_enabled,
+                            recording,
+                            buffered_seconds,
+                        }),
+                        _ => None,
+                    });
+                if tx.send(info).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        });
     }
 
     fn set_status(&mut self, msg: impl Into<String>) {
@@ -160,6 +223,9 @@ impl LibraryApp {
     }
 
     fn drain_channels(&mut self, ctx: &egui::Context) {
+        while let Ok(info) = self.daemon_rx.try_recv() {
+            self.daemon = info;
+        }
         while let Ok(msg) = self.loader_rx.try_recv() {
             match msg {
                 Loaded::Meta { path, meta } => {
@@ -226,7 +292,7 @@ impl LibraryApp {
         let mut profile = preset.profile();
         profile.mute = mute;
         let ext = profile.output_extension();
-        let preset_name = preset_label(preset);
+        let preset_name = preset.slug();
         let suffix = if trim.is_some() { "-trim" } else { "" };
         let out =
             meta::exports_dir(&self.clips_dir).join(format!("{stem}-{preset_name}{suffix}.{ext}"));
@@ -246,7 +312,7 @@ impl LibraryApp {
         self.set_status(format!("Exporting {label} as {preset_name}…"));
         std::thread::spawn(move || {
             let mut on_progress = |p: f64| {
-                *progress.lock().unwrap() = p as f32;
+                *lock_tolerant(&progress) = p as f32;
                 ctx.request_repaint();
             };
             let result = export_with(&input, &out, &profile, trim, &mut on_progress, &cancel)
@@ -267,19 +333,6 @@ impl LibraryApp {
             }
             Err(e) => self.set_status(format!("Delete failed: {e}")),
         }
-    }
-}
-
-/// A filename-safe slug for the export's preset.
-fn preset_label(p: Preset) -> &'static str {
-    match p {
-        Preset::HighQuality => "high",
-        Preset::Discord => "discord",
-        Preset::XTwitter => "x",
-        Preset::Hq1080p60 => "1080p60",
-        Preset::AudioOnly => "audio",
-        Preset::Gif => "gif",
-        Preset::Source => "source",
     }
 }
 
@@ -369,15 +422,14 @@ impl eframe::App for LibraryApp {
         }
 
         // Trim editor takes over the whole window when open.
-        if self.editor.is_some() {
+        if let Some(ed) = self.editor.as_mut() {
             self.watchdog.beat("editor");
             let wd = self.watchdog.clone();
-            let action = self.editor.as_mut().unwrap().ui(ctx, &wd);
-            match action {
+            match ed.ui(ctx, &wd) {
                 EditorAction::None => {}
                 EditorAction::Back => self.editor = None,
                 EditorAction::Export { preset, trim, mute } => {
-                    let clip = self.editor.as_ref().unwrap().clip().clone();
+                    let clip = ed.clip().clone();
                     let stem = clip
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
@@ -393,6 +445,7 @@ impl eframe::App for LibraryApp {
         if !self.loading {
             self.start_loading(ctx);
         }
+        self.start_daemon_poll(ctx);
 
         let now = now_epoch();
         let total_size: u64 = self
@@ -405,11 +458,30 @@ impl eframe::App for LibraryApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("open-recorder");
-                ui.label(
-                    egui::RichText::new("clips")
-                        .color(ui.visuals().weak_text_color())
-                        .size(16.0),
-                );
+                self.daemon_badge(ui);
+                ui.add_space(8.0);
+
+                // Search-as-you-type over clip names; Esc clears.
+                let search = egui::TextEdit::singleline(&mut self.query)
+                    .hint_text("Search clips…")
+                    .desired_width(200.0);
+                let resp = ui.add(search);
+                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.query.clear();
+                }
+                if !self.query.is_empty() && ui.small_button("✕").clicked() {
+                    self.query.clear();
+                }
+
+                egui::ComboBox::from_id_salt("sort")
+                    .selected_text(self.sort.label())
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        for order in SortOrder::ALL {
+                            ui.selectable_value(&mut self.sort, order, order.label());
+                        }
+                    });
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Refresh").clicked() {
                         self.refresh(ctx);
@@ -465,8 +537,19 @@ impl eframe::App for LibraryApp {
                     return;
                 }
 
-                // Snapshot the clip list so we can mutate self inside the closures.
-                let clips = self.clips.clone();
+                // The query/sort view of the model (also the owned snapshot that
+                // lets the card closures mutate `self`).
+                let clips = filter_sort(&self.clips, &self.query, self.sort);
+                if clips.is_empty() {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(80.0);
+                        ui.label(
+                            egui::RichText::new(format!("No clips match “{}”", self.query))
+                                .size(16.0),
+                        );
+                    });
+                    return;
+                }
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
@@ -482,6 +565,41 @@ impl eframe::App for LibraryApp {
 }
 
 impl LibraryApp {
+    /// Live daemon state in the header: buffer armed (green) / recording (red) /
+    /// buffer off (grey) / daemon unreachable (dim).
+    fn daemon_badge(&self, ui: &mut egui::Ui) {
+        let (dot, text, hover) = match self.daemon {
+            Some(d) if d.recording => (
+                egui::Color32::from_rgb(248, 81, 73),
+                "recording".to_string(),
+                "ordd is writing a full-length recording".to_string(),
+            ),
+            Some(d) if d.buffer_enabled => (
+                egui::Color32::from_rgb(63, 185, 80),
+                format!("buffer {}s", d.buffered_seconds),
+                "Replay buffer armed — seconds currently held in RAM".to_string(),
+            ),
+            Some(_) => (
+                egui::Color32::GRAY,
+                "buffer off".to_string(),
+                "ordd is running but the replay buffer is disabled".to_string(),
+            ),
+            None => (
+                egui::Color32::from_rgb(90, 90, 104),
+                "daemon offline".to_string(),
+                "Cannot reach ordd on its control socket".to_string(),
+            ),
+        };
+        ui.label(egui::RichText::new("●").color(dot).size(11.0))
+            .on_hover_text(hover.clone());
+        ui.label(
+            egui::RichText::new(text)
+                .color(ui.visuals().weak_text_color())
+                .size(12.5),
+        )
+        .on_hover_text(hover);
+    }
+
     fn card(&mut self, ui: &mut egui::Ui, clip: &Clip, now: u64, ctx: &egui::Context) {
         let border = egui::Color32::from_rgb(48, 48, 60);
         egui::Frame::none()
@@ -579,7 +697,7 @@ impl LibraryApp {
             let job = self
                 .exports
                 .get(&clip.path)
-                .map(|j| (*j.progress.lock().unwrap(), Arc::clone(&j.cancel)));
+                .map(|j| (*lock_tolerant(&j.progress), Arc::clone(&j.cancel)));
             if let Some((prog, cancel)) = job {
                 ui.label(format!("Exporting… {}%", (prog * 100.0) as u32));
                 if ui.button("Cancel").clicked() {
@@ -587,15 +705,7 @@ impl LibraryApp {
                 }
             } else {
                 ui.menu_button("Export", |ui| {
-                    for preset in [
-                        Preset::Discord,
-                        Preset::HighQuality,
-                        Preset::Hq1080p60,
-                        Preset::XTwitter,
-                        Preset::AudioOnly,
-                        Preset::Gif,
-                        Preset::Source,
-                    ] {
+                    for preset in Preset::ALL {
                         if ui.button(preset.label()).clicked() {
                             self.start_export(clip, preset, ctx);
                             ui.close_menu();

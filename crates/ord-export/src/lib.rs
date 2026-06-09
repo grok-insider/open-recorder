@@ -21,7 +21,7 @@ pub mod probe;
 pub mod profile;
 pub mod run;
 
-pub use plan::{build_plan, FfmpegPlan, SourceInfo, Trim};
+pub use plan::{build_plan, estimated_output_mib, FfmpegPlan, SourceInfo, Trim};
 pub use profile::{ExportProfile, FrameRate, Preset, RateControl, Scale};
 pub use run::{export, export_with, ExportSummary};
 

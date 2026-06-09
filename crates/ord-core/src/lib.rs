@@ -19,6 +19,7 @@ pub mod engine;
 pub mod mux;
 pub mod record;
 pub mod ring;
+pub mod store;
 #[cfg(feature = "waycap")]
 pub mod waycap_backend;
 
@@ -29,6 +30,7 @@ pub use engine::{Engine, PreparedClip};
 pub use mux::{write_clip, MuxError};
 pub use record::Recorder;
 pub use ring::{EncodedFrame, RingBuffer};
+pub use store::{FrameMeta, FrameStore};
 
 /// A timestamp expressed in the stream's time base — **ticks**, not a fixed
 /// unit. The tick length is defined by the backend's

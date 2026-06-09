@@ -76,20 +76,6 @@ impl Timeline {
     pub fn set_playhead(&mut self, t: f64) {
         self.playhead = self.clamp(t);
     }
-
-    /// Fraction `[0,1]` of a time across the clip (for drawing).
-    pub fn fraction(&self, t: f64) -> f32 {
-        if self.duration <= 0.0 {
-            0.0
-        } else {
-            (t / self.duration).clamp(0.0, 1.0) as f32
-        }
-    }
-
-    /// Time in seconds at a fraction `[0,1]` of the clip.
-    pub fn time_at(&self, frac: f32) -> f64 {
-        (frac.clamp(0.0, 1.0) as f64) * self.duration
-    }
 }
 
 /// A zoom/scroll window over the clip, mapping time <-> on-track fraction.
@@ -185,15 +171,6 @@ mod tests {
         assert!(approx(t.playhead(), 7.0)); // follows the out handle
         t.set_playhead(9.0);
         assert!(approx(t.playhead(), 9.0)); // bar scrub is free across the clip
-    }
-
-    #[test]
-    fn fraction_and_time_roundtrip() {
-        let t = Timeline::new(20.0);
-        assert!((t.fraction(10.0) - 0.5).abs() < 1e-6);
-        assert!(approx(t.time_at(0.25), 5.0));
-        assert_eq!(t.fraction(-5.0), 0.0);
-        assert_eq!(t.fraction(40.0), 1.0);
     }
 
     #[test]
