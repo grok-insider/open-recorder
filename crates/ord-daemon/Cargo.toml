@@ -16,6 +16,8 @@ ord-common.workspace = true
 ord-core.workspace = true
 thiserror.workspace = true
 signal-hook = "0.3"
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [features]
 # The shipped daemon records for real; CI builds the default (mock) daemon to

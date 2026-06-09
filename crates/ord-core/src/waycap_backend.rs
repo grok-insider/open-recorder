@@ -213,9 +213,10 @@ impl CaptureBackend for WaycapBackend {
                             Err(mpsc::TrySendError::Full(_)) => {
                                 dropped += 1;
                                 if dropped % 300 == 1 {
-                                    eprintln!(
-                                        "ordd: video forward channel full ({VIDEO_CHANNEL_CAP}); \
-                                         dropping frames (consumer stalled, {dropped} total)"
+                                    tracing::warn!(
+                                        cap = VIDEO_CHANNEL_CAP,
+                                        dropped,
+                                        "video forward channel full; dropping frames (consumer stalled)"
                                     );
                                 }
                             }

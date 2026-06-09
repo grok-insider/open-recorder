@@ -10,6 +10,14 @@ use ord_common::config::Config;
 use ord_core::{Engine, PreparedClip};
 use ord_daemon::{serve, server::bind, socket_path, ClipWriter, Handler};
 
+/// Initialize `tracing` with an `RUST_LOG` env filter (default `info`), so the
+/// daemon emits levelled, filterable logs to the journal instead of bare prints.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(filter).with_target(false).init();
+}
+
 /// Load the user config, writing a default file on first run. `ord-common` is
 /// I/O-free, so the file read/parse lives here in the binary.
 fn load_config() -> Config {
@@ -18,9 +26,10 @@ fn load_config() -> Config {
         Ok(s) => match Config::from_toml_str(&s) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
-                    "ordd: invalid config at {} ({e}); using defaults",
-                    path.display()
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "invalid config; using defaults"
                 );
                 Config::default()
             }
@@ -64,7 +73,7 @@ fn install_signal_handler(socket: PathBuf) {
                 }
             });
         }
-        Err(e) => eprintln!("ordd: could not install signal handler: {e}"),
+        Err(e) => tracing::warn!(error = %e, "could not install signal handler"),
     }
 }
 
@@ -95,7 +104,7 @@ fn make_writer() -> ClipWriter {
     // Without the muxer the daemon still runs (dev mode); saves report where a
     // clip *would* go but write nothing.
     Box::new(|_clip: &PreparedClip| {
-        eprintln!("ordd: built without `mux`; clip not written");
+        tracing::warn!("built without `mux`; clip not written");
         Ok(clip_filename())
     })
 }
@@ -148,12 +157,13 @@ fn make_engine(config: &Config) -> Engine<ord_core::MockBackend> {
 }
 
 fn main() {
+    init_tracing();
     let path = socket_path();
     let config = load_config();
 
     let mut engine = make_engine(&config);
     if let Err(e) = engine.start() {
-        eprintln!("ordd: failed to start capture: {e}");
+        tracing::error!(error = %e, "failed to start capture");
         std::process::exit(1);
     }
 
@@ -162,16 +172,16 @@ fn main() {
     let listener = match bind(&path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("ordd: {e}");
+            tracing::error!(error = %e, "failed to bind control socket");
             std::process::exit(1);
         }
     };
 
     install_signal_handler(path.clone());
 
-    eprintln!("ordd: listening on {}", path.display());
+    tracing::info!(socket = %path.display(), "ordd listening");
     if let Err(e) = serve(listener, handler, make_writer()) {
-        eprintln!("ordd: server error: {e}");
+        tracing::error!(error = %e, "server error");
         std::process::exit(1);
     }
 }

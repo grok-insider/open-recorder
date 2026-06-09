@@ -10,6 +10,7 @@ description = "open-recorder capture/encode engine: ring buffer + keyframe-aware
 [dependencies]
 ord-common.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 bytes = "1"
 ffmpeg-next = { version = "8", optional = true }
 crossbeam = { version = "0.8", optional = true }
