@@ -56,8 +56,13 @@ jobs:
         run: nix flake check --no-build -L
       - name: clippy --all-features (devshell)
         run: nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: test --all-features (devshell)
-        run: nix develop -c cargo test --workspace --all-features
+      # Tests run with every feature EXCEPT `waycap`: the waycap/cust build
+      # dynamically links libcuda.so.1, so while it *compiles* without a GPU
+      # (clippy above covers it), the resulting test binaries cannot even load
+      # on a driverless runner. The waycap test lane runs on the dev box
+      # (`cargo test --features waycap -- --ignored`, per AGENTS.md).
+      - name: test all features except waycap (devshell)
+        run: nix develop -c cargo test --workspace --features "ord-core/mux,ord-daemon/mux,ord-overlay/layershell,ord-ui/gui"
 
   # The nix build + cachix push only runs on version tags (v*) or a manual
   # dispatch — NOT on every master push. This keeps the cache holding only
