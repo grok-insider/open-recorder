@@ -30,6 +30,7 @@ thiserror = "2"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+ffmpeg-next = "8"
 ord-common = { path = "crates/ord-common" }
 ord-core = { path = "crates/ord-core" }
 ord-export = { path = "crates/ord-export" }
@@ -45,3 +46,9 @@ ord-export = { path = "crates/ord-export" }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Repo-wide lints so `cargo clippy` and the editor surface the same gate CI
+# enforces with `-D warnings`. Kept at "warn" here (CI denies); priority -1 lets
+# individual `#[allow(...)]` override.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

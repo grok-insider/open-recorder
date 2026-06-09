@@ -37,6 +37,9 @@
           };
           lib = nixpkgs.lib;
 
+          # Single source of truth for the package version: the workspace Cargo.toml.
+          version = (lib.importTOML ./Cargo.toml).workspace.package.version;
+
           cargoLock = {
             lockFile = ./Cargo.lock;
             # The workspace lockfile carries waycap-rs and its forked pipewire-rs
@@ -98,8 +101,7 @@
           mkPkg = { pname, crate, features ? [], native ? false, mainProgram, description }:
             pkgs.rustPlatform.buildRustPackage (
               (lib.optionalAttrs native nativeEnv) // {
-                inherit pname cargoLock;
-                version = "0.1.0";
+                inherit pname cargoLock version;
                 src = ./.;
                 cargoBuildFlags = [ "-p" crate ]
                   ++ lib.optionals (features != []) [ "--features" (lib.concatStringsSep "," features) ];
