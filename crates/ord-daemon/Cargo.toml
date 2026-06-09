@@ -29,3 +29,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 default = []
 mux = ["ord-core/mux"]
 waycap = ["ord-core/waycap", "mux"]
+
+[lints]
+workspace = true

@@ -26,3 +26,6 @@ required-features = ["layershell"]
 # the trait + HUD model build and test without Wayland.
 default = []
 layershell = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:fontdue"]
+
+[lints]
+workspace = true

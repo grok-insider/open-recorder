@@ -15,3 +15,6 @@ path = "src/main.rs"
 ord-common.workspace = true
 ord-export.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true
