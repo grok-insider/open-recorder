@@ -12,13 +12,18 @@
 
 use std::collections::VecDeque;
 
+use bytes::Bytes;
+
 use crate::Micros;
 
 /// One encoded (Opus) audio frame.
+///
+/// Like [`EncodedFrame`](crate::ring::EncodedFrame), the payload is a [`Bytes`]
+/// handle so selecting a clip's audio window clones refcounts, not packets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedAudioFrame {
     /// Encoded packet bytes.
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// Presentation timestamp in the encoder's own time base (e.g. 1/48000).
     pub pts: i64,
     /// Capture timestamp in microseconds, on the shared monotonic clock used to
@@ -27,9 +32,11 @@ pub struct EncodedAudioFrame {
 }
 
 impl EncodedAudioFrame {
-    pub fn new(data: Vec<u8>, pts: i64, timestamp_micros: Micros) -> Self {
+    /// Build an encoded audio frame. `data` accepts anything convertible into
+    /// [`Bytes`] (the encoder's `Vec<u8>` is moved in without copying).
+    pub fn new(data: impl Into<Bytes>, pts: i64, timestamp_micros: Micros) -> Self {
         Self {
-            data,
+            data: data.into(),
             pts,
             timestamp_micros,
         }

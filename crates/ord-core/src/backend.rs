@@ -132,6 +132,14 @@ impl MockBackend {
         self
     }
 
+    /// Set the per-frame encoded payload size. The default (32 bytes) keeps unit
+    /// tests cheap; benchmarks set a realistic size (tens of KB) so the clip-copy
+    /// cost is representative of a live capture.
+    pub fn with_frame_bytes(mut self, bytes: usize) -> Self {
+        self.frame_bytes = bytes;
+        self
+    }
+
     /// Microsecond spacing between video frames.
     fn frame_interval_micros(&self) -> Micros {
         MICROS_PER_SEC / self.params.fps as i64

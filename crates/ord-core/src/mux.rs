@@ -16,6 +16,9 @@
 use std::path::Path;
 
 #[cfg(feature = "mux")]
+use bytes::Bytes;
+
+#[cfg(feature = "mux")]
 use crate::backend::Codec;
 use crate::engine::PreparedClip;
 
@@ -219,11 +222,11 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
             dts: i64,
             pts: i64,
             key: bool,
-            data: Vec<u8>,
+            data: Bytes,
         },
         Audio {
             ts: i64,
-            data: Vec<u8>,
+            data: Bytes,
         },
     }
 
@@ -233,8 +236,10 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
     let mut last_dts = i64::MIN;
     for frame in ordered {
         // Convert Annex-B -> AVCC (length-prefixed, SPS/PPS stripped) for H.264.
-        let payload = if is_h264 {
-            annexb::to_avcc(&frame.data)
+        // `to_avcc` allocates a fresh `Vec` (moved into `Bytes` O(1)); the
+        // passthrough path is a refcount bump on the buffered frame.
+        let payload: Bytes = if is_h264 {
+            annexb::to_avcc(&frame.data).into()
         } else {
             frame.data.clone()
         };
@@ -273,6 +278,7 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
                 ts,
                 data: frame.data.clone(),
             });
+            // (Bytes clone above is a refcount bump, not a packet copy.)
         }
     }
 

@@ -10,9 +10,17 @@ description = "open-recorder capture/encode engine: ring buffer + keyframe-aware
 [dependencies]
 ord-common.workspace = true
 thiserror.workspace = true
+bytes = "1"
 ffmpeg-next = { version = "8", optional = true }
 crossbeam = { version = "0.8", optional = true }
 waycap-rs = { git = "https://github.com/0xfell/waycap-rs.git", rev = "645d181393170fd14c2f313989dda44872216e6f", default-features = false, features = ["nvidia", "egl"], optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "hotpath"
+harness = false
 
 [features]
 # `mux` pulls in ffmpeg-next (needs the system ffmpeg libs at build time). Off by
