@@ -8,7 +8,7 @@
 
 use ord_common::config::{Container, ExportCodec};
 
-use crate::profile::{ExportProfile, FrameRate, RateControl, Scale};
+use crate::profile::{ExportProfile, FrameRate, Output, RateControl, Scale};
 use crate::ExportError;
 
 /// Properties of the input file, normally filled in by [`crate::probe`].
@@ -156,6 +156,11 @@ fn bitrate_args(is_nvenc: bool, kbps: u32, capped: bool) -> Vec<String> {
     ];
     if is_nvenc {
         a.splice(0..0, ["-rc".to_string(), nvenc_rc.to_string()]);
+        if capped {
+            // Two-pass within NVENC: tighter size adherence + better quality at
+            // the target bitrate (cheap on the GPU).
+            a.extend(["-multipass".to_string(), "fullres".to_string()]);
+        }
     }
     a
 }
@@ -181,31 +186,95 @@ fn audio_args(profile: &ExportProfile, src: &SourceInfo) -> Vec<String> {
     if profile.mute || !src.has_audio {
         return vec!["-an".into()];
     }
-    // Target-size must control audio size, so it always transcodes.
-    let force_transcode = matches!(profile.rate_control, RateControl::TargetSize { .. });
+    // Target-size must control audio size, and loudnorm is a filter, so both
+    // force a transcode (you can't filter or re-bitrate a copied stream).
+    let force_transcode =
+        matches!(profile.rate_control, RateControl::TargetSize { .. }) || profile.normalize_audio;
     let kbps = profile.audio_kbps.max(1);
+    let mut a = Vec::new();
+    if profile.normalize_audio {
+        a.push("-af".into());
+        a.push("loudnorm".into());
+    }
     match profile.container {
         Container::Mkv => {
             let is_opus = src.audio_codec.as_deref() == Some("opus");
             if is_opus && !force_transcode {
-                vec!["-c:a".into(), "copy".into()]
+                a.push("-c:a".into());
+                a.push("copy".into());
             } else {
-                vec![
+                a.extend([
                     "-c:a".into(),
                     "libopus".into(),
                     "-b:a".into(),
                     format!("{kbps}k"),
-                ]
+                ]);
             }
         }
         // MP4: AAC is the universally-playable choice (Discord inline, QuickTime).
-        Container::Mp4 => vec![
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            format!("{kbps}k"),
-        ],
+        Container::Mp4 => {
+            a.extend([
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                format!("{kbps}k"),
+            ]);
+        }
     }
+    a
+}
+
+/// The audio codec name for an audio-only extraction into `container`.
+fn audio_codec_for(container: Container) -> &'static str {
+    match container {
+        Container::Mp4 => "aac",
+        Container::Mkv => "libopus",
+    }
+}
+
+/// Args for an audio-only extraction (`-vn` + transcode to the container codec).
+fn audio_only_args(args: &mut Vec<String>, profile: &ExportProfile, output: &str) {
+    args.push("-vn".into());
+    if profile.normalize_audio {
+        args.push("-af".into());
+        args.push("loudnorm".into());
+    }
+    let kbps = profile.audio_kbps.max(1);
+    args.push("-c:a".into());
+    args.push(audio_codec_for(profile.container).into());
+    args.push("-b:a".into());
+    args.push(format!("{kbps}k"));
+    if profile.container == Container::Mp4 {
+        args.push("-movflags".into());
+        args.push("+faststart".into());
+    }
+    args.push(output.into());
+}
+
+/// Args for a palette-based animated GIF (`scale`/`fps` size it; no audio).
+fn gif_args(args: &mut Vec<String>, profile: &ExportProfile, output: &str) {
+    let fps = match profile.fps {
+        FrameRate::Fixed(f) => f.max(1),
+        FrameRate::Source => 15,
+    };
+    let height = match profile.scale {
+        Scale::MaxHeight(h) => h,
+        Scale::Exact { height, .. } => height,
+        Scale::Source => 480,
+    };
+    // One pass: generate a palette from the frames and apply it (Bayer dithering
+    // keeps gradients clean without ballooning the file).
+    let vf = format!(
+        "fps={fps},scale=-2:{height}:flags=lanczos,split[s0][s1];\
+         [s0]palettegen=stats_mode=diff[p];\
+         [s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"
+    );
+    args.push("-vf".into());
+    args.push(vf);
+    args.push("-loop".into());
+    args.push("0".into());
+    args.push("-an".into());
+    args.push(output.into());
 }
 
 /// Build the full ffmpeg argument vector for an export.
@@ -240,6 +309,32 @@ pub fn build_plan(
     if let Some(t) = trim {
         args.push("-t".into());
         args.push(format!("{:.3}", t.duration()));
+    }
+
+    // Non-video outputs ignore the video codec/rate-control entirely.
+    match profile.output {
+        Output::Gif => {
+            gif_args(&mut args, profile, output);
+            return Ok(FfmpegPlan {
+                args,
+                encoder: "gif".to_string(),
+                uses_hardware: false,
+            });
+        }
+        Output::AudioOnly => {
+            if !src.has_audio {
+                return Err(ExportError::Io(
+                    "source has no audio track for an audio-only export".into(),
+                ));
+            }
+            audio_only_args(&mut args, profile, output);
+            return Ok(FfmpegPlan {
+                args,
+                encoder: String::new(),
+                uses_hardware: false,
+            });
+        }
+        Output::Video => {}
     }
 
     let hardware = profile.hardware && use_hardware;
@@ -470,6 +565,81 @@ mod tests {
             "over budget: {total_bytes}"
         );
         assert!(kbps >= 100);
+    }
+
+    #[test]
+    fn gif_uses_palette_filter() {
+        let plan = build_plan(
+            "in.mkv",
+            "out.gif",
+            &ExportProfile::gif(),
+            &src(),
+            None,
+            true,
+        )
+        .unwrap();
+        let s = joined(&plan);
+        assert!(s.contains("palettegen") && s.contains("paletteuse"));
+        assert!(s.contains("fps=15"));
+        assert!(s.contains("-an"));
+        assert_eq!(plan.encoder, "gif");
+    }
+
+    #[test]
+    fn audio_only_drops_video() {
+        let p = ExportProfile::audio_only(Container::Mp4);
+        let plan = build_plan("in.mkv", "out.m4a", &p, &src(), None, true).unwrap();
+        let s = joined(&plan);
+        assert!(s.contains("-vn"));
+        assert!(s.contains("-c:a aac"));
+        assert!(!s.contains("-c:v"));
+    }
+
+    #[test]
+    fn audio_only_errors_without_audio() {
+        let mut s = src();
+        s.has_audio = false;
+        let p = ExportProfile::audio_only(Container::Mkv);
+        assert!(build_plan("i", "o", &p, &s, None, true).is_err());
+    }
+
+    #[test]
+    fn loudnorm_forces_transcode_and_filter() {
+        let mut p = ExportProfile::high_quality();
+        p.container = Container::Mkv;
+        p.normalize_audio = true;
+        let s = joined(&build_plan("in.mkv", "o.mkv", &p, &src(), None, true).unwrap());
+        assert!(s.contains("-af loudnorm"));
+        assert!(s.contains("-c:a libopus") && !s.contains("-c:a copy"));
+    }
+
+    #[test]
+    fn target_size_uses_nvenc_multipass() {
+        let plan = build_plan(
+            "in.mkv",
+            "o.mp4",
+            &ExportProfile::discord(),
+            &src(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(joined(&plan).contains("-multipass fullres"));
+    }
+
+    #[test]
+    fn x_twitter_is_h264_1080p() {
+        let plan = build_plan(
+            "in.mkv",
+            "o.mp4",
+            &ExportProfile::x_twitter(),
+            &src(),
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.encoder, "h264_nvenc");
+        assert!(joined(&plan).contains("scale=-2:1080"));
     }
 
     #[test]

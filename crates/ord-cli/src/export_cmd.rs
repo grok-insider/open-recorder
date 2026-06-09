@@ -90,13 +90,15 @@ fn parse_scale(s: &str) -> Result<Scale, String> {
     Ok(Scale::Exact { width, height })
 }
 
-/// Derive a default output path: `<stem>-export.<ext>` next to the input.
-fn default_output(input: &Path, container: Container) -> PathBuf {
+/// Derive a default output path: `<stem>-export.<ext>` next to the input. The
+/// extension follows the profile's output kind (gif/audio-only override the
+/// container).
+fn default_output(input: &Path, profile: &ExportProfile) -> PathBuf {
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "clip".to_string());
-    let file = format!("{stem}-export.{}", container.extension());
+    let file = format!("{stem}-export.{}", profile.output_extension());
     match input.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.join(file),
         _ => PathBuf::from(file),
@@ -126,6 +128,7 @@ pub fn parse_export(args: impl Iterator<Item = String>) -> Result<ParsedExport, 
     let mut scale: Option<Scale> = None;
     let mut fps: Option<FrameRate> = None;
     let mut hardware: Option<bool> = None;
+    let mut normalize: Option<bool> = None;
     let mut start: Option<f64> = None;
     let mut end: Option<f64> = None;
 
@@ -171,6 +174,7 @@ pub fn parse_export(args: impl Iterator<Item = String>) -> Result<ParsedExport, 
             "--end" => end = Some(parse_f64(&need(&mut it, "--end")?, "--end")?),
             "--no-hardware" => hardware = Some(false),
             "--hardware" => hardware = Some(true),
+            "--normalize" => normalize = Some(true),
             "-h" | "--help" => return Err(usage().to_string()),
             other if other.starts_with('-') => return Err(format!("unknown flag: {other}")),
             positional => {
@@ -207,10 +211,13 @@ pub fn parse_export(args: impl Iterator<Item = String>) -> Result<ParsedExport, 
     if let Some(h) = hardware {
         profile.hardware = h;
     }
+    if let Some(n) = normalize {
+        profile.normalize_audio = n;
+    }
 
     let output = output
         .map(PathBuf::from)
-        .unwrap_or_else(|| default_output(&input, profile.container));
+        .unwrap_or_else(|| default_output(&input, &profile));
 
     let trim = match (start, end) {
         (None, None) => None,
