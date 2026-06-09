@@ -7,6 +7,8 @@
 
 use std::sync::mpsc::Receiver;
 
+use ord_common::ClipDuration;
+
 use crate::audio::{AudioParams, AudioRingBuffer, EncodedAudioFrame};
 use crate::backend::{BackendError, CaptureBackend, StreamParams};
 use crate::clip::{select_clip, ClipError};
@@ -99,11 +101,16 @@ impl<B: CaptureBackend> Engine<B> {
         n
     }
 
-    /// Select and copy the last `seconds` of buffered frames into a
+    /// The configured replay-buffer capacity in whole seconds.
+    pub fn capacity_seconds(&self) -> u32 {
+        self.ring.capacity_seconds()
+    }
+
+    /// Select and copy the last `duration` of buffered frames into a
     /// [`PreparedClip`] (the clip starts on a keyframe). The audio track covering
     /// the same time window is included. The ring buffers are left intact.
-    pub fn take_clip(&self, seconds: u32) -> Result<PreparedClip, ClipError> {
-        let selection = select_clip(&self.ring, seconds)?;
+    pub fn take_clip(&self, duration: ClipDuration) -> Result<PreparedClip, ClipError> {
+        let selection = select_clip(&self.ring, duration.get())?;
         let frames: Vec<EncodedFrame> = self
             .ring
             .frames()
@@ -162,6 +169,11 @@ mod tests {
     use crate::backend::MockBackend;
     use crate::MICROS_PER_SEC;
 
+    /// Shorthand for a clip duration in tests.
+    fn cd(seconds: u32) -> ClipDuration {
+        ClipDuration::new(seconds).unwrap()
+    }
+
     #[test]
     fn drains_frames_into_ring() {
         // 60fps, 120 frames = 2s of capture, keyframe every 60.
@@ -178,7 +190,7 @@ mod tests {
         let mut eng = Engine::new(MockBackend::new(60, 600, 60), 60);
         eng.start().unwrap();
         eng.drain_available();
-        let clip = eng.take_clip(3).unwrap();
+        let clip = eng.take_clip(cd(3)).unwrap();
         assert!(clip.frames.first().unwrap().is_keyframe);
         // Covers at least the requested 3s.
         assert!(clip.span_ticks() >= 3 * MICROS_PER_SEC);
@@ -192,7 +204,7 @@ mod tests {
         let mut eng = Engine::new(MockBackend::new(60, 600, 60).with_audio(), 60);
         eng.start().unwrap();
         eng.drain_available();
-        let clip = eng.take_clip(3).unwrap();
+        let clip = eng.take_clip(cd(3)).unwrap();
         assert!(clip.has_audio());
         // ~3s of 20ms audio frames -> roughly 150 (allow slack for keyframe
         // window reaching back a little further).
@@ -209,7 +221,7 @@ mod tests {
     #[test]
     fn take_clip_on_empty_errors() {
         let eng = Engine::new(MockBackend::new(60, 0, 1), 60);
-        assert_eq!(eng.take_clip(3), Err(ClipError::EmptyBuffer));
+        assert_eq!(eng.take_clip(cd(3)), Err(ClipError::EmptyBuffer));
     }
 
     #[test]
@@ -217,8 +229,8 @@ mod tests {
         let mut eng = Engine::new(MockBackend::new(60, 300, 60), 60);
         eng.start().unwrap();
         eng.drain_available();
-        let a = eng.take_clip(2).unwrap();
-        let b = eng.take_clip(2).unwrap();
+        let a = eng.take_clip(cd(2)).unwrap();
+        let b = eng.take_clip(cd(2)).unwrap();
         assert_eq!(a, b); // replay buffer intact across saves
     }
 
@@ -230,6 +242,6 @@ mod tests {
         eng.stop().unwrap();
         assert!(!eng.is_running());
         // Buffer still holds frames -> clip still works.
-        assert!(eng.take_clip(1).is_ok());
+        assert!(eng.take_clip(cd(1)).is_ok());
     }
 }

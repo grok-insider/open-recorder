@@ -159,15 +159,15 @@ fn handle_connection<B: CaptureBackend>(
                 let prepared = {
                     let mut h = lock_tolerant(handler);
                     h.pump();
-                    h.prepare_save(duration.get())
+                    h.prepare_save(duration)
                 };
                 match prepared {
-                    Ok(clip) => {
+                    Ok((clip, clamped)) => {
                         let mut w = lock_tolerant(writer);
                         match w(&clip) {
                             Ok(path) => Event::ClipSaved {
                                 path: path.to_string_lossy().into_owned(),
-                                duration,
+                                duration: clamped,
                             },
                             Err(e) => Event::Error {
                                 message: format!("failed to write clip: {e}"),

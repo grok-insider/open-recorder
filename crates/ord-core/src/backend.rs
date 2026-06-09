@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver};
 
 use crate::audio::{AudioCodec, AudioParams, EncodedAudioFrame};
 use crate::ring::EncodedFrame;
-use crate::{Micros, MICROS_PER_SEC};
+use crate::{Ticks, MICROS_PER_SEC};
 
 /// The encoded streams a backend delivers once started: always video, optionally
 /// a mixed audio track.
@@ -141,12 +141,12 @@ impl MockBackend {
     }
 
     /// Microsecond spacing between video frames.
-    fn frame_interval_micros(&self) -> Micros {
+    fn frame_interval_micros(&self) -> Ticks {
         MICROS_PER_SEC / self.params.fps as i64
     }
 
     /// Total captured span in microseconds.
-    fn span_micros(&self) -> Micros {
+    fn span_micros(&self) -> Ticks {
         self.total_frames.saturating_sub(1) as i64 * self.frame_interval_micros()
     }
 }

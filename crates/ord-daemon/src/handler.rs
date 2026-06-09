@@ -5,12 +5,13 @@
 //! tests drive it with `MockBackend` (no GPU). Clip writing is injected via a
 //! closure so tests assert the selected clip without invoking ffmpeg.
 
-use ord_common::{Command, Event};
+use ord_common::{BufferSeconds, ClipDuration, Command, Event};
 use ord_core::{CaptureBackend, ClipError, Engine, PreparedClip};
 
 /// Daemon state + capture engine.
 pub struct Handler<B: CaptureBackend> {
     engine: Engine<B>,
+    buffer: BufferSeconds,
     buffer_enabled: bool,
     recording: bool,
 }
@@ -23,8 +24,11 @@ impl<B: CaptureBackend> Handler<B> {
     /// [`prepare_save`]: Handler::prepare_save
     pub fn new(engine: Engine<B>) -> Self {
         let buffer_enabled = engine.is_running();
+        let buffer = BufferSeconds::new(engine.capacity_seconds())
+            .unwrap_or_else(|| BufferSeconds::new(1).expect("1 is non-zero"));
         Self {
             engine,
+            buffer,
             buffer_enabled,
             recording: false,
         }
@@ -58,20 +62,28 @@ impl<B: CaptureBackend> Handler<B> {
         }
     }
 
-    /// Drain pending frames and select the last `seconds` into a [`PreparedClip`],
-    /// ready for the server to write off-lock. On failure returns the user-facing
-    /// [`Event::Error`] to send back. Runs under the handler lock, but only does
-    /// the cheap selection + refcount-clone (no ffmpeg, no disk, no subprocess).
-    pub fn prepare_save(&mut self, seconds: u32) -> Result<PreparedClip, Event> {
+    /// Drain pending frames and select the last `duration` into a [`PreparedClip`],
+    /// ready for the server to write off-lock. The request is clamped to the
+    /// configured buffer length (you can never save more than is buffered); the
+    /// clamped duration is returned so the caller can report it accurately. On
+    /// failure returns the user-facing [`Event::Error`] to send back. Runs under
+    /// the handler lock, but only does the cheap selection + refcount-clone (no
+    /// ffmpeg, no disk, no subprocess).
+    pub fn prepare_save(
+        &mut self,
+        duration: ClipDuration,
+    ) -> Result<(PreparedClip, ClipDuration), Event> {
+        let clamped = duration.clamped_to(self.buffer);
         self.engine.drain_available();
-        self.engine.take_clip(seconds).map_err(|e| match e {
+        let clip = self.engine.take_clip(clamped).map_err(|e| match e {
             ClipError::EmptyBuffer => Event::Error {
                 message: "nothing buffered yet — is the replay buffer enabled?".into(),
             },
             ClipError::NoKeyframeInWindow => Event::Error {
                 message: "no keyframe available to start a decodable clip".into(),
             },
-        })
+        })?;
+        Ok((clip, clamped))
     }
 
     fn handle_toggle_record(&mut self) -> Event {
@@ -125,19 +137,32 @@ mod tests {
         Handler::new(engine)
     }
 
+    fn cd(seconds: u32) -> ClipDuration {
+        ClipDuration::new(seconds).unwrap()
+    }
+
     #[test]
     fn prepare_save_selects_a_clip() {
         let mut h = handler_with(60, 600, 60, 60);
-        let clip = h.prepare_save(3).expect("clip prepared");
+        let (clip, dur) = h.prepare_save(cd(3)).expect("clip prepared");
         assert!(!clip.frames.is_empty());
         assert!(clip.frames.first().unwrap().is_keyframe);
+        assert_eq!(dur.get(), 3);
+    }
+
+    #[test]
+    fn prepare_save_clamps_to_buffer() {
+        // Buffer holds 60s; requesting 120s must clamp the reported duration to 60.
+        let mut h = handler_with(60, 600, 60, 60);
+        let (_clip, dur) = h.prepare_save(cd(120)).expect("clip prepared");
+        assert_eq!(dur.get(), 60);
     }
 
     #[test]
     fn prepare_save_on_empty_buffer_errors() {
         // 0 frames -> empty buffer.
         let mut h = handler_with(60, 0, 1, 60);
-        let err = h.prepare_save(3).expect_err("empty buffer");
+        let err = h.prepare_save(cd(3)).expect_err("empty buffer");
         assert!(matches!(err, Event::Error { .. }));
     }
 

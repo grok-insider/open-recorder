@@ -28,10 +28,17 @@ pub use engine::{Engine, PreparedClip};
 pub use mux::{write_clip, MuxError};
 pub use ring::{EncodedFrame, RingBuffer};
 
-/// A presentation timestamp in microseconds (matches ffmpeg/waycap-rs `pts`).
-pub type Micros = i64;
+/// A timestamp expressed in the stream's time base — **ticks**, not a fixed
+/// unit. The tick length is defined by the backend's
+/// [`time_base_den`](backend::StreamParams::time_base_den): nanoseconds for
+/// waycap-rs capture, microseconds for the mock. (The old name `Micros` was a
+/// lie — waycap delivers nanoseconds — which once made the save window 1000×
+/// too small.) Convert to real microseconds with [`ticks_to_micros`] when
+/// correlating audio and video.
+pub type Ticks = i64;
 
-/// Microseconds per second.
+/// Microseconds per second (the mock backend's tick rate, and the audio
+/// correlation unit).
 pub const MICROS_PER_SEC: i64 = 1_000_000;
 
 /// Convert a timestamp expressed in `den` ticks-per-second into microseconds.
