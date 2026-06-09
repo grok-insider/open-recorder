@@ -200,13 +200,12 @@ mod tests {
         assert!(matches!(ev, Event::Error { .. }));
     }
 
+    #[cfg(not(feature = "mux"))]
     #[test]
     fn toggle_record_without_mux_errors() {
-        // The default (no-`mux`) build has no streaming muxer, so starting a
-        // recording fails with a clear error instead of silently "succeeding"
-        // (the old stub that flipped a bool and wrote nothing). Status stays not
-        // recording. With the `mux` feature this would start a real recording —
-        // exercised by the record golden test.
+        // The no-`mux` build has no streaming muxer, so starting a recording fails
+        // with a clear error instead of silently "succeeding" (the old stub that
+        // flipped a bool and wrote nothing). Status stays not recording.
         let mut h = handler_with(60, 10, 1, 60);
         assert!(matches!(
             h.handle(Command::ToggleRecord),
@@ -216,6 +215,24 @@ mod tests {
             Event::Status { recording, .. } => assert!(!recording),
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "mux")]
+    #[test]
+    fn toggle_record_flips_state() {
+        // With the muxer present, ToggleRecord opens then closes a real recording.
+        // We don't drain frames here: the mock's synthetic packets aren't valid
+        // H.264, so the muxer would (correctly) reject them and auto-stop — real
+        // frame streaming is covered by record_golden.rs.
+        let mut h = handler_with(60, 10, 1, 60);
+        assert_eq!(
+            h.handle(Command::ToggleRecord),
+            Event::RecordState { recording: true }
+        );
+        assert_eq!(
+            h.handle(Command::ToggleRecord),
+            Event::RecordState { recording: false }
+        );
     }
 
     #[test]
