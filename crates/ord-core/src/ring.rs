@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
-use crate::{Micros, MICROS_PER_SEC};
+use crate::{Ticks, MICROS_PER_SEC};
 
 /// One encoded video frame in the buffer. Mirrors the fields we need from
 /// `waycap_rs::types::video_frame::EncodedVideoFrame`.
@@ -28,15 +28,15 @@ pub struct EncodedFrame {
     /// Whether this frame is a keyframe (IDR). Required for clip selection.
     pub is_keyframe: bool,
     /// Presentation timestamp, microseconds.
-    pub pts: Micros,
+    pub pts: Ticks,
     /// Decode timestamp, microseconds.
-    pub dts: Micros,
+    pub dts: Ticks,
 }
 
 impl EncodedFrame {
     /// Convenience constructor. Accepts anything convertible into [`Bytes`]
     /// (e.g. a `Vec<u8>` from the encoder, which is moved in without copying).
-    pub fn new(data: impl Into<Bytes>, is_keyframe: bool, pts: Micros, dts: Micros) -> Self {
+    pub fn new(data: impl Into<Bytes>, is_keyframe: bool, pts: Ticks, dts: Ticks) -> Self {
         Self {
             data: data.into(),
             is_keyframe,
@@ -60,9 +60,9 @@ impl EncodedFrame {
 #[derive(Debug)]
 pub struct RingBuffer {
     frames: VecDeque<EncodedFrame>,
-    capacity_ticks: Micros,
+    capacity_ticks: Ticks,
     ticks_per_sec: i64,
-    max_pts: Micros,
+    max_pts: Ticks,
     bytes: usize,
 }
 
@@ -120,7 +120,7 @@ impl RingBuffer {
     }
 
     /// Remove frames whose pts is strictly less than `cutoff`.
-    fn evict_before(&mut self, cutoff: Micros) {
+    fn evict_before(&mut self, cutoff: Ticks) {
         while let Some(front) = self.frames.front() {
             if front.pts >= cutoff {
                 break;
@@ -150,7 +150,7 @@ impl RingBuffer {
 
     /// The span (in pts ticks) from the oldest to the newest buffered frame.
     /// Zero if fewer than two frames.
-    pub fn span_ticks(&self) -> Micros {
+    pub fn span_ticks(&self) -> Ticks {
         match (self.frames.front(), self.frames.back()) {
             (Some(f), Some(b)) => b.pts - f.pts,
             _ => 0,
@@ -167,13 +167,18 @@ impl RingBuffer {
         self.ticks_per_sec
     }
 
+    /// The configured capacity in whole seconds.
+    pub fn capacity_seconds(&self) -> u32 {
+        (self.capacity_ticks / self.ticks_per_sec.max(1)) as u32
+    }
+
     /// The pts of the newest buffered frame, if any.
-    pub fn newest_pts(&self) -> Option<Micros> {
+    pub fn newest_pts(&self) -> Option<Ticks> {
         self.frames.back().map(|f| f.pts)
     }
 
     /// The pts of the oldest buffered frame, if any.
-    pub fn oldest_pts(&self) -> Option<Micros> {
+    pub fn oldest_pts(&self) -> Option<Ticks> {
         self.frames.front().map(|f| f.pts)
     }
 

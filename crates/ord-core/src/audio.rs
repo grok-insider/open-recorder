@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 
-use crate::Micros;
+use crate::Ticks;
 
 /// One encoded (Opus) audio frame.
 ///
@@ -28,13 +28,13 @@ pub struct EncodedAudioFrame {
     pub pts: i64,
     /// Capture timestamp in microseconds, on the shared monotonic clock used to
     /// correlate with video.
-    pub timestamp_micros: Micros,
+    pub timestamp_micros: Ticks,
 }
 
 impl EncodedAudioFrame {
     /// Build an encoded audio frame. `data` accepts anything convertible into
     /// [`Bytes`] (the encoder's `Vec<u8>` is moved in without copying).
-    pub fn new(data: impl Into<Bytes>, pts: i64, timestamp_micros: Micros) -> Self {
+    pub fn new(data: impl Into<Bytes>, pts: i64, timestamp_micros: Ticks) -> Self {
         Self {
             data: data.into(),
             pts,
@@ -73,8 +73,8 @@ const MICROS_PER_SEC: i64 = 1_000_000;
 #[derive(Debug)]
 pub struct AudioRingBuffer {
     frames: VecDeque<EncodedAudioFrame>,
-    capacity_micros: Micros,
-    max_ts: Micros,
+    capacity_micros: Ticks,
+    max_ts: Ticks,
     bytes: usize,
 }
 
@@ -123,11 +123,7 @@ impl AudioRingBuffer {
 
     /// Frames whose capture timestamp falls within `[start_micros, end_micros]`,
     /// cloned, oldest first. Used to pick the audio for a video clip window.
-    pub fn select_window(
-        &self,
-        start_micros: Micros,
-        end_micros: Micros,
-    ) -> Vec<EncodedAudioFrame> {
+    pub fn select_window(&self, start_micros: Ticks, end_micros: Ticks) -> Vec<EncodedAudioFrame> {
         self.frames
             .iter()
             .filter(|f| f.timestamp_micros >= start_micros && f.timestamp_micros <= end_micros)

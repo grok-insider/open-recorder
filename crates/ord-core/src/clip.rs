@@ -11,7 +11,7 @@
 //! the shortest decodable clip that covers the requested window.
 
 use crate::ring::{EncodedFrame, RingBuffer};
-use crate::Micros;
+use crate::Ticks;
 
 /// The selected clip: indices into the buffer's frame sequence (oldest = 0) plus
 /// derived timing. `start_index` always points at a keyframe.
@@ -22,14 +22,14 @@ pub struct ClipSelection {
     /// Number of frames included (from `start_index` to the end of the buffer).
     pub frame_count: usize,
     /// pts of the first included frame.
-    pub start_pts: Micros,
+    pub start_pts: Ticks,
     /// pts of the last included frame.
-    pub end_pts: Micros,
+    pub end_pts: Ticks,
 }
 
 impl ClipSelection {
     /// The covered span in microseconds.
-    pub fn span_micros(&self) -> Micros {
+    pub fn span_ticks(&self) -> Ticks {
         self.end_pts - self.start_pts
     }
 }
@@ -144,7 +144,7 @@ mod tests {
             "expected ~300 frames for 5s, got {}",
             sel.frame_count
         );
-        assert!(sel.span_micros() >= 4 * ns); // span is in pts ticks (nanos here)
+        assert!(sel.span_ticks() >= 4 * ns); // span is in pts ticks (nanos here)
     }
 
     #[test]
@@ -168,7 +168,7 @@ mod tests {
         assert_eq!(sel.frame_count, 1);
         assert_eq!(sel.start_pts, 0);
         assert_eq!(sel.end_pts, 0);
-        assert_eq!(sel.span_micros(), 0);
+        assert_eq!(sel.span_ticks(), 0);
     }
 
     #[test]
@@ -247,7 +247,7 @@ mod tests {
         ]);
         let sel = select_clip(&rb, 2).unwrap();
         assert_eq!(sel.start_pts, 5 * MICROS_PER_SEC);
-        assert!(sel.span_micros() >= 2 * MICROS_PER_SEC);
+        assert!(sel.span_ticks() >= 2 * MICROS_PER_SEC);
     }
 
     #[test]

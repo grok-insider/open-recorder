@@ -12,6 +12,7 @@
 //! ```
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use ord_common::ClipDuration;
 use ord_core::{EncodedFrame, MICROS_PER_SEC};
 use ord_core::{Engine, MockBackend, RingBuffer};
 
@@ -68,8 +69,9 @@ fn bench_take_clip(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("take_clip");
     group.throughput(Throughput::Bytes((total as usize * FRAME_BYTES) as u64));
+    let dur = ClipDuration::new(SECS).unwrap();
     group.bench_function("last_30s_16kib_frames", |b| {
-        b.iter(|| black_box(eng.take_clip(black_box(SECS)).expect("clip")))
+        b.iter(|| black_box(eng.take_clip(black_box(dur)).expect("clip")))
     });
     group.finish();
 }
