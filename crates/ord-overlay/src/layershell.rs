@@ -272,7 +272,16 @@ impl State {
                         .clamp(CARD_MIN_W as f32, CARD_MAX_W as f32);
                     let x0 = right - card_w + slide;
                     draw_card(
-                        canvas, w, h, cache, x0, y, card_w, toast.kind, &toast.text, alpha,
+                        canvas,
+                        w,
+                        h,
+                        cache,
+                        x0,
+                        y,
+                        card_w,
+                        toast.kind,
+                        &toast.text,
+                        alpha,
                     );
                 }
                 y += (CARD_H + CARD_GAP) as f32;
