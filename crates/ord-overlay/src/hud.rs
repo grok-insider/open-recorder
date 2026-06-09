@@ -42,7 +42,10 @@ impl Hud {
         self.toast_for(kind, text, now_ms, DEFAULT_TOAST_MS);
     }
 
-    /// Push a toast with an explicit lifetime.
+    /// Push a toast with an explicit lifetime. **Coalesces**: if the newest toast
+    /// is the same kind and text and still on screen, its lifetime is simply
+    /// extended (and re-animated) instead of stacking a duplicate card — so
+    /// spamming the save key shows one refreshing toast, not five identical ones.
     pub fn toast_for(
         &mut self,
         kind: ToastKind,
@@ -50,9 +53,17 @@ impl Hud {
         now_ms: u64,
         ttl_ms: u64,
     ) {
+        let text = text.into();
+        if let Some(last) = self.toasts.last_mut() {
+            if last.kind == kind && last.text == text && last.expires_at_ms > now_ms {
+                last.expires_at_ms = now_ms.saturating_add(ttl_ms);
+                last.created_at_ms = now_ms;
+                return;
+            }
+        }
         self.toasts.push(Toast {
             kind,
-            text: text.into(),
+            text,
             created_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(ttl_ms),
         });
@@ -148,6 +159,26 @@ mod tests {
         assert!(hud.tick(100)); // toast expired -> changed
         assert!(!hud.is_animating());
         assert!(!hud.tick(200)); // empty -> no change
+    }
+
+    #[test]
+    fn identical_toasts_coalesce() {
+        let mut hud = Hud::default();
+        hud.toast(ToastKind::Saved, "Clip saved (3s)", 0);
+        hud.toast(ToastKind::Saved, "Clip saved (3s)", 500);
+        hud.toast(ToastKind::Saved, "Clip saved (3s)", 1000);
+        // All three coalesce into one refreshed card, not three stacked.
+        assert_eq!(hud.toasts().len(), 1);
+        assert_eq!(hud.toasts()[0].expires_at_ms, 1000 + DEFAULT_TOAST_MS);
+    }
+
+    #[test]
+    fn different_toasts_do_not_coalesce() {
+        let mut hud = Hud::default();
+        hud.toast(ToastKind::Saved, "Clip saved (3s)", 0);
+        hud.toast(ToastKind::Saved, "Clip saved (5s)", 100); // different text
+        hud.toast(ToastKind::Error, "Clip saved (3s)", 200); // different kind
+        assert_eq!(hud.toasts().len(), 3);
     }
 
     #[test]

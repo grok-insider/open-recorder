@@ -147,7 +147,16 @@ fn main() {
             }
         }
 
-        // Brief backoff before reconnecting to the (restarting) daemon.
-        std::thread::sleep(Duration::from_millis(500));
+        // Backoff before reconnecting to the (restarting) daemon — but keep
+        // ticking + rendering so a toast that fired right before the restart
+        // keeps animating instead of freezing on screen.
+        let backoff_until = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < backoff_until {
+            let changed = hud.tick(now_ms());
+            if changed || hud.is_animating() {
+                overlay.render(&hud, now_ms());
+            }
+            std::thread::sleep(Duration::from_millis(16));
+        }
     }
 }
