@@ -286,6 +286,22 @@ impl State {
                 }
                 y += (CARD_H + CARD_GAP) as f32;
             }
+
+            // Persistent replay-buffer indicator: a small dot in the top-right
+            // corner (within the shadow margin, clear of the cards) whenever the
+            // buffer is armed. Static, so with the caller's dirty-tracking it
+            // costs nothing while idle.
+            if hud.buffer_active {
+                draw_dot(
+                    canvas,
+                    w,
+                    h,
+                    w as f32 - 11.0,
+                    11.0,
+                    4.5,
+                    accent(ToastKind::Recording),
+                );
+            }
         }
 
         let surface = self.layer.wl_surface();
@@ -434,6 +450,38 @@ fn draw_card(
     draw_text(
         canvas, width, height, cache, text, tx, baseline, TEXT_RGB, alpha,
     );
+}
+
+/// Draw a small anti-aliased filled dot with a faint halo (the buffer indicator).
+fn draw_dot(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    color: (f32, f32, f32),
+) {
+    let half = r + 3.0;
+    let xs = (cx - half).floor().max(0.0) as u32;
+    let xe = ((cx + half).ceil() as u32).min(width);
+    let ys = (cy - half).floor().max(0.0) as u32;
+    let ye = ((cy + half).ceil() as u32).min(height);
+    for py in ys..ye {
+        for px in xs..xe {
+            let fx = px as f32 + 0.5;
+            let fy = py as f32 + 0.5;
+            let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() - r;
+            let idx = ((py * width + px) * 4) as usize;
+            let cov = (0.5 - d).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                blend(canvas, idx, color.0, color.1, color.2, cov * 0.9);
+            } else if d < 3.0 {
+                let halo = (1.0 - d / 3.0).clamp(0.0, 1.0) * 0.18;
+                blend(canvas, idx, color.0, color.1, color.2, halo);
+            }
+        }
+    }
 }
 
 /// Draw the per-kind status icon (anti-aliased, procedural — no glyph needed).
