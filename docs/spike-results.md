@@ -107,6 +107,17 @@ proceed.
   devshell); exposing them through waycap-rs is a fork item (the enum only has
   `H264Nvenc`). H.264 is fine for v1.
 
+## UPDATE: HEVC/AV1 + CBR shipped and verified on hardware
+
+The fork recipe below was implemented in `0xfell/waycap-rs` (rev `5a23bf4`):
+`VideoEncoder::{HevcNvenc, Av1Nvenc}` + `RateControl::ConstantBitrate`.
+Verified live on the RTX 5070 Ti (Hyprland session, portal token reuse):
+`capture.codec = "hevc"` and `"av1"` with `bitrate_kbps = 12000` each produced
+a 1440p clip (`hevc`/`av1` + Opus per ffprobe) that **fully decodes**
+(`ffmpeg -f null`), confirming the `hvcC`/`av1C` extradata from the bitstream
+module. The post-save hook fired with the clip path. The original recipe is
+kept below for history.
+
 ## HEVC/AV1 via a waycap-rs fork — verified recipe
 
 Assessed the fork scope against the pinned waycap-rs commit. It is **small and
