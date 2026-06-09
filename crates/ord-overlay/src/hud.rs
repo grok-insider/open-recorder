@@ -59,13 +59,27 @@ impl Hud {
     }
 
     /// Drop toasts whose expiry is at or before `now_ms`. Call each tick.
-    pub fn tick(&mut self, now_ms: u64) {
+    /// Returns `true` if any toast was removed (i.e. the visible set changed and
+    /// the renderer should repaint once more).
+    pub fn tick(&mut self, now_ms: u64) -> bool {
+        let before = self.toasts.len();
         self.toasts.retain(|t| t.expires_at_ms > now_ms);
+        self.toasts.len() != before
     }
 
     /// Currently-visible toasts (oldest first).
     pub fn toasts(&self) -> &[Toast] {
         &self.toasts
+    }
+
+    /// Whether a transient toast is on screen, so the renderer should run its
+    /// fade/slide animation at full frame rate. Distinct from [`has_content`]:
+    /// the persistent buffer indicator is **static** and needs no per-frame
+    /// redraw, so it must not by itself pin the HUD at 60fps.
+    ///
+    /// [`has_content`]: Hud::has_content
+    pub fn is_animating(&self) -> bool {
+        !self.toasts.is_empty()
     }
 
     /// Whether there is anything to draw (indicator or toasts).
@@ -122,6 +136,27 @@ mod tests {
         assert!(hud.has_content());
         hud.tick(DEFAULT_TOAST_MS);
         assert!(!hud.has_content());
+    }
+
+    #[test]
+    fn tick_reports_change_and_animating() {
+        let mut hud = Hud::default();
+        assert!(!hud.is_animating());
+        hud.toast_for(ToastKind::Saved, "a", 0, 100);
+        assert!(hud.is_animating());
+        assert!(!hud.tick(50)); // nothing expired yet -> no change
+        assert!(hud.tick(100)); // toast expired -> changed
+        assert!(!hud.is_animating());
+        assert!(!hud.tick(200)); // empty -> no change
+    }
+
+    #[test]
+    fn buffer_indicator_alone_is_not_animating() {
+        // The persistent indicator is static: it must not force 60fps redraws.
+        let mut hud = Hud::default();
+        hud.set_buffer_active(true);
+        assert!(hud.has_content());
+        assert!(!hud.is_animating());
     }
 
     #[test]
