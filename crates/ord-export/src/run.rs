@@ -5,13 +5,22 @@
 //! software encoder so an export never hard-fails just because the GPU session
 //! could not be acquired.
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::plan::{build_plan, Trim};
 use crate::probe::probe;
 use crate::profile::ExportProfile;
 use crate::{ffmpeg_bin, ExportError};
+
+/// A cancel flag that never trips (for the simple [`export`] path).
+fn never_cancel() -> &'static AtomicBool {
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    &NEVER
+}
 
 /// Result of a successful export.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,12 +34,29 @@ pub struct ExportSummary {
     pub duration_secs: f64,
 }
 
-/// Export `input` to `output` per `profile`, optionally trimmed.
+/// Export `input` to `output` per `profile`, optionally trimmed (blocking, no
+/// progress). Convenience wrapper over [`export_with`].
 pub fn export(
     input: &Path,
     output: &Path,
     profile: &ExportProfile,
     trim: Option<Trim>,
+) -> Result<ExportSummary, ExportError> {
+    export_with(input, output, profile, trim, &mut |_| {}, never_cancel())
+}
+
+/// Export with live progress reporting and cancellation.
+///
+/// `on_progress` is called with a fraction in `0.0..=1.0` as ffmpeg makes
+/// progress (parsed from `-progress pipe:1`). Setting `cancel` kills the running
+/// ffmpeg and yields [`ExportError::Cancelled`] (no partial file is left behind).
+pub fn export_with(
+    input: &Path,
+    output: &Path,
+    profile: &ExportProfile,
+    trim: Option<Trim>,
+    on_progress: &mut dyn FnMut(f64),
+    cancel: &AtomicBool,
 ) -> Result<ExportSummary, ExportError> {
     let src = probe(input)?;
     let duration = trim.map(|t| t.duration()).unwrap_or(src.duration_secs);
@@ -50,15 +76,17 @@ pub fn export(
     let phase = (|| -> Result<(String, bool, u64), ExportError> {
         // Attempt the profile as configured (hardware if requested).
         let plan = build_plan(&input_s, &output_s, profile, &src, trim, true)?;
-        let (encoder, used_hardware) = match run_ffmpeg(&plan.args) {
+        let (encoder, used_hardware) = match run_ffmpeg(&plan.args, duration, on_progress, cancel) {
             Ok(()) => (plan.encoder, plan.uses_hardware),
+            // A cancellation is final — never retry it in software.
+            Err(ExportError::Cancelled) => return Err(ExportError::Cancelled),
             Err(e) => {
                 // Retry in software only if the failed attempt actually used the
                 // GPU for a re-encode; a copy or already-software run has nothing
                 // to gain.
                 if plan.uses_hardware && profile.reencodes() {
                     let sw = build_plan(&input_s, &output_s, profile, &src, trim, false)?;
-                    run_ffmpeg(&sw.args)?;
+                    run_ffmpeg(&sw.args, duration, on_progress, cancel)?;
                     (sw.encoder, sw.uses_hardware)
                 } else {
                     return Err(e);
@@ -88,20 +116,77 @@ pub fn export(
     })
 }
 
-/// Run ffmpeg with `args`, capturing stderr for diagnostics.
-fn run_ffmpeg(args: &[String]) -> Result<(), ExportError> {
-    let out = Command::new(ffmpeg_bin())
-        .args(args)
-        .output()
+/// Run ffmpeg with `args`, streaming progress and honoring cancellation.
+///
+/// Prepends `-progress pipe:1 -nostats`, reads the progress stream from stdout
+/// (computing a fraction from `out_time_us` / `duration`), drains stderr on a
+/// side thread to avoid a pipe-full deadlock, and kills the child if `cancel`
+/// trips.
+fn run_ffmpeg(
+    args: &[String],
+    duration: f64,
+    on_progress: &mut dyn FnMut(f64),
+    cancel: &AtomicBool,
+) -> Result<(), ExportError> {
+    let mut full: Vec<String> = vec!["-progress".into(), "pipe:1".into(), "-nostats".into()];
+    full.extend_from_slice(args);
+
+    let mut child = Command::new(ffmpeg_bin())
+        .args(&full)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| ExportError::Spawn(e.to_string()))?;
 
-    if out.status.success() {
-        return Ok(());
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    // Drain stderr on a thread so a full stderr pipe can't deadlock the export.
+    let stderr_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        s
+    });
+
+    let mut cancelled = false;
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            cancelled = true;
+            break;
+        }
+        if let Some(us) = line.strip_prefix("out_time_us=") {
+            if duration > 0.0 {
+                if let Ok(us) = us.trim().parse::<i64>() {
+                    on_progress((us as f64 / 1_000_000.0 / duration).clamp(0.0, 1.0));
+                }
+            }
+        }
     }
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Wait for exit, still honoring a late cancel (e.g. progress stopped).
+    let status = loop {
+        if cancel.load(Ordering::Relaxed) && !cancelled {
+            let _ = child.kill();
+            cancelled = true;
+        }
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => return Err(ExportError::Spawn(e.to_string())),
+        }
+    };
+    let stderr = stderr_thread.join().unwrap_or_default();
+
+    if cancelled {
+        return Err(ExportError::Cancelled);
+    }
+    if status.success() {
+        on_progress(1.0);
+        return Ok(());
+    }
     Err(ExportError::Ffmpeg {
-        code: out.status.code(),
+        code: status.code(),
         stderr_tail: stderr_tail(&stderr),
     })
 }
@@ -125,7 +210,8 @@ mod tests {
     #[test]
     fn missing_ffmpeg_binary_is_a_spawn_error() {
         std::env::set_var("ORD_FFMPEG", "/nonexistent/ffmpeg-xyz");
-        let err = run_ffmpeg(&["-version".to_string()]).unwrap_err();
+        let err =
+            run_ffmpeg(&["-version".to_string()], 0.0, &mut |_| {}, never_cancel()).unwrap_err();
         std::env::remove_var("ORD_FFMPEG");
         assert!(matches!(err, ExportError::Spawn(_)));
     }

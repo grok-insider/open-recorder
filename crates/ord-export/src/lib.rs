@@ -23,7 +23,7 @@ pub mod run;
 
 pub use plan::{build_plan, FfmpegPlan, SourceInfo, Trim};
 pub use profile::{ExportProfile, FrameRate, Preset, RateControl, Scale};
-pub use run::{export, ExportSummary};
+pub use run::{export, export_with, ExportSummary};
 
 /// The `ffmpeg` binary, overridable via `ORD_FFMPEG` (e.g. a Nix store path).
 /// The single resolver shared by the runner, the probe path, and the GUI so the
@@ -53,6 +53,8 @@ pub enum ExportError {
         code: Option<i32>,
         stderr_tail: String,
     },
+    #[error("export cancelled")]
+    Cancelled,
     #[error("i/o error: {0}")]
     Io(String),
 }

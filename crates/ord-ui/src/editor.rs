@@ -672,21 +672,18 @@ impl EditorState {
                         };
                         ui.close_menu();
                     }
-                    if ui.button("High quality  (AV1, source res)").clicked() {
-                        *action = EditorAction::Export {
-                            preset: Preset::HighQuality,
-                            trim,
-                            mute,
-                        };
-                        ui.close_menu();
-                    }
-                    if ui.button("Source  (lossless remux)").clicked() {
-                        *action = EditorAction::Export {
-                            preset: Preset::Source,
-                            trim,
-                            mute,
-                        };
-                        ui.close_menu();
+                    for preset in [
+                        Preset::HighQuality,
+                        Preset::Hq1080p60,
+                        Preset::XTwitter,
+                        Preset::AudioOnly,
+                        Preset::Gif,
+                        Preset::Source,
+                    ] {
+                        if ui.button(preset.label()).clicked() {
+                            *action = EditorAction::Export { preset, trim, mute };
+                            ui.close_menu();
+                        }
                     }
                 });
             });

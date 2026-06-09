@@ -6,15 +6,15 @@
 //! (via [`ord_export`] presets), Reveal, and Delete. Metadata and thumbnails are
 //! loaded off the UI thread so the window stays responsive.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use ord_export::{export, ExportSummary, Preset, Trim};
+use ord_export::{export_with, ExportSummary, Preset, Trim};
 
 use crate::editor::{EditorAction, EditorState};
 use crate::format::{human_duration, human_size, relative_time, resolution};
@@ -43,6 +43,12 @@ struct ExportMsg {
     result: Result<ExportSummary, String>,
 }
 
+/// A live export's shared progress (0.0..=1.0) and cancel flag.
+struct ExportJob {
+    progress: Arc<Mutex<f32>>,
+    cancel: Arc<AtomicBool>,
+}
+
 /// Per-clip async-loaded state.
 #[derive(Default)]
 struct ClipState {
@@ -61,7 +67,7 @@ pub struct LibraryApp {
     loader_tx: Sender<Loaded>,
     export_rx: Receiver<ExportMsg>,
     export_tx: Sender<ExportMsg>,
-    exporting: HashSet<PathBuf>,
+    exports: HashMap<PathBuf, ExportJob>,
     confirm_delete: Option<PathBuf>,
     status: Option<(String, Instant)>,
     styled: bool,
@@ -92,7 +98,7 @@ impl LibraryApp {
             loader_tx,
             export_rx,
             export_tx,
-            exporting: HashSet::new(),
+            exports: HashMap::new(),
             confirm_delete: None,
             status: None,
             styled: false,
@@ -171,7 +177,7 @@ impl LibraryApp {
             }
         }
         while let Ok(msg) = self.export_rx.try_recv() {
-            self.exporting.remove(&msg.clip);
+            self.exports.remove(&msg.clip);
             match msg.result {
                 Ok(s) => {
                     let name = s
@@ -180,6 +186,9 @@ impl LibraryApp {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     self.set_status(format!("Exported → {name}  ({})", human_size(s.size_bytes)));
+                }
+                Err(e) if e == ord_export::ExportError::Cancelled.to_string() => {
+                    self.set_status("Export cancelled");
                 }
                 Err(e) => self.set_status(format!("Export failed: {e}")),
             }
@@ -211,12 +220,12 @@ impl LibraryApp {
         mute: bool,
         ctx: &egui::Context,
     ) {
-        if self.exporting.contains(input) {
+        if self.exports.contains_key(input) {
             return;
         }
         let mut profile = preset.profile();
         profile.mute = mute;
-        let ext = profile.container.extension();
+        let ext = profile.output_extension();
         let preset_name = preset_label(preset);
         let suffix = if trim.is_some() { "-trim" } else { "" };
         let out =
@@ -224,10 +233,24 @@ impl LibraryApp {
         let input = input.to_path_buf();
         let tx = self.export_tx.clone();
         let ctx = ctx.clone();
-        self.exporting.insert(input.clone());
+
+        let progress = Arc::new(Mutex::new(0.0f32));
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.exports.insert(
+            input.clone(),
+            ExportJob {
+                progress: Arc::clone(&progress),
+                cancel: Arc::clone(&cancel),
+            },
+        );
         self.set_status(format!("Exporting {label} as {preset_name}…"));
         std::thread::spawn(move || {
-            let result = export(&input, &out, &profile, trim).map_err(|e| e.to_string());
+            let mut on_progress = |p: f64| {
+                *progress.lock().unwrap() = p as f32;
+                ctx.request_repaint();
+            };
+            let result = export_with(&input, &out, &profile, trim, &mut on_progress, &cancel)
+                .map_err(|e| e.to_string());
             let _ = tx.send(ExportMsg {
                 clip: input,
                 result,
@@ -247,10 +270,15 @@ impl LibraryApp {
     }
 }
 
+/// A filename-safe slug for the export's preset.
 fn preset_label(p: Preset) -> &'static str {
     match p {
         Preset::HighQuality => "high",
         Preset::Discord => "discord",
+        Preset::XTwitter => "x",
+        Preset::Hq1080p60 => "1080p60",
+        Preset::AudioOnly => "audio",
+        Preset::Gif => "gif",
         Preset::Source => "source",
     }
 }
@@ -547,24 +575,34 @@ impl LibraryApp {
             if ui.button("Edit").clicked() {
                 self.open_editor(clip, ctx);
             }
-            let exporting = self.exporting.contains(&clip.path);
-            ui.add_enabled_ui(!exporting, |ui| {
-                let label = if exporting { "Exporting" } else { "Export" };
-                ui.menu_button(label, |ui| {
-                    if ui.button("Discord  (fits 10 MB, 1080p)").clicked() {
-                        self.start_export(clip, Preset::Discord, ctx);
-                        ui.close_menu();
-                    }
-                    if ui.button("High quality  (AV1, source res)").clicked() {
-                        self.start_export(clip, Preset::HighQuality, ctx);
-                        ui.close_menu();
-                    }
-                    if ui.button("Source  (lossless remux)").clicked() {
-                        self.start_export(clip, Preset::Source, ctx);
-                        ui.close_menu();
+            // Owned snapshot so the menu closure can still borrow `self` mutably.
+            let job = self
+                .exports
+                .get(&clip.path)
+                .map(|j| (*j.progress.lock().unwrap(), Arc::clone(&j.cancel)));
+            if let Some((prog, cancel)) = job {
+                ui.label(format!("Exporting… {}%", (prog * 100.0) as u32));
+                if ui.button("Cancel").clicked() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            } else {
+                ui.menu_button("Export", |ui| {
+                    for preset in [
+                        Preset::Discord,
+                        Preset::HighQuality,
+                        Preset::Hq1080p60,
+                        Preset::XTwitter,
+                        Preset::AudioOnly,
+                        Preset::Gif,
+                        Preset::Source,
+                    ] {
+                        if ui.button(preset.label()).clicked() {
+                            self.start_export(clip, preset, ctx);
+                            ui.close_menu();
+                        }
                     }
                 });
-            });
+            }
         });
 
         ui.add_space(4.0);
