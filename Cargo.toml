@@ -28,6 +28,8 @@ serde_json = "1"
 bincode = "1"
 thiserror = "2"
 toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
 ord-common = { path = "crates/ord-common" }
 ord-core = { path = "crates/ord-core" }
 ord-export = { path = "crates/ord-export" }

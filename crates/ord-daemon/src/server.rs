@@ -101,7 +101,7 @@ pub fn serve<B: CaptureBackend + 'static>(
         let stream = match conn {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("ordd: accept error: {e}");
+                tracing::warn!(error = %e, "accept error; continuing");
                 continue;
             }
         };
@@ -111,7 +111,7 @@ pub fn serve<B: CaptureBackend + 'static>(
         std::thread::spawn(move || {
             if let Err(e) = handle_connection(stream, &handler, &writer, &subs) {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
-                    eprintln!("ordd: connection error: {e}");
+                    tracing::warn!(error = %e, "connection error");
                 }
             }
         });
