@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use waycap_rs::pipeline::builder::CaptureBuilder;
-use waycap_rs::types::config::{AudioEncoder, QualityPreset, VideoEncoder};
+use waycap_rs::types::config::{AudioEncoder, QualityPreset, RateControl, VideoEncoder};
 use waycap_rs::Capture;
 
 use crate::audio::{AudioCodec, AudioParams, EncodedAudioFrame};
@@ -51,6 +51,8 @@ impl From<Quality> for QualityPreset {
 pub struct WaycapBackend {
     quality: Quality,
     fps: u32,
+    codec: Codec,
+    bitrate_kbps: Option<u32>,
     width: u32,
     height: u32,
     audio_enabled: bool,
@@ -65,13 +67,15 @@ pub struct WaycapBackend {
 
 impl WaycapBackend {
     /// Create a backend (does not start capture or prompt the portal yet). The
-    /// width/height are container hints; actual dimensions come from the H.264
-    /// SPS in the stream. Desktop audio (the default sink monitor) is captured by
-    /// default; toggle with [`with_audio`](Self::with_audio).
+    /// width/height are container hints; actual dimensions come from the codec's
+    /// parameter sets in the stream. Desktop audio (the default sink monitor) is
+    /// captured by default; toggle with [`with_audio`](Self::with_audio).
     pub fn new(quality: Quality, fps: u32) -> Self {
         Self {
             quality,
             fps,
+            codec: Codec::H264,
+            bitrate_kbps: None,
             width: 2560,
             height: 1440,
             audio_enabled: true,
@@ -83,6 +87,22 @@ impl WaycapBackend {
             stop: Arc::new(AtomicBool::new(false)),
             running: false,
         }
+    }
+
+    /// Select the NVENC capture codec (default: H.264). All three [`Codec`]s
+    /// are supported end-to-end: the waycap-rs fork encodes them and the
+    /// mux/bitstream side writes the matching extradata (`avcC`/`hvcC`/`av1C`).
+    pub fn with_codec(mut self, codec: Codec) -> Self {
+        self.codec = codec;
+        self
+    }
+
+    /// Request constant-bitrate encoding at `kbps` instead of the quality
+    /// preset, keeping replay-buffer RAM use predictable in high-motion scenes.
+    /// `None` (default) records in constant-quality mode via the preset.
+    pub fn with_bitrate_kbps(mut self, kbps: Option<u32>) -> Self {
+        self.bitrate_kbps = kbps;
+        self
     }
 
     /// Set the container dimension hints.
@@ -138,9 +158,20 @@ impl CaptureBackend for WaycapBackend {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        let encoder = match self.codec {
+            Codec::H264 => VideoEncoder::H264Nvenc,
+            Codec::Hevc => VideoEncoder::HevcNvenc,
+            Codec::Av1 => VideoEncoder::Av1Nvenc,
+        };
+        let rate_control = match self.bitrate_kbps {
+            Some(kbps) => RateControl::ConstantBitrate { kbps },
+            None => RateControl::Quality,
+        };
+
         let mut builder = CaptureBuilder::new()
-            .with_video_encoder(VideoEncoder::H264Nvenc)
+            .with_video_encoder(encoder)
             .with_quality_preset(self.quality.into())
+            .with_rate_control(rate_control)
             .with_target_fps(self.fps as u64)
             .with_cursor_shown();
         if self.mic_enabled {
@@ -289,13 +320,13 @@ impl CaptureBackend for WaycapBackend {
 
     fn params(&self) -> StreamParams {
         StreamParams {
-            // Dimensions are carried in the H.264 SPS (in each keyframe), so the
-            // muxer/decoder recover them even though waycap-rs does not surface
-            // them here. These act only as a container hint.
+            // Dimensions are carried in the codec's parameter sets (in each
+            // keyframe), so the muxer/decoder recover them even though waycap-rs
+            // does not surface them here. These act only as a container hint.
             width: self.width,
             height: self.height,
             fps: self.fps,
-            codec: Codec::H264,
+            codec: self.codec,
             time_base_den: crate::backend::NANOS_PER_SEC, // waycap pts are nanoseconds
         }
     }

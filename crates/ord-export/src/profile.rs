@@ -256,6 +256,31 @@ pub enum Preset {
 }
 
 impl Preset {
+    /// Every preset, in the order UIs should offer them. Menus iterate this so
+    /// a new preset can never be forgotten in one of them.
+    pub const ALL: [Preset; 7] = [
+        Preset::Discord,
+        Preset::HighQuality,
+        Preset::Hq1080p60,
+        Preset::XTwitter,
+        Preset::AudioOnly,
+        Preset::Gif,
+        Preset::Source,
+    ];
+
+    /// A filename-safe slug for export naming (`<stem>-<slug>.<ext>`).
+    pub fn slug(self) -> &'static str {
+        match self {
+            Preset::HighQuality => "high",
+            Preset::Discord => "discord",
+            Preset::XTwitter => "x",
+            Preset::Hq1080p60 => "1080p60",
+            Preset::AudioOnly => "audio",
+            Preset::Gif => "gif",
+            Preset::Source => "source",
+        }
+    }
+
     /// Materialize the preset into a concrete profile.
     pub fn profile(self) -> ExportProfile {
         match self {

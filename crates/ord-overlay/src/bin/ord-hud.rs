@@ -2,12 +2,11 @@
 //! click-through wlr-layer-shell HUD over everything (including fullscreen
 //! games). Run it from a compositor `exec-once`.
 
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
-use ord_common::{read_frame, socket_path, write_frame, Command, Event};
+use ord_common::{socket_path, Event};
 use ord_overlay::hud::{Hud, ToastKind};
 use ord_overlay::{LayerShellOverlay, Overlay};
 
@@ -51,18 +50,14 @@ fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {
 /// Connect to the daemon and subscribe, returning a receiver of events. The
 /// reader thread ends (dropping the sender) when the daemon disconnects.
 fn subscribe(path: &PathBuf) -> Option<mpsc::Receiver<Event>> {
-    let mut stream = UnixStream::connect(path).ok()?;
-    write_frame(&mut stream, &Command::Subscribe.encode().ok()?).ok()?;
+    let events = ord_common::connect(path).ok()?.subscribe().ok()?;
     let (tx, rx) = mpsc::channel::<Event>();
     // Read events on a background thread; the main thread owns the Wayland
     // connection and renders (Wayland client objects are not Send).
     std::thread::spawn(move || {
-        let mut s = stream;
-        while let Ok(bytes) = read_frame(&mut s) {
-            if let Ok(ev) = Event::decode(&bytes) {
-                if tx.send(ev).is_err() {
-                    break;
-                }
+        for ev in events {
+            if tx.send(ev).is_err() {
+                break;
             }
         }
     });

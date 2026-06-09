@@ -4,9 +4,11 @@
 
 pub mod gamedetect;
 pub mod handler;
+pub mod hook;
 pub mod server;
 
 pub use gamedetect::{clip_stem, detect_foreground};
 pub use handler::{Handler, RecordPath};
+pub use hook::spawn_clip_hook;
 pub use ord_common::socket_path;
 pub use server::{serve, ClipWriter, ServerError};

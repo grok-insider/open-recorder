@@ -100,6 +100,26 @@ fn target_size_kbps(mib: f64, duration: f64, has_audio: bool, audio_kbps: u32) -
     kbps.floor().max(100.0) as u32
 }
 
+/// Estimate the finished file size (MiB) for `profile` over `duration` seconds.
+/// `None` when the size isn't predictable (stream copy / quality-based modes).
+/// Pure planner math — mirrors exactly how the bitrates are chosen, including
+/// the 100 kbps video floor that makes very long size-targeted clips overshoot.
+pub fn estimated_output_mib(profile: &ExportProfile, duration: f64) -> Option<f64> {
+    if duration <= 0.0 {
+        return Some(0.0);
+    }
+    let audio_kbps = if profile.mute { 0 } else { profile.audio_kbps };
+    let video_kbps = match profile.rate_control {
+        RateControl::TargetSize { mib } => {
+            target_size_kbps(mib, duration, !profile.mute, profile.audio_kbps)
+        }
+        RateControl::Bitrate { kbps } => kbps,
+        _ => return None,
+    };
+    let bits = (video_kbps + audio_kbps) as f64 * 1000.0 * duration;
+    Some(bits / 8.0 / (1024.0 * 1024.0))
+}
+
 /// Rate-control flags for the encoder.
 fn rate_control_args(
     encoder: &str,
@@ -419,6 +439,24 @@ mod tests {
 
     fn joined(plan: &FfmpegPlan) -> String {
         plan.args.join(" ")
+    }
+
+    #[test]
+    fn estimated_size_tracks_the_target_budget() {
+        let p = ExportProfile::discord(); // TargetSize { mib: 9.0 }
+                                          // A normal clip lands just under the budget (0.92 container overhead).
+        let est = estimated_output_mib(&p, 30.0).unwrap();
+        assert!((7.5..=9.0).contains(&est), "got {est}");
+        // A very long clip hits the 100 kbps video floor and overshoots.
+        let long = estimated_output_mib(&p, 3600.0).unwrap();
+        assert!(long > 9.0, "got {long}");
+        // Short selections shrink toward the budget, never balloon.
+        assert_eq!(estimated_output_mib(&p, 0.0), Some(0.0));
+        // Quality-based profiles are not predictable.
+        assert_eq!(
+            estimated_output_mib(&ExportProfile::high_quality(), 30.0),
+            None
+        );
     }
 
     #[test]

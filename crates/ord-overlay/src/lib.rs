@@ -27,11 +27,13 @@ pub enum OverlayError {
 }
 
 /// A transparent, always-on-top, click-through HUD surface.
+///
+/// Deliberately minimal: the HUD renders every state from [`Hud`], so the trait
+/// is create/render/destroy. (A `set_visible` toggle was removed as speculative
+/// API — an empty `Hud` renders nothing, which is "hidden".)
 pub trait Overlay {
     /// Create the surface on the active output.
     fn create(&mut self) -> Result<(), OverlayError>;
-    /// Show or hide without destroying the surface.
-    fn set_visible(&mut self, visible: bool);
     /// Render the current HUD state (called each tick by the owner). `now_ms` is
     /// the same monotonic clock the toasts were created with, so the renderer can
     /// drive fade/slide animations.
@@ -45,7 +47,6 @@ pub trait Overlay {
 #[derive(Debug, Default)]
 pub struct NoopOverlay {
     pub created: bool,
-    pub visible: bool,
     pub renders: u32,
 }
 
@@ -54,15 +55,11 @@ impl Overlay for NoopOverlay {
         self.created = true;
         Ok(())
     }
-    fn set_visible(&mut self, visible: bool) {
-        self.visible = visible;
-    }
     fn render(&mut self, _hud: &Hud, _now_ms: u64) {
         self.renders += 1;
     }
     fn destroy(&mut self) {
         self.created = false;
-        self.visible = false;
     }
 }
 
@@ -75,14 +72,11 @@ mod tests {
         let mut o = NoopOverlay::default();
         o.create().unwrap();
         assert!(o.created);
-        o.set_visible(true);
-        assert!(o.visible);
         let hud = Hud::default();
         o.render(&hud, 0);
         o.render(&hud, 16);
         assert_eq!(o.renders, 2);
         o.destroy();
         assert!(!o.created);
-        assert!(!o.visible);
     }
 }

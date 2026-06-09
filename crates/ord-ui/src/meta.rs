@@ -48,16 +48,29 @@ pub fn thumbnail_path(clip_path: &Path) -> PathBuf {
     thumb_cache_dir().join(format!("{stem}.jpg"))
 }
 
-fn extract(clip_path: &Path, out: &Path, seek: &str) -> bool {
-    Command::new(ord_export::ffmpeg_bin())
-        .args(["-v", "error", "-y", "-ss", seek, "-i"])
+/// Extract one frame at `secs` as JPEG bytes (ffmpeg → MJPEG pipe), scaled to
+/// `width`. The single frame extractor behind both the library's cached
+/// thumbnails and the editor's filmstrip — keep them on this one code path.
+pub fn extract_frame_jpeg(clip_path: &Path, secs: f64, width: u32) -> Option<Vec<u8>> {
+    let out = Command::new(ord_export::ffmpeg_bin())
+        .args(["-v", "error", "-ss", &format!("{:.3}", secs.max(0.0)), "-i"])
         .arg(clip_path)
-        .args(["-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "4"])
-        .arg(out)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-        && out.exists()
+        .args([
+            "-frames:v",
+            "1",
+            "-vf",
+            &format!("scale={width}:-2"),
+            "-q:v",
+            "4",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "mjpeg",
+            "-",
+        ])
+        .output()
+        .ok()?;
+    (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
 }
 
 /// Ensure a cached thumbnail exists, extracting one with ffmpeg if needed.
@@ -70,11 +83,10 @@ pub fn ensure_thumbnail(clip_path: &Path) -> Option<PathBuf> {
     std::fs::create_dir_all(out.parent()?).ok()?;
     // Prefer a frame ~1s in (avoids black intro frames); fall back to the very
     // first frame for sub-second clips.
-    if extract(clip_path, &out, "1") || extract(clip_path, &out, "0") {
-        Some(out)
-    } else {
-        None
-    }
+    let jpeg = extract_frame_jpeg(clip_path, 1.0, 480)
+        .or_else(|| extract_frame_jpeg(clip_path, 0.0, 480))?;
+    std::fs::write(&out, jpeg).ok()?;
+    Some(out)
 }
 
 /// Where exported files are written (`<clips>/exports`).

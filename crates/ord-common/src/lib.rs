@@ -4,18 +4,22 @@
 //! protocol (`Command`/`Event`), and their bincode (de)serialization. The CLI,
 //! GUI, and daemon all speak this protocol over the Unix socket.
 
+pub mod client;
 pub mod config;
 pub mod frame;
 pub mod ipc;
 pub mod newtypes;
+pub mod sync;
 
+pub use client::{connect, Client, ClientError};
 pub use config::{
-    default_config_path, AudioConfig, CaptureConfig, Config, ConfigError, Container, ExportCodec,
-    ExportConfig, Quality,
+    default_config_path, AudioConfig, CaptureCodec, CaptureConfig, Config, ConfigError, Container,
+    ExportCodec, ExportConfig, HooksConfig, Quality,
 };
 pub use frame::{read_frame, write_frame, MAX_FRAME, PROTOCOL_VERSION};
 pub use ipc::{Command, Event, ProtocolError};
 pub use newtypes::{BufferSeconds, ClipDuration, MonitorId};
+pub use sync::lock_tolerant;
 
 use std::path::PathBuf;
 

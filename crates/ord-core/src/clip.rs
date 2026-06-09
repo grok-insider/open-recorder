@@ -10,7 +10,7 @@
 //! to the last keyframe before the window). That is correct and intended — it is
 //! the shortest decodable clip that covers the requested window.
 
-use crate::ring::{EncodedFrame, RingBuffer};
+use crate::store::FrameStore;
 use crate::Ticks;
 
 /// The selected clip: indices into the buffer's frame sequence (oldest = 0) plus
@@ -51,16 +51,14 @@ pub enum ClipError {
 /// The window ends at the newest buffered frame and extends `requested_seconds`
 /// back. The clip starts at the newest keyframe with pts <= the window start
 /// (clamped to the oldest buffered frame), guaranteeing a decodable stream.
-pub fn select_clip(
-    buffer: &RingBuffer,
+///
+/// Works on [`FrameStore`] metadata only — a single scan, no payload access —
+/// so it is equally cheap over a RAM ring or a disk-backed store.
+pub fn select_clip<S: FrameStore + ?Sized>(
+    buffer: &S,
     requested_seconds: u32,
 ) -> Result<ClipSelection, ClipError> {
-    let frames: Vec<&EncodedFrame> = buffer.frames().collect();
-    if frames.is_empty() {
-        return Err(ClipError::EmptyBuffer);
-    }
-
-    let newest_pts = frames.last().expect("non-empty").pts;
+    let newest_pts = buffer.newest_pts().ok_or(ClipError::EmptyBuffer)?;
     // Convert the requested seconds into the buffer's pts time base (waycap uses
     // nanoseconds, the mock uses microseconds) — using the wrong base here makes
     // the window microscopic and the clip far too short.
@@ -68,45 +66,39 @@ pub fn select_clip(
     // The ideal start of the requested window (may be before the oldest frame).
     let window_start = newest_pts - requested_ticks;
 
-    // Find the newest keyframe whose pts <= window_start. If none (the requested
-    // window starts before the first keyframe), fall back to the oldest keyframe
-    // in the buffer so we still produce a decodable clip covering as much of the
-    // window as exists.
-    let mut start_index: Option<usize> = None;
-    for (i, frame) in frames.iter().enumerate() {
-        if frame.is_keyframe && frame.pts <= window_start {
-            start_index = Some(i);
+    // One metadata pass: the newest keyframe whose pts <= window_start, and the
+    // earliest keyframe as the fallback when the requested window starts before
+    // the first keyframe (still produces a decodable clip covering as much of
+    // the window as exists). No keyframe at all means no decodable clip.
+    let mut in_window: Option<(usize, Ticks)> = None;
+    let mut earliest: Option<(usize, Ticks)> = None;
+    for meta in buffer.scan() {
+        if !meta.is_keyframe {
+            continue;
+        }
+        if earliest.is_none() {
+            earliest = Some((meta.index, meta.pts));
+        }
+        if meta.pts <= window_start {
+            in_window = Some((meta.index, meta.pts));
         }
     }
-
-    let start_index = match start_index {
-        Some(i) => i,
-        None => {
-            // No keyframe at/before the window start. Use the earliest keyframe
-            // available (covers part of the window). If there is no keyframe at
-            // all, we cannot produce a decodable clip.
-            frames
-                .iter()
-                .position(|f| f.is_keyframe)
-                .ok_or(ClipError::NoKeyframeInWindow)?
-        }
-    };
-
-    let start_pts = frames[start_index].pts;
-    let end_pts = newest_pts;
-    let frame_count = frames.len() - start_index;
+    let (start_index, start_pts) = in_window
+        .or(earliest)
+        .ok_or(ClipError::NoKeyframeInWindow)?;
 
     Ok(ClipSelection {
         start_index,
-        frame_count,
+        frame_count: buffer.len() - start_index,
         start_pts,
-        end_pts,
+        end_pts: newest_pts,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ring::{EncodedFrame, RingBuffer};
     use crate::MICROS_PER_SEC;
 
     fn frame(sec: f64, keyframe: bool) -> EncodedFrame {

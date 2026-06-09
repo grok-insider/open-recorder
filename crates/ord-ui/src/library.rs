@@ -59,6 +59,60 @@ pub fn sort_newest_first(clips: &mut [Clip]) {
     });
 }
 
+/// Library ordering options (the view's sort selector).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortOrder {
+    #[default]
+    NewestFirst,
+    OldestFirst,
+    Name,
+}
+
+impl SortOrder {
+    pub const ALL: [SortOrder; 3] = [
+        SortOrder::NewestFirst,
+        SortOrder::OldestFirst,
+        SortOrder::Name,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SortOrder::NewestFirst => "Newest",
+            SortOrder::OldestFirst => "Oldest",
+            SortOrder::Name => "Name",
+        }
+    }
+}
+
+/// Filter clips by a case-insensitive substring of the label/stem, then order
+/// them. An empty/whitespace query keeps everything. Pure (view-model for the
+/// library's search box), so the grid never re-scans the disk to search.
+pub fn filter_sort(clips: &[Clip], query: &str, order: SortOrder) -> Vec<Clip> {
+    let q = query.trim().to_lowercase();
+    let mut out: Vec<Clip> = clips
+        .iter()
+        .filter(|c| q.is_empty() || c.stem.to_lowercase().contains(&q))
+        .cloned()
+        .collect();
+    match order {
+        SortOrder::NewestFirst => sort_newest_first(&mut out),
+        SortOrder::OldestFirst => {
+            sort_newest_first(&mut out);
+            // Keep no-epoch clips last (stable partition preserved by reversing
+            // only the dated prefix).
+            let dated = out.iter().take_while(|c| c.epoch.is_some()).count();
+            out[..dated].reverse();
+        }
+        SortOrder::Name => out.sort_by(|a, b| {
+            a.label()
+                .to_lowercase()
+                .cmp(&b.label().to_lowercase())
+                .then_with(|| b.epoch.cmp(&a.epoch))
+        }),
+    }
+    out
+}
+
 /// Scan a directory for clips, sorted newest-first. Missing dir -> empty list.
 pub fn scan_dir(dir: &Path) -> Vec<Clip> {
     let mut clips: Vec<Clip> = match std::fs::read_dir(dir) {
@@ -120,6 +174,44 @@ mod tests {
         assert_eq!(v[2].epoch, Some(100));
         // no-epoch sorts last.
         assert_eq!(v[3].epoch, None);
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_substring() {
+        let v = vec![
+            clip("path-of-exile-100"),
+            clip("hades-200"),
+            clip("doom-300"),
+        ];
+        let hits = filter_sort(&v, "EXILE", SortOrder::NewestFirst);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].label(), "path-of-exile");
+        // Empty / whitespace query keeps everything.
+        assert_eq!(filter_sort(&v, "  ", SortOrder::NewestFirst).len(), 3);
+    }
+
+    #[test]
+    fn sort_orders() {
+        let v = vec![clip("b-100"), clip("a-300"), clip("c-200"), clip("zz")];
+        let newest = filter_sort(&v, "", SortOrder::NewestFirst);
+        assert_eq!(newest[0].epoch, Some(300));
+        assert_eq!(newest[3].epoch, None);
+
+        let oldest = filter_sort(&v, "", SortOrder::OldestFirst);
+        assert_eq!(oldest[0].epoch, Some(100));
+        assert_eq!(oldest[2].epoch, Some(300));
+        // No-epoch clips stay last in both date orders.
+        assert_eq!(oldest[3].epoch, None);
+
+        let by_name = filter_sort(&v, "", SortOrder::Name);
+        assert_eq!(by_name[0].label(), "a");
+        assert_eq!(by_name[3].label(), "zz");
+    }
+
+    #[test]
+    fn sort_order_labels() {
+        assert_eq!(SortOrder::ALL.len(), 3);
+        assert_eq!(SortOrder::default().label(), "Newest");
     }
 
     #[test]

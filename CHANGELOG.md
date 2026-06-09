@@ -8,6 +8,51 @@ All notable changes to open-recorder are recorded here. The format follows
 
 ### Features
 
+- **HEVC/AV1 capture + CBR.** `capture.codec = "h264"|"hevc"|"av1"` and
+  `capture.bitrate_kbps` (CBR) in `config.toml`, working end-to-end: the
+  `0xfell/waycap-rs` fork now exposes `hevc_nvenc`/`av1_nvenc` and a
+  `RateControl::ConstantBitrate` knob (1-second VBV), and the mux side writes
+  the matching `hvcC`/`av1C` extradata. CBR keeps the replay buffer's RAM use
+  predictable in high-motion scenes.
+- **Post-save hook.** `hooks.on_clip_saved = "<program>"` runs after every saved
+  clip with the clip path as `$1` (gpu-screen-recorder's `-sc`, but config-
+  driven): notifications, renames, uploads. Asynchronous and off the capture
+  path; a broken hook is logged, never fails the save.
+- **Library search + sort + daemon status.** The clip library has
+  search-as-you-type over clip names (Esc clears), a Newest/Oldest/Name sort
+  selector, and a live daemon badge in the header (buffer armed + buffered
+  seconds / recording / buffer off / daemon offline) polled over the control
+  socket.
+- **Honest export size estimates.** Every size-predictable preset in the editor
+  export menu shows an estimate derived from the planner's actual bitrate math
+  (including the budget overhead factor and the 100 kbps floor on very long
+  selections), replacing the previous decorative constant.
+
+### Architecture / internal
+
+- **One bitstream module, two muxers.** All per-codec logic — `avcC`/`hvcC`/
+  `av1C` extradata building and Annex-B→length-prefix packet transforms — now
+  lives in `ord-core/src/mux/bitstream.rs` keyed by `Codec`, with full HEVC SPS
+  and AV1 sequence-header parsing, unit-tested without ffmpeg. The clip muxer
+  and the streaming recorder share one stream-setup helper (`mux/stream.rs`),
+  eliminating the duplicated unsafe codecpar/extradata blocks and `is_h264`
+  branches (`write_clip` shrank from ~244 lines to a readable sequence).
+- **`FrameStore` seam.** The engine is generic over the replay store
+  (`Engine<B, S: FrameStore = RingBuffer>`); clip selection works on a metadata
+  scan instead of borrowing the RAM deque, so a disk-backed buffer (longer
+  windows, low-RAM boxes) is now an implementation, not a refactor.
+- **`lock_tolerant` everywhere.** The poisoned-lock-recovery helper moved to
+  `ord-common` and is used by the daemon *and* all UI crates; the editor player
+  had ~20 `lock().unwrap()` sites that could cascade a decode-thread panic into
+  the UI thread. The player's 165-line `decode_loop` was split into a
+  `DecodeSession` with one method per phase (seek/pacing/EOF/video/audio).
+- **Shared IPC client.** `ord_common::client` owns connect/request/subscribe;
+  `ord` and `ord-hud` no longer hand-roll the framing dance.
+- Dedupe & dead code: one thumbnail extractor (library cache + editor filmstrip),
+  `Preset::ALL` + `Preset::slug()` so menus and filenames can't drift, removed
+  the unused `Overlay::set_visible`, `Timeline::fraction/time_at`, and
+  `Player::volume`.
+
 - **Real full-length recording.** `ord record` now starts/stops an actual NVENC
   recording (streaming muxer, separate from the replay buffer) written as a
   game-named `<game>-rec-<epoch>.mkv`, instead of the old no-op that reported

@@ -104,19 +104,24 @@ fn make_record_path() -> ord_daemon::RecordPath {
 }
 
 #[cfg(feature = "mux")]
-fn make_writer() -> ClipWriter {
-    Box::new(|clip: &PreparedClip| {
+fn make_writer(hook: Option<String>) -> ClipWriter {
+    Box::new(move |clip: &PreparedClip| {
         std::fs::create_dir_all(clips_dir()).map_err(|e| e.to_string())?;
         let path = clip_filename();
         ord_core::write_clip(clip, &path).map_err(|e| e.to_string())?;
+        // The hook runs detached AFTER a successful write, still off the
+        // handler lock, so it can never stall capture or fail the save.
+        if let Some(hook) = hook.as_deref() {
+            ord_daemon::spawn_clip_hook(hook, &path);
+        }
         Ok(path)
     })
 }
 
 #[cfg(not(feature = "mux"))]
-fn make_writer() -> ClipWriter {
+fn make_writer(_hook: Option<String>) -> ClipWriter {
     // Without the muxer the daemon still runs (dev mode); saves report where a
-    // clip *would* go but write nothing.
+    // clip *would* go but write nothing (and the hook is skipped).
     Box::new(|_clip: &PreparedClip| {
         tracing::warn!("built without `mux`; clip not written");
         Ok(clip_filename())
@@ -136,6 +141,17 @@ fn map_quality(q: ord_common::config::Quality) -> ord_core::waycap_backend::Qual
     }
 }
 
+/// Map the on-disk capture codec enum onto the engine's [`ord_core::Codec`].
+#[cfg(feature = "waycap")]
+fn map_codec(c: ord_common::config::CaptureCodec) -> ord_core::Codec {
+    use ord_common::config::CaptureCodec as C;
+    match c {
+        C::H264 => ord_core::Codec::H264,
+        C::Hevc => ord_core::Codec::Hevc,
+        C::Av1 => ord_core::Codec::Av1,
+    }
+}
+
 #[cfg(feature = "waycap")]
 fn make_engine(config: &Config) -> Engine<ord_core::waycap_backend::WaycapBackend> {
     use ord_core::waycap_backend::WaycapBackend;
@@ -143,6 +159,8 @@ fn make_engine(config: &Config) -> Engine<ord_core::waycap_backend::WaycapBacken
     // Enabling the mic implies audio; mic capture also includes desktop audio.
     let audio_any = config.audio.desktop || config.audio.mic;
     let backend = WaycapBackend::new(map_quality(config.capture.quality), config.capture.fps)
+        .with_codec(map_codec(config.capture.codec))
+        .with_bitrate_kbps(config.capture.bitrate_kbps)
         .with_audio(audio_any)
         .with_mic(config.audio.mic)
         .with_restore_token_path(restore_token_path());
@@ -194,7 +212,11 @@ fn main() {
     install_signal_handler(path.clone());
 
     tracing::info!(socket = %path.display(), "ordd listening");
-    if let Err(e) = serve(listener, handler, make_writer()) {
+    if let Err(e) = serve(
+        listener,
+        handler,
+        make_writer(config.hooks.on_clip_saved.clone()),
+    ) {
         tracing::error!(error = %e, "server error");
         std::process::exit(1);
     }

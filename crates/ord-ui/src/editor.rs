@@ -7,7 +7,6 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 
@@ -164,7 +163,6 @@ impl EditorState {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) -> EditorAction {
-        let mut action = EditorAction::None;
         let (
             space,
             key_i,
@@ -245,8 +243,7 @@ impl EditorState {
         if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
             self.debug = !self.debug;
         }
-        let _ = &mut action;
-        action
+        EditorAction::None
     }
 
     /// Debug overlay + throttled log to `/tmp/ord-ui-debug.log` (toggle: F3 or
@@ -659,28 +656,19 @@ impl EditorState {
                 ui.menu_button(egui::RichText::new("Export selection").strong(), |ui| {
                     let trim = self.current_trim();
                     let mute = self.mute_export;
-                    let mib = ord_export::profile::ExportProfile::discord();
-                    let est = est_discord_mib(self.timeline.selection_duration(), &mib);
-                    if ui
-                        .button(format!("Discord  (~{est:.1} MiB, 1080p)"))
-                        .clicked()
-                    {
-                        *action = EditorAction::Export {
-                            preset: Preset::Discord,
-                            trim,
-                            mute,
+                    let dur = self.timeline.selection_duration();
+                    for preset in Preset::ALL {
+                        // Size-predictable presets show an honest estimate from
+                        // the planner's own bitrate math.
+                        let mut profile = preset.profile();
+                        profile.mute = mute;
+                        let label = match ord_export::estimated_output_mib(&profile, dur) {
+                            Some(est) if est > 0.0 => {
+                                format!("{}  (~{est:.1} MiB)", preset.label())
+                            }
+                            _ => preset.label().to_string(),
                         };
-                        ui.close_menu();
-                    }
-                    for preset in [
-                        Preset::HighQuality,
-                        Preset::Hq1080p60,
-                        Preset::XTwitter,
-                        Preset::AudioOnly,
-                        Preset::Gif,
-                        Preset::Source,
-                    ] {
-                        if ui.button(preset.label()).clicked() {
+                        if ui.button(label).clicked() {
                             *action = EditorAction::Export { preset, trim, mute };
                             ui.close_menu();
                         }
@@ -715,21 +703,6 @@ fn nice_step(span: f64) -> f64 {
     600.0
 }
 
-/// Rough finished-size estimate (MiB) for the Discord target over `dur`.
-fn est_discord_mib(dur: f64, profile: &ord_export::profile::ExportProfile) -> f64 {
-    if let ord_export::profile::RateControl::TargetSize { mib } = profile.rate_control {
-        // Target size is duration-independent (the encoder hits the budget), but
-        // very short clips can't exceed source; clamp to a sane floor.
-        if dur <= 0.0 {
-            0.0
-        } else {
-            mib.min(9.0)
-        }
-    } else {
-        0.0
-    }
-}
-
 /// Decode `count` evenly-spaced thumbnails for the timeline filmstrip off-thread.
 fn spawn_filmstrip(
     clip: &std::path::Path,
@@ -755,28 +728,11 @@ fn spawn_filmstrip(
     rx
 }
 
-/// Extract one MJPEG frame at `secs` via ffmpeg and decode it to an egui image.
+/// Extract one frame at `secs` (via the shared [`meta`](crate::meta) extractor)
+/// and decode it to an egui image.
 fn extract_thumb(clip: &std::path::Path, secs: f64, width: u32) -> Option<egui::ColorImage> {
-    let out = Command::new(ord_export::ffmpeg_bin())
-        .args(["-v", "error", "-ss", &format!("{:.3}", secs.max(0.0)), "-i"])
-        .arg(clip)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            &format!("scale={width}:-2"),
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "-",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return None;
-    }
-    let img = image::load_from_memory(&out.stdout).ok()?.to_rgba8();
+    let jpeg = crate::meta::extract_frame_jpeg(clip, secs, width)?;
+    let img = image::load_from_memory(&jpeg).ok()?.to_rgba8();
     let (w, h) = img.dimensions();
     Some(egui::ColorImage::from_rgba_unmultiplied(
         [w as usize, h as usize],

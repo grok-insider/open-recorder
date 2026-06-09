@@ -16,6 +16,7 @@ use crate::clip::{select_clip, ClipError};
 use crate::mux::MuxError;
 use crate::record::Recorder;
 use crate::ring::{EncodedFrame, RingBuffer};
+use crate::store::FrameStore;
 
 /// A clip ready to be muxed: ordered encoded video frames (first is a keyframe),
 /// the audio frames covering the same window (may be empty), and the stream
@@ -43,10 +44,14 @@ impl PreparedClip {
     }
 }
 
-/// Drives capture into the ring buffers and produces clips on demand.
-pub struct Engine<B: CaptureBackend> {
+/// Drives capture into the replay store and produces clips on demand.
+///
+/// Generic over the [`FrameStore`] so the replay window can live in RAM (the
+/// default [`RingBuffer`]) or, in the future, on disk — without the engine,
+/// daemon, or selection logic changing.
+pub struct Engine<B: CaptureBackend, S: FrameStore = RingBuffer> {
     backend: B,
-    ring: RingBuffer,
+    ring: S,
     audio_ring: AudioRingBuffer,
     rx: Option<Receiver<EncodedFrame>>,
     audio_rx: Option<Receiver<EncodedAudioFrame>>,
@@ -56,14 +61,26 @@ pub struct Engine<B: CaptureBackend> {
 }
 
 impl<B: CaptureBackend> Engine<B> {
-    /// Create an engine over `backend` with a `capacity_seconds` replay buffer.
-    /// The ring buffer uses the backend's pts time base so eviction keeps exactly
-    /// `capacity_seconds` of footage regardless of whether pts are micro- or
-    /// nanoseconds.
+    /// Create an engine over `backend` with a `capacity_seconds` in-RAM replay
+    /// buffer. The ring buffer uses the backend's pts time base so eviction
+    /// keeps exactly `capacity_seconds` of footage regardless of whether pts
+    /// are micro- or nanoseconds.
     pub fn new(backend: B, capacity_seconds: u32) -> Self {
         let ticks_per_sec = backend.params().time_base_den;
+        Self::with_store(
+            backend,
+            RingBuffer::with_time_base(capacity_seconds, ticks_per_sec),
+            capacity_seconds,
+        )
+    }
+}
+
+impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
+    /// Create an engine over `backend` with a caller-provided replay store
+    /// (`capacity_seconds` sizes the audio ring to match).
+    pub fn with_store(backend: B, store: S, capacity_seconds: u32) -> Self {
         Self {
-            ring: RingBuffer::with_time_base(capacity_seconds, ticks_per_sec),
+            ring: store,
             audio_ring: AudioRingBuffer::new(capacity_seconds),
             backend,
             rx: None,
@@ -154,13 +171,9 @@ impl<B: CaptureBackend> Engine<B> {
     /// the same time window is included. The ring buffers are left intact.
     pub fn take_clip(&self, duration: ClipDuration) -> Result<PreparedClip, ClipError> {
         let selection = select_clip(&self.ring, duration.get())?;
-        let frames: Vec<EncodedFrame> = self
+        let frames = self
             .ring
-            .frames()
-            .skip(selection.start_index)
-            .take(selection.frame_count)
-            .cloned()
-            .collect();
+            .window(selection.start_index, selection.frame_count);
 
         // Map the video window (in the video pts time base) to microseconds and
         // pull the audio frames that fall inside it, keeping A/V aligned. The
@@ -191,7 +204,7 @@ impl<B: CaptureBackend> Engine<B> {
     /// Number of keyframes currently buffered. With few keyframes, "save last N"
     /// can only reach back to the newest one — useful for spotting GOP issues.
     pub fn buffered_keyframes(&self) -> usize {
-        self.ring.frames().filter(|f| f.is_keyframe).count()
+        self.ring.scan().filter(|m| m.is_keyframe).count()
     }
 
     /// Whether capture is running.
