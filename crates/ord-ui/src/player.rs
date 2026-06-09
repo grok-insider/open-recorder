@@ -197,13 +197,6 @@ pub struct Player {
     fps: f64,
 }
 
-/// The GPU NV12 shader render path is the DEFAULT: it scales the full-res frame
-/// to the preview widget in one pass (crisp) with ~0 CPU. Opt out with
-/// `ORD_RENDER=cpu` (falls back to the egui-texture path with a CPU scale).
-fn render_gl_enabled() -> bool {
-    !matches!(std::env::var("ORD_RENDER").as_deref(), Ok("cpu"))
-}
-
 impl Player {
     /// Open `path` and start the decode thread + audio output (paused).
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -251,7 +244,7 @@ impl Player {
             None
         };
 
-        let render_gl = render_gl_enabled();
+        let render_gl = crate::tuning::render_gl();
         let decode_thread = {
             let shared = Arc::clone(&shared);
             let path = PathBuf::from(path);
@@ -792,7 +785,7 @@ fn cuvid_name(id: ff::codec::Id) -> Option<&'static str> {
 /// `ORD_DECODE`: `sw` forces software; `nvdec`/`gl`/`zerocopy` force-or-warn
 /// hardware; unset = auto (NVDEC if available).
 fn open_video_decoder(params: ff::codec::Parameters) -> Option<(ff::decoder::Video, DecKind)> {
-    let want = std::env::var("ORD_DECODE").unwrap_or_default();
+    let want = crate::tuning::decode_pref();
     let force_sw = want == "sw";
     let force_hw = matches!(want.as_str(), "nvdec" | "gl" | "zerocopy" | "hw");
 
