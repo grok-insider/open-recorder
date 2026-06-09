@@ -25,6 +25,18 @@ pub use plan::{build_plan, FfmpegPlan, SourceInfo, Trim};
 pub use profile::{ExportProfile, FrameRate, Preset, RateControl, Scale};
 pub use run::{export, ExportSummary};
 
+/// The `ffmpeg` binary, overridable via `ORD_FFMPEG` (e.g. a Nix store path).
+/// The single resolver shared by the runner, the probe path, and the GUI so the
+/// override is honored everywhere.
+pub fn ffmpeg_bin() -> String {
+    std::env::var("ORD_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
+}
+
+/// The `ffprobe` binary, overridable via `ORD_FFPROBE`.
+pub fn ffprobe_bin() -> String {
+    std::env::var("ORD_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string())
+}
+
 /// Errors during export.
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {

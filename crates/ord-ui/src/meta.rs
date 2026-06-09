@@ -48,12 +48,8 @@ pub fn thumbnail_path(clip_path: &Path) -> PathBuf {
     thumb_cache_dir().join(format!("{stem}.jpg"))
 }
 
-fn ffmpeg_bin() -> String {
-    std::env::var("ORD_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
-}
-
 fn extract(clip_path: &Path, out: &Path, seek: &str) -> bool {
-    Command::new(ffmpeg_bin())
+    Command::new(ord_export::ffmpeg_bin())
         .args(["-v", "error", "-y", "-ss", seek, "-i"])
         .arg(clip_path)
         .args(["-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "4"])

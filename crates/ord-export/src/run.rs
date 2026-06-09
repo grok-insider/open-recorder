@@ -11,7 +11,7 @@ use std::process::Command;
 use crate::plan::{build_plan, Trim};
 use crate::probe::probe;
 use crate::profile::ExportProfile;
-use crate::ExportError;
+use crate::{ffmpeg_bin, ExportError};
 
 /// Result of a successful export.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,11 +23,6 @@ pub struct ExportSummary {
     pub used_hardware: bool,
     /// Duration of the exported clip in seconds.
     pub duration_secs: f64,
-}
-
-/// The `ffmpeg` binary, overridable via `ORD_FFMPEG` (e.g. a Nix store path).
-fn ffmpeg_bin() -> String {
-    std::env::var("ORD_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string())
 }
 
 /// Export `input` to `output` per `profile`, optionally trimmed.

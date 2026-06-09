@@ -51,13 +51,6 @@ pub enum ServerError {
     InUse(String),
 }
 
-/// Default control socket path: `$XDG_RUNTIME_DIR/open-recorder.sock`, falling
-/// back to `/tmp` if the runtime dir is unset.
-pub fn socket_path() -> PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(dir).join("open-recorder.sock")
-}
-
 /// Bind the listener, removing a stale socket file if present.
 pub fn bind(path: &PathBuf) -> Result<UnixListener, ServerError> {
     if path.exists() {

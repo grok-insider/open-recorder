@@ -9,12 +9,7 @@ use std::process::Command;
 use serde::Deserialize;
 
 use crate::plan::SourceInfo;
-use crate::ExportError;
-
-/// The `ffprobe` binary, overridable via `ORD_FFPROBE` (e.g. a Nix store path).
-fn ffprobe_bin() -> String {
-    std::env::var("ORD_FFPROBE").unwrap_or_else(|_| "ffprobe".to_string())
-}
+use crate::{ffprobe_bin, ExportError};
 
 #[derive(Deserialize)]
 struct ProbeOutput {
