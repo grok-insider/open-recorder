@@ -5,24 +5,32 @@
 //! tests drive it with `MockBackend` (no GPU). Clip writing is injected via a
 //! closure so tests assert the selected clip without invoking ffmpeg.
 
+use std::path::PathBuf;
+
 use ord_common::{BufferSeconds, ClipDuration, Command, Event};
 use ord_core::{CaptureBackend, ClipError, Engine, PreparedClip};
+
+/// Resolves where a new full-length recording should be written (game-named,
+/// timestamped). Injected so the handler stays free of filename I/O and tests can
+/// supply a temp path.
+pub type RecordPath = Box<dyn FnMut() -> PathBuf + Send>;
 
 /// Daemon state + capture engine.
 pub struct Handler<B: CaptureBackend> {
     engine: Engine<B>,
     buffer: BufferSeconds,
     buffer_enabled: bool,
-    recording: bool,
+    record_path: RecordPath,
 }
 
 impl<B: CaptureBackend> Handler<B> {
     /// Build a handler over `engine`. The engine should already be started if the
     /// buffer is meant to be live. Clip *writing* is owned by the server layer so
     /// the slow ffmpeg mux runs off the handler lock (see [`prepare_save`]).
+    /// `record_path` resolves the output path each time a recording is started.
     ///
     /// [`prepare_save`]: Handler::prepare_save
-    pub fn new(engine: Engine<B>) -> Self {
+    pub fn new(engine: Engine<B>, record_path: RecordPath) -> Self {
         let buffer_enabled = engine.is_running();
         let buffer = BufferSeconds::new(engine.capacity_seconds())
             .unwrap_or_else(|| BufferSeconds::new(1).expect("1 is non-zero"));
@@ -30,7 +38,7 @@ impl<B: CaptureBackend> Handler<B> {
             engine,
             buffer,
             buffer_enabled,
-            recording: false,
+            record_path,
         }
     }
 
@@ -87,9 +95,21 @@ impl<B: CaptureBackend> Handler<B> {
     }
 
     fn handle_toggle_record(&mut self) -> Event {
-        self.recording = !self.recording;
-        Event::RecordState {
-            recording: self.recording,
+        if self.engine.is_recording() {
+            match self.engine.stop_recording() {
+                Some(Err(e)) => Event::Error {
+                    message: format!("recording failed to finalize: {e}"),
+                },
+                _ => Event::RecordState { recording: false },
+            }
+        } else {
+            let path = (self.record_path)();
+            match self.engine.start_recording(path) {
+                Ok(()) => Event::RecordState { recording: true },
+                Err(e) => Event::Error {
+                    message: format!("could not start recording: {e}"),
+                },
+            }
         }
     }
 
@@ -116,7 +136,7 @@ impl<B: CaptureBackend> Handler<B> {
         self.engine.drain_available();
         Event::Status {
             buffer_enabled: self.buffer_enabled,
-            recording: self.recording,
+            recording: self.engine.is_recording(),
             buffered_seconds: self.engine.buffered_seconds(),
             buffered_frames: self.engine.buffered_frames() as u32,
             buffered_keyframes: self.engine.buffered_keyframes() as u32,
@@ -134,7 +154,10 @@ mod tests {
     fn handler_with(fps: u32, frames: u32, kf: u32, cap_secs: u32) -> Handler<MockBackend> {
         let mut engine = Engine::new(MockBackend::new(fps, frames, kf), cap_secs);
         engine.start().unwrap();
-        Handler::new(engine)
+        Handler::new(
+            engine,
+            Box::new(|| std::env::temp_dir().join("ord-test-rec.mkv")),
+        )
     }
 
     fn cd(seconds: u32) -> ClipDuration {
@@ -178,16 +201,21 @@ mod tests {
     }
 
     #[test]
-    fn toggle_record_flips_state() {
+    fn toggle_record_without_mux_errors() {
+        // The default (no-`mux`) build has no streaming muxer, so starting a
+        // recording fails with a clear error instead of silently "succeeding"
+        // (the old stub that flipped a bool and wrote nothing). Status stays not
+        // recording. With the `mux` feature this would start a real recording —
+        // exercised by the record golden test.
         let mut h = handler_with(60, 10, 1, 60);
-        assert_eq!(
+        assert!(matches!(
             h.handle(Command::ToggleRecord),
-            Event::RecordState { recording: true }
-        );
-        assert_eq!(
-            h.handle(Command::ToggleRecord),
-            Event::RecordState { recording: false }
-        );
+            Event::Error { .. }
+        ));
+        match h.handle(Command::Status) {
+            Event::Status { recording, .. } => assert!(!recording),
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub mod backend;
 pub mod clip;
 pub mod engine;
 pub mod mux;
+pub mod record;
 pub mod ring;
 #[cfg(feature = "waycap")]
 pub mod waycap_backend;
@@ -26,6 +27,7 @@ pub use backend::{BackendError, CaptureBackend, CaptureStreams, Codec, MockBacke
 pub use clip::{select_clip, ClipError, ClipSelection};
 pub use engine::{Engine, PreparedClip};
 pub use mux::{write_clip, MuxError};
+pub use record::Recorder;
 pub use ring::{EncodedFrame, RingBuffer};
 
 /// A timestamp expressed in the stream's time base — **ticks**, not a fixed

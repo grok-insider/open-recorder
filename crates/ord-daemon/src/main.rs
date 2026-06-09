@@ -77,16 +77,30 @@ fn install_signal_handler(socket: PathBuf) {
     }
 }
 
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn clip_filename() -> PathBuf {
     // <game-or-clip>-<epoch>.mkv: sortable, unique, and labelled by the
     // foreground app when detectable.
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     let game = ord_daemon::detect_foreground();
     let stem = ord_daemon::clip_stem(game.as_deref());
-    clips_dir().join(format!("{stem}-{secs}.mkv"))
+    clips_dir().join(format!("{stem}-{}.mkv", epoch_secs()))
+}
+
+/// Build the recording-path provider: `<game>-rec-<epoch>.mkv` in the clips dir,
+/// ensuring the directory exists. Called each time a recording starts.
+fn make_record_path() -> ord_daemon::RecordPath {
+    Box::new(|| {
+        let _ = std::fs::create_dir_all(clips_dir());
+        let game = ord_daemon::detect_foreground();
+        let stem = ord_daemon::clip_stem(game.as_deref());
+        clips_dir().join(format!("{stem}-rec-{}.mkv", epoch_secs()))
+    })
 }
 
 #[cfg(feature = "mux")]
@@ -167,7 +181,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let handler = Handler::new(engine);
+    let handler = Handler::new(engine, make_record_path());
 
     let listener = match bind(&path) {
         Ok(l) => l,
