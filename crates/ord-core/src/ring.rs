@@ -10,14 +10,21 @@
 
 use std::collections::VecDeque;
 
+use bytes::Bytes;
+
 use crate::{Micros, MICROS_PER_SEC};
 
 /// One encoded video frame in the buffer. Mirrors the fields we need from
 /// `waycap_rs::types::video_frame::EncodedVideoFrame`.
+///
+/// The payload is a [`Bytes`] handle, not an owned `Vec<u8>`: clip selection
+/// (`take_clip`) clones the selected window on every save, and a `Bytes` clone is
+/// an atomic refcount bump rather than a copy of the encoded packet. Building one
+/// from the `Vec<u8>` the encoder hands us is O(1) (it takes ownership).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedFrame {
     /// Encoded packet bytes.
-    pub data: Vec<u8>,
+    pub data: Bytes,
     /// Whether this frame is a keyframe (IDR). Required for clip selection.
     pub is_keyframe: bool,
     /// Presentation timestamp, microseconds.
@@ -27,10 +34,11 @@ pub struct EncodedFrame {
 }
 
 impl EncodedFrame {
-    /// Convenience constructor.
-    pub fn new(data: Vec<u8>, is_keyframe: bool, pts: Micros, dts: Micros) -> Self {
+    /// Convenience constructor. Accepts anything convertible into [`Bytes`]
+    /// (e.g. a `Vec<u8>` from the encoder, which is moved in without copying).
+    pub fn new(data: impl Into<Bytes>, is_keyframe: bool, pts: Micros, dts: Micros) -> Self {
         Self {
-            data,
+            data: data.into(),
             is_keyframe,
             pts,
             dts,

@@ -8,8 +8,7 @@ use std::path::PathBuf;
 
 use ord_common::config::Config;
 use ord_core::{Engine, PreparedClip};
-use ord_daemon::handler::ClipWriter;
-use ord_daemon::{serve, server::bind, socket_path, Handler};
+use ord_daemon::{serve, server::bind, socket_path, ClipWriter, Handler};
 
 /// Load the user config, writing a default file on first run. `ord-common` is
 /// I/O-free, so the file read/parse lives here in the binary.
@@ -132,7 +131,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let handler = Handler::new(engine, make_writer());
+    let handler = Handler::new(engine);
 
     let listener = match bind(&path) {
         Ok(l) => l,
@@ -143,7 +142,7 @@ fn main() {
     };
 
     eprintln!("ordd: listening on {}", path.display());
-    if let Err(e) = serve(listener, handler) {
+    if let Err(e) = serve(listener, handler, make_writer()) {
         eprintln!("ordd: server error: {e}");
         std::process::exit(1);
     }
