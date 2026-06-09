@@ -5,17 +5,11 @@
 //! (`bind = ALT, R, exec, ord save --last 30`).
 
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
-use ord_common::{read_frame, write_frame, ClipDuration, Command, Event};
+use ord_common::{read_frame, socket_path, write_frame, ClipDuration, Command, Event};
 
 mod export_cmd;
-
-fn socket_path() -> PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(dir).join("open-recorder.sock")
-}
 
 fn usage() -> &'static str {
     "open-recorder CLI\n\

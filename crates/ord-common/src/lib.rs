@@ -16,3 +16,14 @@ pub use config::{
 pub use frame::{read_frame, write_frame, MAX_FRAME};
 pub use ipc::{Command, Event, ProtocolError};
 pub use newtypes::{BufferSeconds, ClipDuration, MonitorId};
+
+use std::path::PathBuf;
+
+/// Path to the daemon control socket: `$XDG_RUNTIME_DIR/open-recorder.sock`,
+/// falling back to `/tmp` when the runtime dir is unset. The single source of
+/// truth shared by the daemon, the CLI, and the HUD so all three agree on the
+/// location (pure path construction — no filesystem access).
+pub fn socket_path() -> PathBuf {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(dir).join("open-recorder.sock")
+}

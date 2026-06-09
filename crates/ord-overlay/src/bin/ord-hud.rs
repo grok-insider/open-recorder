@@ -7,14 +7,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
-use ord_common::{read_frame, write_frame, Command, Event};
+use ord_common::{read_frame, socket_path, write_frame, Command, Event};
 use ord_overlay::hud::{Hud, ToastKind};
 use ord_overlay::{LayerShellOverlay, Overlay};
-
-fn socket_path() -> PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(dir).join("open-recorder.sock")
-}
 
 /// Map a daemon event onto a HUD update.
 fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {

@@ -760,8 +760,7 @@ fn spawn_filmstrip(
 
 /// Extract one MJPEG frame at `secs` via ffmpeg and decode it to an egui image.
 fn extract_thumb(clip: &std::path::Path, secs: f64, width: u32) -> Option<egui::ColorImage> {
-    let ffmpeg = std::env::var("ORD_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_string());
-    let out = Command::new(ffmpeg)
+    let out = Command::new(ord_export::ffmpeg_bin())
         .args(["-v", "error", "-ss", &format!("{:.3}", secs.max(0.0)), "-i"])
         .arg(clip)
         .args([
