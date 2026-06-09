@@ -5,6 +5,7 @@
 //! owns an `Engine` and calls [`Engine::drain_available`] as frames arrive and
 //! [`Engine::take_clip`] on a save request.
 
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use ord_common::ClipDuration;
@@ -12,6 +13,8 @@ use ord_common::ClipDuration;
 use crate::audio::{AudioParams, AudioRingBuffer, EncodedAudioFrame};
 use crate::backend::{BackendError, CaptureBackend, StreamParams};
 use crate::clip::{select_clip, ClipError};
+use crate::mux::MuxError;
+use crate::record::Recorder;
 use crate::ring::{EncodedFrame, RingBuffer};
 
 /// A clip ready to be muxed: ordered encoded video frames (first is a keyframe),
@@ -47,6 +50,9 @@ pub struct Engine<B: CaptureBackend> {
     audio_ring: AudioRingBuffer,
     rx: Option<Receiver<EncodedFrame>>,
     audio_rx: Option<Receiver<EncodedAudioFrame>>,
+    /// Active full-length recording, if any. Frames are tee'd here from
+    /// `drain_available` in addition to the replay ring.
+    recorder: Option<Recorder>,
 }
 
 impl<B: CaptureBackend> Engine<B> {
@@ -62,7 +68,29 @@ impl<B: CaptureBackend> Engine<B> {
             backend,
             rx: None,
             audio_rx: None,
+            recorder: None,
         }
+    }
+
+    /// Begin a full-length recording to `path`, tee'd from the live capture in
+    /// addition to the replay ring. The file starts at the next keyframe.
+    pub fn start_recording(&mut self, path: PathBuf) -> Result<(), MuxError> {
+        if self.recorder.is_some() {
+            return Ok(());
+        }
+        let rec = Recorder::start(&path, self.backend.params(), self.backend.audio_params())?;
+        self.recorder = Some(rec);
+        Ok(())
+    }
+
+    /// Finalize the active recording and return its path. `None` if not recording.
+    pub fn stop_recording(&mut self) -> Option<Result<PathBuf, MuxError>> {
+        self.recorder.take().map(|r| r.finish())
+    }
+
+    /// Whether a full-length recording is currently active.
+    pub fn is_recording(&self) -> bool {
+        self.recorder.is_some()
     }
 
     /// Start capture; frames begin flowing into the ring buffers on
@@ -86,17 +114,32 @@ impl<B: CaptureBackend> Engine<B> {
     /// ring buffers. Returns how many video frames were ingested. Non-blocking.
     pub fn drain_available(&mut self) -> usize {
         if let Some(arx) = self.audio_rx.as_ref() {
-            while let Ok(frame) = arx.try_recv() {
+            // Collect first so the recorder (which needs `&mut self`) can be fed
+            // without holding the receiver borrow.
+            let frames: Vec<EncodedAudioFrame> = arx.try_iter().collect();
+            for frame in frames {
+                if let Some(rec) = self.recorder.as_mut() {
+                    if let Err(e) = rec.push_audio(&frame) {
+                        tracing::error!(error = %e, "recording audio write failed; stopping recording");
+                        self.recorder = None;
+                    }
+                }
                 self.audio_ring.push(frame);
             }
         }
-        let Some(rx) = self.rx.as_ref() else {
-            return 0;
+        let frames: Vec<EncodedFrame> = match self.rx.as_ref() {
+            Some(rx) => rx.try_iter().collect(),
+            None => return 0,
         };
-        let mut n = 0;
-        while let Ok(frame) = rx.try_recv() {
+        let n = frames.len();
+        for frame in frames {
+            if let Some(rec) = self.recorder.as_mut() {
+                if let Err(e) = rec.push_video(&frame) {
+                    tracing::error!(error = %e, "recording video write failed; stopping recording");
+                    self.recorder = None;
+                }
+            }
             self.ring.push(frame);
-            n += 1;
         }
         n
     }

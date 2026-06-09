@@ -23,7 +23,7 @@ use crate::backend::Codec;
 use crate::engine::PreparedClip;
 
 #[cfg(feature = "mux")]
-mod annexb;
+pub(crate) mod annexb;
 
 /// Errors writing a clip.
 #[derive(Debug, thiserror::Error)]
@@ -43,7 +43,7 @@ impl From<ffmpeg_next::Error> for MuxError {
 
 /// ffmpeg codec id for our [`Codec`].
 #[cfg(feature = "mux")]
-fn codec_id(codec: Codec) -> ffmpeg_next::codec::Id {
+pub(crate) fn codec_id(codec: Codec) -> ffmpeg_next::codec::Id {
     use ffmpeg_next::codec::Id;
     match codec {
         Codec::H264 => Id::H264,
@@ -58,7 +58,7 @@ fn codec_id(codec: Codec) -> ffmpeg_next::codec::Id {
 /// mapping family of 0 (mono/stereo), a conventional 3840-sample (80ms) pre-skip,
 /// and zero output gain.
 #[cfg(feature = "mux")]
-fn build_opus_head(sample_rate: u32, channels: u16) -> Vec<u8> {
+pub(crate) fn build_opus_head(sample_rate: u32, channels: u16) -> Vec<u8> {
     let mut h = Vec::with_capacity(19);
     h.extend_from_slice(b"OpusHead");
     h.push(1); // version

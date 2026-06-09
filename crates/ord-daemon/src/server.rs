@@ -230,7 +230,10 @@ mod tests {
     fn mock_handler() -> Handler<MockBackend> {
         let mut engine = Engine::new(MockBackend::new(60, 600, 60), 60);
         engine.start().unwrap();
-        Handler::new(engine)
+        Handler::new(
+            engine,
+            Box::new(|| std::env::temp_dir().join("ord-test-rec.mkv")),
+        )
     }
 
     /// A writer that "succeeds" instantly without touching disk.

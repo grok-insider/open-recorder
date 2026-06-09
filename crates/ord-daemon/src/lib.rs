@@ -7,6 +7,6 @@ pub mod handler;
 pub mod server;
 
 pub use gamedetect::{clip_stem, detect_foreground};
-pub use handler::Handler;
+pub use handler::{Handler, RecordPath};
 pub use ord_common::socket_path;
 pub use server::{serve, ClipWriter, ServerError};
