@@ -185,21 +185,41 @@ impl CaptureBackend for WaycapBackend {
             .start()
             .map_err(|e| BackendError::Init(format!("{e:?}")))?;
 
-        let (tx, rx) = mpsc::channel();
+        // BOUND the forwarding channels so a stalled consumer (the daemon's
+        // periodic `pump`) can never grow them without bound. The daemon drains
+        // every ~250 ms, so occupancy stays near zero; these caps (~4 s of video,
+        // and plenty of audio packets) are a memory backstop, not a normal limit.
+        const VIDEO_CHANNEL_CAP: usize = 240;
+        const AUDIO_CHANNEL_CAP: usize = 2000;
+
+        let (tx, rx) = mpsc::sync_channel(VIDEO_CHANNEL_CAP);
         let stop = Arc::clone(&self.stop);
         stop.store(false, Ordering::Release);
 
-        // Forward waycap-rs (crossbeam) frames onto our mpsc channel, converting
-        // each into our EncodedFrame. Exits when stop is set or either channel
-        // closes.
+        // Forward waycap-rs (crossbeam) frames onto our bounded mpsc channel,
+        // converting each into our EncodedFrame. Exits when stop is set or the
+        // channel closes. If the channel is full (consumer stalled), drop the
+        // frame rather than grow memory — a saved clip may glitch there, but the
+        // periodic pump means this should never happen.
         let video_stop = Arc::clone(&stop);
         let forwarder = std::thread::spawn(move || {
+            let mut dropped = 0u64;
             while !video_stop.load(Ordering::Acquire) {
                 match video_recv.recv_timeout(Duration::from_millis(100)) {
                     Ok(f) => {
                         let frame = EncodedFrame::new(f.data, f.is_keyframe, f.pts, f.dts);
-                        if tx.send(frame).is_err() {
-                            break;
+                        match tx.try_send(frame) {
+                            Ok(()) => {}
+                            Err(mpsc::TrySendError::Full(_)) => {
+                                dropped += 1;
+                                if dropped % 300 == 1 {
+                                    eprintln!(
+                                        "ordd: video forward channel full ({VIDEO_CHANNEL_CAP}); \
+                                         dropping frames (consumer stalled, {dropped} total)"
+                                    );
+                                }
+                            }
+                            Err(mpsc::TrySendError::Disconnected(_)) => break,
                         }
                     }
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,
@@ -214,15 +234,17 @@ impl CaptureBackend for WaycapBackend {
         // clock as the video pts. Our engine correlates A/V in microseconds, so
         // divide by 1000 here to land in that domain.
         let audio_out = if let Some(audio_recv) = audio_recv {
-            let (atx, arx) = mpsc::channel();
+            let (atx, arx) = mpsc::sync_channel(AUDIO_CHANNEL_CAP);
             let audio_stop = Arc::clone(&stop);
             let handle = std::thread::spawn(move || {
                 while !audio_stop.load(Ordering::Acquire) {
                     match audio_recv.recv_timeout(Duration::from_millis(100)) {
                         Ok(f) => {
                             let frame = EncodedAudioFrame::new(f.data, f.pts, f.timestamp / 1000);
-                            if atx.send(frame).is_err() {
-                                break;
+                            match atx.try_send(frame) {
+                                Ok(()) => {}
+                                Err(mpsc::TrySendError::Full(_)) => {} // backstop only
+                                Err(mpsc::TrySendError::Disconnected(_)) => break,
                             }
                         }
                         Err(crossbeam::channel::RecvTimeoutError::Timeout) => continue,

@@ -182,9 +182,38 @@
               lib.mkEnableOption "the ordd capture daemon user service" // { default = true; };
             hud.enable =
               lib.mkEnableOption "the ord-hud overlay user service" // { default = true; };
+            settings = lib.mkOption {
+              type = lib.types.nullOr (pkgs.formats.toml { }).type;
+              default = null;
+              example = {
+                capture = {
+                  fps = 60;
+                  buffer_seconds = 30;
+                  quality = "high";
+                };
+                audio = {
+                  desktop = true;
+                  mic = true;
+                };
+              };
+              description = ''
+                Declarative `~/.config/open-recorder/config.toml`. When null (the
+                default), ordd writes its own default config on first run and the
+                user edits it by hand. When set, the config is managed by Home
+                Manager (read-only). Sections: `capture` (fps, buffer_seconds,
+                quality), `audio` (desktop, mic), `export` (codec, container).
+              '';
+            };
           };
           config = lib.mkIf cfg.enable {
             home.packages = [ cfg.package ];
+
+            # Render the recorder config when declaratively configured. ordd only
+            # writes a default when the file is MISSING, so an HM-managed file is
+            # read, never clobbered.
+            xdg.configFile."open-recorder/config.toml" = lib.mkIf (cfg.settings != null) {
+              source = (pkgs.formats.toml { }).generate "open-recorder-config.toml" cfg.settings;
+            };
 
             systemd.user.services.ordd = lib.mkIf cfg.daemon.enable {
               Unit = {
