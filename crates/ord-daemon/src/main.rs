@@ -55,7 +55,12 @@ fn install_signal_handler(socket: PathBuf) {
             std::thread::spawn(move || {
                 if signals.forever().next().is_some() {
                     let _ = std::fs::remove_file(&socket);
-                    std::process::exit(0);
+                    // `_exit`, NOT `std::process::exit`: the latter runs C atexit
+                    // handlers, which deadlock against waycap's EGL/PipeWire/CUDA
+                    // background threads during teardown (observed as a 90 s hang
+                    // then SIGKILL). This terminates immediately — like the default
+                    // SIGTERM disposition — but only after the socket is removed.
+                    signal_hook::low_level::exit(0);
                 }
             });
         }
