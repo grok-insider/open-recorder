@@ -88,7 +88,8 @@ removing every layer of indirection.
   megabytes.
 - **Save = stream-copy from newest keyframe** — instant, lossless, no re-encode.
 - **Hot path: no panics, no per-frame copies, no allocation churn.**
-- **HEVC default** (best NVENC quality/size on the 5070 Ti); AV1 optional.
+- **H.264 default today** (the shipped NVENC capture path); HEVC (best NVENC
+  quality/size on the 5070 Ti) and AV1 planned via a waycap-rs fork.
 - Bench the ring-buffer push and save-path latency (`criterion`) to catch
   regressions.
 

@@ -128,9 +128,12 @@ alternative.
 
 ### Encoding defaults
 
-HEVC by default (best NVENC quality/size on the 5070 Ti, ideal for local
-editing); AV1 optional (5070 Ti + ffmpeg-full 8.1). `.mkv` container
-(crash-safe, editor-friendly). Audio: desktop output + optional mic.
+**H.264 by default today** — the shipped capture path (`waycap_backend.rs`)
+records H.264 NVENC, which the ring buffer + stream-copy muxer handle. HEVC
+(best NVENC quality/size on the 5070 Ti, ideal for local editing) and AV1 (5070
+Ti + ffmpeg-full 8.1) are **planned** via a waycap-rs fork — the `Codec` enum
+already carries `Hevc`/`Av1` variants for when capture emits them. `.mkv`
+container (crash-safe, editor-friendly). Audio: desktop output + optional mic.
 
 ---
 
@@ -210,7 +213,7 @@ promise. We ship Linux-first.
 |----------|--------|-----|
 | Language | Rust | Performance, safety, single-binary daemon/CLI, matches house stack. |
 | Engine | native `waycap-rs` (Tier B) | Highest performance ceiling; full ownership; zero-copy DMA-BUF→NVENC. |
-| Codec | HEVC default, AV1 optional | Best NVENC quality/size on RTX 5070 Ti; AV1 supported by the GPU. |
+| Codec | H.264 today; HEVC/AV1 planned | Shipped path is H.264 NVENC; HEVC/AV1 (best quality/size on the 5070 Ti) come via a waycap-rs fork — the `Codec` enum is ready. |
 | GUI | `egui` | Mature cross-platform overlay + click-through; one toolkit for HUD + library. |
 | Library overlay | Hyprland special workspace | Reuses existing pattern (Discord/Spotify); no custom code. |
 | HUD overlay | `wlr-layer-shell` (Wayland), X11/Win32 later | Native floating-over-fullscreen; same protocol as waybar/swaync. |

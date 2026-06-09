@@ -9,15 +9,13 @@ members = [
     "crates/ord-overlay",
     "crates/ord-ui",
 ]
-# The Phase-1 spike is a throwaway with heavy GPU/CUDA deps; keep it out of the
-# workspace so the testable core builds with plain cargo (and in CI without a GPU).
-exclude = [
-    "spike",
-]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Minimum supported Rust version. 1.87 stabilized `u32::is_multiple_of`, used on
+# the hot path. CI uses stable (>= this); the nix devshell's rustc is canonical.
+rust-version = "1.87"
 license = "MIT"
 authors = ["0xfell"]
 repository = "https://github.com/0xfell/open-recorder"
