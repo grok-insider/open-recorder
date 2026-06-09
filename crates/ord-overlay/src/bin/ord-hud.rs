@@ -4,7 +4,7 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use ord_common::{read_frame, write_frame, Command, Event};
@@ -101,12 +101,22 @@ fn main() {
             continue;
         };
 
-        // Inner loop: render + drain events until the daemon disconnects.
+        // Inner loop: render + drain events until the daemon disconnects. We only
+        // repaint when something actually changed (an event arrived or a toast
+        // expired) or while a toast is mid-animation. Crucially, a buffer-on but
+        // no-toast session — i.e. *all of normal gameplay* — is NOT "animating":
+        // the static buffer indicator needs no per-frame redraw, so we block on
+        // the event channel and spend ~zero CPU instead of a 60fps invisible
+        // clear+rasterize+commit+roundtrip over the fullscreen game.
+        let mut dirty = true; // force an initial paint
         loop {
             let mut disconnected = false;
             loop {
                 match rx.try_recv() {
-                    Ok(ev) => apply(&mut hud, &ev, now_ms()),
+                    Ok(ev) => {
+                        apply(&mut hud, &ev, now_ms());
+                        dirty = true;
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         disconnected = true;
@@ -117,12 +127,29 @@ fn main() {
             if disconnected {
                 break; // reconnect, keeping the overlay up
             }
-            hud.tick(now_ms());
-            overlay.render(&hud, now_ms());
-            // ~60fps while toasts are on screen (smooth fade/slide); idle-slow
-            // otherwise to keep CPU near zero when there's nothing to show.
-            let frame_ms = if hud.has_content() { 16 } else { 100 };
-            std::thread::sleep(Duration::from_millis(frame_ms));
+            if hud.tick(now_ms()) {
+                dirty = true; // a toast just expired -> repaint the new state once
+            }
+            let animating = hud.is_animating();
+            if dirty || animating {
+                overlay.render(&hud, now_ms());
+                dirty = false;
+            }
+            if animating {
+                // Smooth fade/slide while a toast is visible.
+                std::thread::sleep(Duration::from_millis(16));
+            } else {
+                // Idle: block until the next event (instant toast) or a periodic
+                // wake. No CPU spent while nothing is on screen.
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(ev) => {
+                        apply(&mut hud, &ev, now_ms());
+                        dirty = true;
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
         }
 
         // Brief backoff before reconnecting to the (restarting) daemon.

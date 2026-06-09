@@ -1,13 +1,15 @@
 //! Real wlr-layer-shell HUD surface (pure-Rust via smithay-client-toolkit).
 //!
 //! Creates an OVERLAY-layer, anchored, **click-through** surface that floats over
-//! everything (including fullscreen games) and paints the [`Hud`] as simple
-//! colored toast bars into an shm buffer. No GPU needed.
+//! everything (including fullscreen games) and paints the [`Hud`]'s toasts as
+//! dark rounded cards — soft drop shadow, per-kind anti-aliased icon, and real
+//! text (fontdue) — into an ARGB shm buffer. No GPU needed.
 //!
-//! Behind the `layershell` feature (needs a Wayland session). The text rendering
-//! is intentionally minimal — solid bars colored by [`ToastKind`] plus a buffer
-//! indicator dot — keeping the dependency surface small and robust. Glyph
-//! rendering can be layered on later without changing the [`Overlay`] contract.
+//! Behind the `layershell` feature (needs a Wayland session). All pixel work is
+//! CPU SDF rasterization; glyph bitmaps are cached per character (the font size
+//! is constant) so an on-screen toast costs a blit, not a re-rasterize, each
+//! frame. The caller (`ord-hud`) only repaints while a toast is animating, so the
+//! static buffer-on state spends no time here at all.
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
@@ -27,10 +29,22 @@ use smithay_client_toolkit::{
     registry_handlers,
 };
 
-use fontdue::Font;
+use std::collections::HashMap;
+
+use fontdue::{Font, Metrics};
 
 use crate::hud::{Hud, ToastKind};
 use crate::{Overlay, OverlayError};
+
+/// A rasterized glyph (constant font size), cached so a visible toast blits the
+/// same bitmap each frame instead of re-rasterizing every character every paint.
+struct Glyph {
+    metrics: Metrics,
+    bitmap: Vec<u8>,
+}
+
+/// Glyph bitmap cache keyed by character (the font size is fixed at [`FONT_PX`]).
+type GlyphCache = HashMap<char, Glyph>;
 
 /// Embedded UI font for the toast text (OFL, see `assets/fonts/LICENSES.md`).
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf");
@@ -127,6 +141,7 @@ struct State {
     layer: LayerSurface,
     conn: Connection,
     font: Font,
+    glyph_cache: GlyphCache,
     width: u32,
     height: u32,
     visible: bool,
@@ -183,6 +198,7 @@ impl State {
             layer,
             conn: conn.clone(),
             font,
+            glyph_cache: GlyphCache::new(),
             width,
             height,
             visible: true,
@@ -208,6 +224,22 @@ impl State {
         if !self.configured {
             return;
         }
+
+        // Rasterize any not-yet-cached glyphs first, while `font` and
+        // `glyph_cache` can be borrowed together (before the canvas borrows the
+        // pool). The font size is constant, so each glyph is rasterized at most
+        // once per process; thereafter a visible toast only blits.
+        if self.visible {
+            for toast in hud.toasts().iter().take(MAX_ROWS as usize) {
+                for ch in toast.text.chars() {
+                    if !self.glyph_cache.contains_key(&ch) {
+                        let (metrics, bitmap) = self.font.rasterize(ch, FONT_PX);
+                        self.glyph_cache.insert(ch, Glyph { metrics, bitmap });
+                    }
+                }
+            }
+        }
+
         let (w, h) = (self.width, self.height);
         let stride = (w * 4) as i32;
         let (buffer, canvas) =
@@ -220,11 +252,10 @@ impl State {
             };
 
         // Clear to fully transparent (premultiplied BGRA).
-        for px in canvas.chunks_exact_mut(4) {
-            px.copy_from_slice(&[0, 0, 0, 0]);
-        }
+        canvas.fill(0);
 
         if self.visible {
+            let cache = &self.glyph_cache;
             let right = w as f32 - SHADOW as f32;
             let mut y = SHADOW as f32;
             for toast in hud.toasts().iter().take(MAX_ROWS as usize) {
@@ -236,21 +267,12 @@ impl State {
                 let alpha = fade_in.min(fade_out);
                 if alpha > 0.001 {
                     let slide = (1.0 - fade_in) * SLIDE_PX + (1.0 - fade_out) * SLIDE_PX;
-                    let text_w = measure_text(&self.font, &toast.text, FONT_PX);
+                    let text_w = measure_text(cache, &toast.text);
                     let card_w = (PAD_X + ICON_BOX + ICON_GAP + text_w + PAD_X)
                         .clamp(CARD_MIN_W as f32, CARD_MAX_W as f32);
                     let x0 = right - card_w + slide;
                     draw_card(
-                        canvas,
-                        w,
-                        h,
-                        &self.font,
-                        x0,
-                        y,
-                        card_w,
-                        toast.kind,
-                        &toast.text,
-                        alpha,
+                        canvas, w, h, cache, x0, y, card_w, toast.kind, &toast.text, alpha,
                     );
                 }
                 y += (CARD_H + CARD_GAP) as f32;
@@ -329,10 +351,11 @@ fn sd_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-/// Sum of glyph advance widths (px) — for auto-sizing the card.
-fn measure_text(font: &Font, text: &str, px: f32) -> f32 {
+/// Sum of cached glyph advance widths (px) — for auto-sizing the card. Any glyph
+/// in `text` is expected to be in `cache` already (the renderer pre-populates it).
+fn measure_text(cache: &GlyphCache, text: &str) -> f32 {
     text.chars()
-        .map(|c| font.metrics(c, px).advance_width)
+        .map(|c| cache.get(&c).map_or(0.0, |g| g.metrics.advance_width))
         .sum()
 }
 
@@ -342,7 +365,7 @@ fn draw_card(
     canvas: &mut [u8],
     width: u32,
     height: u32,
-    font: &Font,
+    cache: &GlyphCache,
     x0: f32,
     y0: f32,
     w: f32,
@@ -400,7 +423,7 @@ fn draw_card(
     let tx = x0 + PAD_X + ICON_BOX + ICON_GAP;
     let baseline = y0 + h / 2.0 + FONT_PX * 0.34;
     draw_text(
-        canvas, width, height, font, text, tx, baseline, TEXT_RGB, alpha,
+        canvas, width, height, cache, text, tx, baseline, TEXT_RGB, alpha,
     );
 }
 
@@ -478,13 +501,14 @@ fn draw_icon(
     }
 }
 
-/// Rasterize `text` with fontdue and blit it (alpha = glyph coverage).
+/// Blit `text` from the cached glyph bitmaps (alpha = glyph coverage). Glyphs are
+/// rasterized once into `cache` by the renderer; here we only copy pixels.
 #[allow(clippy::too_many_arguments)]
 fn draw_text(
     canvas: &mut [u8],
     width: u32,
     height: u32,
-    font: &Font,
+    cache: &GlyphCache,
     text: &str,
     x: f32,
     baseline: f32,
@@ -493,7 +517,10 @@ fn draw_text(
 ) {
     let mut pen = x;
     for ch in text.chars() {
-        let (m, bitmap) = font.rasterize(ch, FONT_PX);
+        let Some(glyph) = cache.get(&ch) else {
+            continue;
+        };
+        let m = &glyph.metrics;
         if m.width > 0 && m.height > 0 {
             let gx = (pen + m.xmin as f32).round() as i32;
             let gy = (baseline - m.height as f32 - m.ymin as f32).round() as i32;
@@ -507,7 +534,7 @@ fn draw_text(
                     if px < 0 || px as u32 >= width {
                         continue;
                     }
-                    let cov = bitmap[row * m.width + col] as f32 / 255.0;
+                    let cov = glyph.bitmap[row * m.width + col] as f32 / 255.0;
                     if cov > 0.0 {
                         let idx = ((py as u32 * width + px as u32) * 4) as usize;
                         blend(canvas, idx, color.0, color.1, color.2, cov * alpha);
