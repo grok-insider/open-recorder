@@ -31,3 +31,15 @@ toml = "0.8"
 ord-common = { path = "crates/ord-common" }
 ord-core = { path = "crates/ord-core" }
 ord-export = { path = "crates/ord-export" }
+
+# Release profile for the shipped binaries. This is a latency-sensitive recorder,
+# so tune for runtime over build time (the cachix cache absorbs the longer build):
+#   - thin LTO + a single codegen unit: better cross-crate inlining on the hot
+#     capture/ring/mux path with far less build cost than "fat" LTO.
+#   - strip symbols: smaller binaries in the nix closure.
+# NOTE: panic stays "unwind" on purpose — the daemon recovers from poisoned locks
+# (a panic in one thread must not abort the whole process and re-open the OOM).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
