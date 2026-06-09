@@ -75,7 +75,7 @@ impl EditorState {
             drag: None,
             strip_rx,
             strip: vec![None; FILMSTRIP_TILES],
-            debug: std::env::var("ORD_DEBUG").is_ok(),
+            debug: crate::tuning::debug_overlay(),
             dbg_log_at: Instant::now(),
         })
     }

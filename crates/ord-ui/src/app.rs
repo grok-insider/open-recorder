@@ -326,7 +326,7 @@ impl eframe::App for LibraryApp {
         // for screenshotting/validating the preview render path.
         if !self.auto_open_tried {
             self.auto_open_tried = true;
-            if let Ok(path) = std::env::var("ORD_OPEN") {
+            if let Some(path) = crate::tuning::auto_open() {
                 let path = PathBuf::from(path);
                 if path.is_file() {
                     let label = path

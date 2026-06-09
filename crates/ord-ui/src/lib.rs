@@ -23,3 +23,5 @@ pub mod glvideo;
 pub mod meta;
 #[cfg(feature = "gui")]
 pub mod player;
+#[cfg(feature = "gui")]
+pub mod tuning;
