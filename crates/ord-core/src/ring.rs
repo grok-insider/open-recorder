@@ -122,11 +122,13 @@ impl RingBuffer {
     /// Remove frames whose pts is strictly less than `cutoff`.
     fn evict_before(&mut self, cutoff: Micros) {
         while let Some(front) = self.frames.front() {
-            if front.pts < cutoff {
-                let removed = self.frames.pop_front().expect("front exists");
-                self.bytes -= removed.len();
-            } else {
+            if front.pts >= cutoff {
                 break;
+            }
+            // `front()` just confirmed an element; the hot path must not panic, so
+            // fold the pop into the same branch rather than `.expect`.
+            if let Some(removed) = self.frames.pop_front() {
+                self.bytes -= removed.len();
             }
         }
     }
@@ -184,6 +186,10 @@ impl RingBuffer {
     pub fn clear(&mut self) {
         self.frames.clear();
         self.bytes = 0;
+        // Reset the eviction anchor too (audio's clear() already does). Otherwise
+        // a stale `max_pts` survives the clear and a lower-pts epoch after a buffer
+        // toggle (capture restart) is evicted on arrival — wiping the new buffer.
+        self.max_pts = i64::MIN;
     }
 }
 
@@ -267,6 +273,22 @@ mod tests {
         rb.clear();
         assert!(rb.is_empty());
         assert_eq!(rb.bytes(), 0);
+    }
+
+    #[test]
+    fn clear_resets_eviction_anchor() {
+        // Regression: clear() must reset max_pts. Buffer a high-pts epoch, clear,
+        // then push a fresh low-pts epoch (as a capture restart after a buffer
+        // toggle delivers). Without the reset, the stale max_pts evicts the new
+        // frames on arrival and the buffer stays empty.
+        let mut rb = RingBuffer::new(60);
+        rb.push(f(100.0, true)); // max_pts -> 100s
+        rb.clear();
+        rb.push(f(0.0, true));
+        rb.push(f(1.0, false));
+        assert_eq!(rb.len(), 2);
+        assert_eq!(rb.oldest_pts(), Some(0));
+        assert_eq!(rb.newest_pts(), Some(MICROS_PER_SEC));
     }
 
     #[test]

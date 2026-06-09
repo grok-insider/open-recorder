@@ -112,11 +112,11 @@ impl AudioRingBuffer {
         }
         let cutoff = self.max_ts - self.capacity_micros;
         while let Some(front) = self.frames.front() {
-            if front.timestamp_micros < cutoff {
-                let removed = self.frames.pop_front().expect("front exists");
-                self.bytes -= removed.len();
-            } else {
+            if front.timestamp_micros >= cutoff {
                 break;
+            }
+            if let Some(removed) = self.frames.pop_front() {
+                self.bytes -= removed.len();
             }
         }
     }

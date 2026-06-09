@@ -42,6 +42,27 @@ fn clips_dir() -> PathBuf {
     PathBuf::from(home).join("Videos/open-recorder")
 }
 
+/// Install a SIGTERM/SIGINT handler that removes the control socket and exits
+/// cleanly. systemd sends SIGTERM when the user service stops; without this the
+/// process is killed mid-accept and leaves the socket file behind (the next start
+/// recovers via `bind`, but a deterministic shutdown is cleaner). The handler runs
+/// on its own thread — not in async-signal context — so the cleanup is safe.
+fn install_signal_handler(socket: PathBuf) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+    match Signals::new([SIGINT, SIGTERM]) {
+        Ok(mut signals) => {
+            std::thread::spawn(move || {
+                if signals.forever().next().is_some() {
+                    let _ = std::fs::remove_file(&socket);
+                    std::process::exit(0);
+                }
+            });
+        }
+        Err(e) => eprintln!("ordd: could not install signal handler: {e}"),
+    }
+}
+
 fn clip_filename() -> PathBuf {
     // <game-or-clip>-<epoch>.mkv: sortable, unique, and labelled by the
     // foreground app when detectable.
@@ -140,6 +161,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    install_signal_handler(path.clone());
 
     eprintln!("ordd: listening on {}", path.display());
     if let Err(e) = serve(listener, handler, make_writer()) {

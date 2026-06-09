@@ -15,6 +15,7 @@ path = "src/main.rs"
 ord-common.workspace = true
 ord-core.workspace = true
 thiserror.workspace = true
+signal-hook = "0.3"
 
 [features]
 # The shipped daemon records for real; CI builds the default (mock) daemon to
