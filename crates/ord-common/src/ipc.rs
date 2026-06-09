@@ -69,6 +69,16 @@ impl Command {
 }
 
 impl Event {
+    /// Whether this event is a state change worth pushing to subscribers (the
+    /// HUD). Lives on the type so the daemon's broadcast filter can't drift out
+    /// of sync with the protocol as variants are added.
+    pub fn is_state_change(&self) -> bool {
+        matches!(
+            self,
+            Event::ClipSaved { .. } | Event::BufferState { .. } | Event::RecordState { .. }
+        )
+    }
+
     /// Encode to a bincode byte buffer.
     pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
         bincode::serialize(self).map_err(|e| ProtocolError::Encode(e.to_string()))
