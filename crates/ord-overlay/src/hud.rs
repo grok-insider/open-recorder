@@ -11,11 +11,13 @@ pub enum ToastKind {
     Error,
 }
 
-/// A transient on-screen message with an expiry time (monotonic ms).
+/// A transient on-screen message with creation + expiry times (monotonic ms).
+/// `created_at_ms` lets the renderer drive a fade/slide-in on appear.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toast {
     pub kind: ToastKind,
     pub text: String,
+    pub created_at_ms: u64,
     pub expires_at_ms: u64,
 }
 
@@ -51,6 +53,7 @@ impl Hud {
         self.toasts.push(Toast {
             kind,
             text: text.into(),
+            created_at_ms: now_ms,
             expires_at_ms: now_ms.saturating_add(ttl_ms),
         });
     }

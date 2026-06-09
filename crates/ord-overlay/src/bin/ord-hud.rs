@@ -96,7 +96,7 @@ fn main() {
         let Some(rx) = subscribe(&path) else {
             // Daemon not up yet; keep the overlay alive and retry shortly.
             hud.tick(now_ms());
-            overlay.render(&hud);
+            overlay.render(&hud, now_ms());
             std::thread::sleep(Duration::from_secs(1));
             continue;
         };
@@ -118,8 +118,11 @@ fn main() {
                 break; // reconnect, keeping the overlay up
             }
             hud.tick(now_ms());
-            overlay.render(&hud);
-            std::thread::sleep(Duration::from_millis(100));
+            overlay.render(&hud, now_ms());
+            // ~60fps while toasts are on screen (smooth fade/slide); idle-slow
+            // otherwise to keep CPU near zero when there's nothing to show.
+            let frame_ms = if hud.has_content() { 16 } else { 100 };
+            std::thread::sleep(Duration::from_millis(frame_ms));
         }
 
         // Brief backoff before reconnecting to the (restarting) daemon.

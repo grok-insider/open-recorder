@@ -32,8 +32,10 @@ pub trait Overlay {
     fn create(&mut self) -> Result<(), OverlayError>;
     /// Show or hide without destroying the surface.
     fn set_visible(&mut self, visible: bool);
-    /// Render the current HUD state (called each tick by the owner).
-    fn render(&mut self, hud: &Hud);
+    /// Render the current HUD state (called each tick by the owner). `now_ms` is
+    /// the same monotonic clock the toasts were created with, so the renderer can
+    /// drive fade/slide animations.
+    fn render(&mut self, hud: &Hud, now_ms: u64);
     /// Tear down the surface.
     fn destroy(&mut self);
 }
@@ -55,7 +57,7 @@ impl Overlay for NoopOverlay {
     fn set_visible(&mut self, visible: bool) {
         self.visible = visible;
     }
-    fn render(&mut self, _hud: &Hud) {
+    fn render(&mut self, _hud: &Hud, _now_ms: u64) {
         self.renders += 1;
     }
     fn destroy(&mut self) {
@@ -76,8 +78,8 @@ mod tests {
         o.set_visible(true);
         assert!(o.visible);
         let hud = Hud::default();
-        o.render(&hud);
-        o.render(&hud);
+        o.render(&hud, 0);
+        o.render(&hud, 16);
         assert_eq!(o.renders, 2);
         o.destroy();
         assert!(!o.created);

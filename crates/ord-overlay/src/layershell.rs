@@ -27,13 +27,41 @@ use smithay_client_toolkit::{
     registry_handlers,
 };
 
+use fontdue::Font;
+
 use crate::hud::{Hud, ToastKind};
 use crate::{Overlay, OverlayError};
 
-const WIDTH: u32 = 360;
-const BAR_H: u32 = 36;
-const PAD: u32 = 6;
-const MAX_ROWS: u32 = 6;
+/// Embedded UI font for the toast text (OFL, see `assets/fonts/LICENSES.md`).
+const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf");
+
+// Layout. The surface is a transparent canvas anchored top-right; cards are
+// right-aligned within it, with `SHADOW` px of transparent margin for the soft
+// drop shadow.
+const SHADOW: u32 = 16;
+const CARD_H: u32 = 46;
+const CARD_GAP: u32 = 10;
+const MAX_ROWS: u32 = 5;
+const CARD_MAX_W: u32 = 420;
+const CARD_MIN_W: u32 = 168;
+const SURFACE_W: u32 = CARD_MAX_W + SHADOW * 2;
+const SURFACE_H: u32 = SHADOW * 2 + (CARD_H + CARD_GAP) * MAX_ROWS;
+
+const CARD_RADIUS: f32 = 12.0;
+const FONT_PX: f32 = 15.0;
+const PAD_X: f32 = 15.0;
+const ICON_BOX: f32 = 20.0;
+const ICON_GAP: f32 = 11.0;
+
+// Animation.
+const FADE_IN_MS: f32 = 150.0;
+const FADE_OUT_MS: f32 = 240.0;
+const SLIDE_PX: f32 = 18.0;
+
+// Palette (straight, non-premultiplied; compositing premultiplies).
+const CARD_BG: (f32, f32, f32) = (28.0, 29.0, 36.0); // #1C1D24
+const TEXT_RGB: (f32, f32, f32) = (236.0, 237.0, 241.0); // #ECEDF1
+const CARD_ALPHA: f32 = 0.94;
 
 /// A live wlr-layer-shell HUD surface.
 pub struct LayerShellOverlay {
@@ -74,11 +102,11 @@ impl Overlay for LayerShellOverlay {
         }
     }
 
-    fn render(&mut self, hud: &Hud) {
+    fn render(&mut self, hud: &Hud, now_ms: u64) {
         if let Some(inner) = self.inner.as_mut() {
             // Process queued events (configure/close) before drawing.
             let _ = inner.event_queue.dispatch_pending(&mut inner.state);
-            inner.state.draw(hud);
+            inner.state.draw(hud, now_ms);
             // Round-trip so the compositor's buffer-release events come back and
             // the SlotPool recycles buffers instead of growing every frame.
             let _ = inner.event_queue.roundtrip(&mut inner.state);
@@ -98,6 +126,7 @@ struct State {
     pool: SlotPool,
     layer: LayerSurface,
     conn: Connection,
+    font: Font,
     width: u32,
     height: u32,
     visible: bool,
@@ -126,10 +155,10 @@ impl State {
             None,
         );
 
-        let height = PAD + (BAR_H + PAD) * MAX_ROWS;
+        let (width, height) = (SURFACE_W, SURFACE_H);
         layer.set_anchor(Anchor::TOP | Anchor::RIGHT);
-        layer.set_size(WIDTH, height);
-        layer.set_margin(12, 12, 0, 0);
+        layer.set_size(width, height);
+        layer.set_margin(8, 8, 0, 0);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
         // Click-through: an EMPTY input region means no pointer events are routed
@@ -140,8 +169,11 @@ impl State {
 
         layer.commit();
 
-        let pool = SlotPool::new((WIDTH * height * 4) as usize, &shm)
+        let pool = SlotPool::new((width * height * 4) as usize, &shm)
             .map_err(|e| format!("slot pool: {e}"))?;
+
+        let font = Font::from_bytes(FONT_DATA, fontdue::FontSettings::default())
+            .map_err(|e| format!("font load: {e}"))?;
 
         let mut state = State {
             registry_state: RegistryState::new(&globals),
@@ -150,7 +182,8 @@ impl State {
             pool,
             layer,
             conn: conn.clone(),
-            width: WIDTH,
+            font,
+            width,
             height,
             visible: true,
             configured: false,
@@ -171,17 +204,7 @@ impl State {
         Ok((state, event_queue))
     }
 
-    fn color(kind: ToastKind) -> u32 {
-        // 0xAARRGGBB premultiplied-ish; alpha kept high for legibility.
-        match kind {
-            ToastKind::Saved => 0xCC2E7D32,     // green
-            ToastKind::Recording => 0xCCC62828, // red
-            ToastKind::Stopped => 0xCC616161,   // grey
-            ToastKind::Error => 0xCCB71C1C,     // dark red
-        }
-    }
-
-    fn draw(&mut self, hud: &Hud) {
+    fn draw(&mut self, hud: &Hud, now_ms: u64) {
         if !self.configured {
             return;
         }
@@ -196,16 +219,41 @@ impl State {
                 Err(_) => return,
             };
 
-        // Clear to transparent.
+        // Clear to fully transparent (premultiplied BGRA).
         for px in canvas.chunks_exact_mut(4) {
             px.copy_from_slice(&[0, 0, 0, 0]);
         }
 
         if self.visible {
-            // Only transient toasts are drawn; the replay buffer being armed is
-            // not shown as a persistent bar (it floated over everything).
-            for (row, toast) in hud.toasts().iter().take(MAX_ROWS as usize).enumerate() {
-                fill_bar(canvas, w, row as u32, Self::color(toast.kind));
+            let right = w as f32 - SHADOW as f32;
+            let mut y = SHADOW as f32;
+            for toast in hud.toasts().iter().take(MAX_ROWS as usize) {
+                // Fade + slide on appear and just before expiry.
+                let age = now_ms.saturating_sub(toast.created_at_ms) as f32;
+                let remaining = toast.expires_at_ms.saturating_sub(now_ms) as f32;
+                let fade_in = ease_out_cubic(age / FADE_IN_MS);
+                let fade_out = ease_out_cubic(remaining / FADE_OUT_MS);
+                let alpha = fade_in.min(fade_out);
+                if alpha > 0.001 {
+                    let slide = (1.0 - fade_in) * SLIDE_PX + (1.0 - fade_out) * SLIDE_PX;
+                    let text_w = measure_text(&self.font, &toast.text, FONT_PX);
+                    let card_w = (PAD_X + ICON_BOX + ICON_GAP + text_w + PAD_X)
+                        .clamp(CARD_MIN_W as f32, CARD_MAX_W as f32);
+                    let x0 = right - card_w + slide;
+                    draw_card(
+                        canvas,
+                        w,
+                        h,
+                        &self.font,
+                        x0,
+                        y,
+                        card_w,
+                        toast.kind,
+                        &toast.text,
+                        alpha,
+                    );
+                }
+                y += (CARD_H + CARD_GAP) as f32;
             }
         }
 
@@ -220,24 +268,254 @@ impl State {
     }
 }
 
-/// Paint a single rounded-ish (plain rect) bar at row index `row`.
-fn fill_bar(canvas: &mut [u8], width: u32, row: u32, argb: u32) {
-    let y0 = PAD + row * (BAR_H + PAD);
-    let a = ((argb >> 24) & 0xff) as u8;
-    let r = ((argb >> 16) & 0xff) as u8;
-    let g = ((argb >> 8) & 0xff) as u8;
-    let b = (argb & 0xff) as u8;
-    for y in y0..(y0 + BAR_H) {
-        for x in PAD..(width - PAD) {
-            let idx = ((y * width + x) * 4) as usize;
-            if idx + 4 <= canvas.len() {
-                // wl_shm Argb8888 is little-endian BGRA in memory.
-                canvas[idx] = b;
-                canvas[idx + 1] = g;
-                canvas[idx + 2] = r;
-                canvas[idx + 3] = a;
+#[inline]
+fn ease_out_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+/// Accent colour (straight RGB) per toast kind.
+#[inline]
+fn accent(kind: ToastKind) -> (f32, f32, f32) {
+    match kind {
+        ToastKind::Saved => (63.0, 185.0, 80.0),     // #3FB950
+        ToastKind::Recording => (248.0, 81.0, 73.0), // #F85149
+        ToastKind::Stopped => (139.0, 148.0, 158.0), // #8B949E
+        ToastKind::Error => (248.0, 81.0, 73.0),     // #F85149
+    }
+}
+
+/// Composite a straight-colour source with coverage `a` (0..1) over a
+/// premultiplied-alpha BGRA destination pixel at byte `idx`.
+#[inline]
+fn blend(canvas: &mut [u8], idx: usize, r: f32, g: f32, b: f32, a: f32) {
+    if a <= 0.0 || idx + 4 > canvas.len() {
+        return;
+    }
+    let a = a.min(1.0);
+    let inv = 1.0 - a;
+    let db = canvas[idx] as f32;
+    let dg = canvas[idx + 1] as f32;
+    let dr = canvas[idx + 2] as f32;
+    let da = canvas[idx + 3] as f32;
+    canvas[idx] = (b * a + db * inv) as u8;
+    canvas[idx + 1] = (g * a + dg * inv) as u8;
+    canvas[idx + 2] = (r * a + dr * inv) as u8;
+    canvas[idx + 3] = (255.0 * a + da * inv) as u8;
+}
+
+/// Signed distance to a rounded box centred at `(cx,cy)`, half-size `(hw,hh)`.
+#[inline]
+fn sd_round_box(px: f32, py: f32, cx: f32, cy: f32, hw: f32, hh: f32, r: f32) -> f32 {
+    let dx = (px - cx).abs() - (hw - r);
+    let dy = (py - cy).abs() - (hh - r);
+    let ax = dx.max(0.0);
+    let ay = dy.max(0.0);
+    (ax * ax + ay * ay).sqrt() + dx.max(dy).min(0.0) - r
+}
+
+/// Distance from `(px,py)` to the segment `a`-`b`.
+#[inline]
+fn sd_segment(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let (pax, pay) = (px - ax, py - ay);
+    let (bax, bay) = (bx - ax, by - ay);
+    let denom = bax * bax + bay * bay;
+    let h = if denom > 0.0 {
+        ((pax * bax + pay * bay) / denom).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let (dx, dy) = (pax - bax * h, pay - bay * h);
+    (dx * dx + dy * dy).sqrt()
+}
+
+/// Sum of glyph advance widths (px) — for auto-sizing the card.
+fn measure_text(font: &Font, text: &str, px: f32) -> f32 {
+    text.chars()
+        .map(|c| font.metrics(c, px).advance_width)
+        .sum()
+}
+
+/// Draw one toast card: soft shadow, rounded body + hairline, icon, and text.
+#[allow(clippy::too_many_arguments)]
+fn draw_card(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    font: &Font,
+    x0: f32,
+    y0: f32,
+    w: f32,
+    kind: ToastKind,
+    text: &str,
+    alpha: f32,
+) {
+    let h = CARD_H as f32;
+    let (cx, cy) = (x0 + w / 2.0, y0 + h / 2.0);
+    let (hw, hh) = (w / 2.0, h / 2.0);
+
+    let pad = SHADOW as f32;
+    let xs = (x0 - pad).floor().max(0.0) as u32;
+    let xe = ((x0 + w + pad).ceil() as u32).min(width);
+    let ys = (y0 - pad).floor().max(0.0) as u32;
+    let ye = ((y0 + h + pad).ceil() as u32).min(height);
+    let feather = 13.0;
+    let sh_cy = cy + 4.0;
+    for py in ys..ye {
+        for px in xs..xe {
+            let fx = px as f32 + 0.5;
+            let fy = py as f32 + 0.5;
+            let idx = ((py * width + px) * 4) as usize;
+            // Soft drop shadow (outside the card body).
+            let ds = sd_round_box(fx, fy, cx, sh_cy, hw, hh, CARD_RADIUS);
+            if ds > 0.0 && ds < feather {
+                let s = 1.0 - ds / feather;
+                blend(canvas, idx, 0.0, 0.0, 0.0, 0.40 * s * s * alpha);
+            }
+            // Card body with AA edge.
+            let d = sd_round_box(fx, fy, cx, cy, hw, hh, CARD_RADIUS);
+            let cov = (0.5 - d).clamp(0.0, 1.0);
+            if cov > 0.0 {
+                blend(
+                    canvas,
+                    idx,
+                    CARD_BG.0,
+                    CARD_BG.1,
+                    CARD_BG.2,
+                    CARD_ALPHA * cov * alpha,
+                );
+                // Faint light hairline just inside the edge for definition.
+                let ring = (1.0 - (d + 1.2).abs()).clamp(0.0, 1.0);
+                if ring > 0.0 {
+                    blend(canvas, idx, 255.0, 255.0, 255.0, 0.05 * ring * alpha);
+                }
             }
         }
+    }
+
+    let icx = x0 + PAD_X + ICON_BOX / 2.0;
+    let icy = y0 + h / 2.0;
+    draw_icon(canvas, width, height, kind, icx, icy, accent(kind), alpha);
+
+    let tx = x0 + PAD_X + ICON_BOX + ICON_GAP;
+    let baseline = y0 + h / 2.0 + FONT_PX * 0.34;
+    draw_text(
+        canvas, width, height, font, text, tx, baseline, TEXT_RGB, alpha,
+    );
+}
+
+/// Draw the per-kind status icon (anti-aliased, procedural — no glyph needed).
+#[allow(clippy::too_many_arguments)]
+fn draw_icon(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    kind: ToastKind,
+    cx: f32,
+    cy: f32,
+    color: (f32, f32, f32),
+    alpha: f32,
+) {
+    let half = ICON_BOX / 2.0 + 1.0;
+    let xs = (cx - half).floor().max(0.0) as u32;
+    let xe = ((cx + half).ceil() as u32).min(width);
+    let ys = (cy - half).floor().max(0.0) as u32;
+    let ye = ((cy + half).ceil() as u32).min(height);
+    let stroke = 1.7;
+    for py in ys..ye {
+        for px in xs..xe {
+            let fx = px as f32 + 0.5;
+            let fy = py as f32 + 0.5;
+            let cov = match kind {
+                ToastKind::Recording => {
+                    let r = ICON_BOX * 0.30;
+                    let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() - r;
+                    (0.5 - d).clamp(0.0, 1.0)
+                }
+                ToastKind::Saved => {
+                    let r = ICON_BOX * 0.36;
+                    let d = sd_segment(
+                        fx,
+                        fy,
+                        cx - r * 0.62,
+                        cy + r * 0.06,
+                        cx - r * 0.16,
+                        cy + r * 0.5,
+                    )
+                    .min(sd_segment(
+                        fx,
+                        fy,
+                        cx - r * 0.16,
+                        cy + r * 0.5,
+                        cx + r * 0.64,
+                        cy - r * 0.46,
+                    )) - stroke;
+                    (0.5 - d).clamp(0.0, 1.0)
+                }
+                ToastKind::Stopped => {
+                    let s = ICON_BOX * 0.26;
+                    let d = sd_round_box(fx, fy, cx, cy, s, s, 2.5);
+                    (0.5 - d).clamp(0.0, 1.0)
+                }
+                ToastKind::Error => {
+                    let r = ICON_BOX * 0.28;
+                    let d = sd_segment(fx, fy, cx - r, cy - r, cx + r, cy + r).min(sd_segment(
+                        fx,
+                        fy,
+                        cx - r,
+                        cy + r,
+                        cx + r,
+                        cy - r,
+                    )) - stroke;
+                    (0.5 - d).clamp(0.0, 1.0)
+                }
+            };
+            if cov > 0.0 {
+                let idx = ((py * width + px) * 4) as usize;
+                blend(canvas, idx, color.0, color.1, color.2, cov * alpha);
+            }
+        }
+    }
+}
+
+/// Rasterize `text` with fontdue and blit it (alpha = glyph coverage).
+#[allow(clippy::too_many_arguments)]
+fn draw_text(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    font: &Font,
+    text: &str,
+    x: f32,
+    baseline: f32,
+    color: (f32, f32, f32),
+    alpha: f32,
+) {
+    let mut pen = x;
+    for ch in text.chars() {
+        let (m, bitmap) = font.rasterize(ch, FONT_PX);
+        if m.width > 0 && m.height > 0 {
+            let gx = (pen + m.xmin as f32).round() as i32;
+            let gy = (baseline - m.height as f32 - m.ymin as f32).round() as i32;
+            for row in 0..m.height {
+                let py = gy + row as i32;
+                if py < 0 || py as u32 >= height {
+                    continue;
+                }
+                for col in 0..m.width {
+                    let px = gx + col as i32;
+                    if px < 0 || px as u32 >= width {
+                        continue;
+                    }
+                    let cov = bitmap[row * m.width + col] as f32 / 255.0;
+                    if cov > 0.0 {
+                        let idx = ((py as u32 * width + px as u32) * 4) as usize;
+                        blend(canvas, idx, color.0, color.1, color.2, cov * alpha);
+                    }
+                }
+            }
+        }
+        pen += m.advance_width;
     }
 }
 
