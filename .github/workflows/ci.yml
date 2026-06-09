@@ -12,10 +12,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The Rust quality gate runs on EVERY push/PR: fast, no GPU, no nix. This is
-  # the per-iteration check.
+  # Fast Rust gate on EVERY push/PR: no GPU, no nix, default (pure) features.
+  # The per-iteration check.
   rust:
-    name: fmt + clippy + test
+    name: fmt + clippy + test (default features)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +26,38 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # The product's real code is feature-gated (waycap/mux/layershell/gui) and the
+  # default Rust job never compiles it. This nix lane builds + lints + tests ALL
+  # features in the devshell (ffmpeg/wayland/cuda toolchain), so the muxer +
+  # mux_golden tests, the HUD renderer, and the egui UI can't silently rot. No
+  # GPU is needed to compile or to run the non-`#[ignore]` tests. Also evaluates
+  # the flake (HM module, packages, outputHashes) so breakage surfaces on PRs,
+  # not only at release. Runs on every push/PR.
+  nix-checks:
+    name: nix --all-features + flake eval
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # Pull build deps (CUDA/ffmpeg) from cache; no auth token needed for reads,
+      # so this works on PRs from forks too.
+      - name: Set up Cachix (pull)
+        uses: cachix/cachix-action@v15
+        with:
+          name: 0xfell
+          extraPullNames: nix-community
+      - name: Evaluate the flake (no build)
+        run: nix flake check --no-build -L
+      - name: clippy --all-features (devshell)
+        run: nix develop -c cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: test --all-features (devshell)
+        run: nix develop -c cargo test --workspace --all-features
 
   # The nix build + cachix push only runs on version tags (v*) or a manual
   # dispatch — NOT on every master push. This keeps the cache holding only
