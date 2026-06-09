@@ -12,6 +12,8 @@ thiserror.workspace = true
 ord-common.workspace = true
 smithay-client-toolkit = { version = "0.19", optional = true }
 wayland-client = { version = "0.31", optional = true }
+# Pure-Rust glyph rasterizer for the HUD text (no system fonts / no GPU).
+fontdue = { version = "0.9", optional = true }
 
 [[bin]]
 name = "ord-hud"
@@ -23,4 +25,4 @@ required-features = ["layershell"]
 # smithay-client-toolkit; needs a Wayland session at runtime). Off by default so
 # the trait + HUD model build and test without Wayland.
 default = []
-layershell = ["dep:smithay-client-toolkit", "dep:wayland-client"]
+layershell = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:fontdue"]

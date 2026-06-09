@@ -19,17 +19,17 @@ fn main() {
     }
 
     let mut hud = Hud::default();
-    hud.set_buffer_active(true);
-
     let start = Instant::now();
     let now_ms = || start.elapsed().as_millis() as u64;
-    hud.toast(ToastKind::Saved, "Clip saved", now_ms());
-    hud.toast(ToastKind::Recording, "Recording", now_ms());
+    hud.toast_for(ToastKind::Saved, "Clip saved (30s)", now_ms(), 8000);
+    hud.toast_for(ToastKind::Recording, "Replay buffer on", now_ms(), 8000);
+    hud.toast_for(ToastKind::Stopped, "Recording stopped", now_ms(), 8000);
+    hud.toast_for(ToastKind::Error, "Encoder error: no NVENC", now_ms(), 8000);
 
-    while start.elapsed() < Duration::from_secs(3) {
+    while start.elapsed() < Duration::from_secs(9) {
         hud.tick(now_ms());
-        overlay.render(&hud);
-        std::thread::sleep(Duration::from_millis(100));
+        overlay.render(&hud, now_ms());
+        std::thread::sleep(Duration::from_millis(16));
     }
     overlay.destroy();
     eprintln!("hud_demo: done");
