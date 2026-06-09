@@ -47,8 +47,30 @@ pub fn detect_foreground() -> Option<String> {
         return None;
     }
     let text = String::from_utf8(out.stdout).ok()?;
-    // Avoid a JSON dep: pull the "class" field value with a tiny scan.
-    extract_json_string_field(&text, "class")
+    // Avoid a JSON dep: pull the fields with a tiny scan.
+    pick_name(
+        extract_json_string_field(&text, "class"),
+        extract_json_string_field(&text, "title"),
+    )
+}
+
+/// Whether a window class is a cryptic Steam app id (`steam_app_<digits>`),
+/// whose human name lives in the title instead.
+fn is_steam_app_class(class: &str) -> bool {
+    class
+        .strip_prefix("steam_app_")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Choose the best human-facing name from a window's class and title. Steam games
+/// have a `steam_app_<id>` class, so their real name (e.g. "Path of Exile 2") is
+/// in the title; everything else uses the (usually descriptive) class.
+pub fn pick_name(class: Option<String>, title: Option<String>) -> Option<String> {
+    match class {
+        Some(c) if is_steam_app_class(&c) => title.or(Some(c)),
+        Some(c) => Some(c),
+        None => title,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -132,5 +154,30 @@ mod tests {
         let json = r#"{"class":"","title":"X"}"#;
         assert_eq!(extract_json_string_field(json, "class"), None);
         assert_eq!(extract_json_string_field(json, "nope"), None);
+    }
+
+    #[test]
+    fn steam_app_class_prefers_title() {
+        // A Steam game: cryptic class -> use the human title.
+        assert_eq!(
+            pick_name(
+                Some("steam_app_2694490".into()),
+                Some("Path of Exile 2".into())
+            )
+            .as_deref(),
+            Some("Path of Exile 2")
+        );
+        // No title -> fall back to the class.
+        assert_eq!(
+            pick_name(Some("steam_app_2694490".into()), None).as_deref(),
+            Some("steam_app_2694490")
+        );
+        // Non-Steam app -> the class is already descriptive.
+        assert_eq!(
+            pick_name(Some("brave-browser".into()), Some("Some Tab".into())).as_deref(),
+            Some("brave-browser")
+        );
+        // Only a title available.
+        assert_eq!(pick_name(None, Some("mpv".into())).as_deref(), Some("mpv"));
     }
 }
