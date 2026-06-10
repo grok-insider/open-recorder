@@ -431,6 +431,145 @@ pub fn build_plan(
     })
 }
 
+/// Build the ffmpeg argument vector for a **multi-segment** export: each
+/// [`Trim`] window is cut out and the pieces are concatenated (re-encoded —
+/// the `concat` filter cannot stream-copy) into one output.
+///
+/// Segments must be ascending and non-overlapping. Only video outputs are
+/// supported; pick a re-encoding preset (stream copy cannot join cuts).
+pub fn build_segments_plan(
+    input: &str,
+    output: &str,
+    profile: &ExportProfile,
+    src: &SourceInfo,
+    segments: &[Trim],
+    use_hardware: bool,
+) -> Result<FfmpegPlan, ExportError> {
+    if segments.is_empty() {
+        return Err(ExportError::InvalidTrim);
+    }
+    for t in segments {
+        t.validate()?;
+    }
+    for w in segments.windows(2) {
+        if w[1].start_secs < w[0].end_secs {
+            return Err(ExportError::InvalidTrim);
+        }
+    }
+    let duration: f64 = segments.iter().map(|t| t.duration()).sum();
+    if duration <= 0.0 {
+        return Err(ExportError::ZeroDuration);
+    }
+    if profile.output != Output::Video {
+        return Err(ExportError::Io(
+            "multi-segment export supports video presets only".into(),
+        ));
+    }
+    if !profile.reencodes() {
+        return Err(ExportError::Io(
+            "joining cuts re-encodes; pick a re-encoding preset (not stream copy)".into(),
+        ));
+    }
+
+    let hardware = profile.hardware && use_hardware;
+    let encoder = encoder_name(profile.codec, hardware);
+    let with_audio = src.has_audio && !profile.mute;
+    let n = segments.len();
+
+    // trim/atrim each window, reset timestamps, then concat the pieces.
+    let mut filter = String::new();
+    for (i, t) in segments.iter().enumerate() {
+        filter.push_str(&format!(
+            "[0:v]trim=start={:.3}:end={:.3},setpts=PTS-STARTPTS[v{i}];",
+            t.start_secs, t.end_secs
+        ));
+        if with_audio {
+            filter.push_str(&format!(
+                "[0:a]atrim=start={:.3}:end={:.3},asetpts=PTS-STARTPTS[a{i}];",
+                t.start_secs, t.end_secs
+            ));
+        }
+    }
+    for i in 0..n {
+        filter.push_str(&format!("[v{i}]"));
+        if with_audio {
+            filter.push_str(&format!("[a{i}]"));
+        }
+    }
+    filter.push_str(&format!(
+        "concat=n={n}:v=1:a={}[vc]",
+        if with_audio { 1 } else { 0 }
+    ));
+    let mut vout = "[vc]".to_string();
+    let mut aout = String::new();
+    if with_audio {
+        filter.push_str("[ac]");
+        aout = "[ac]".to_string();
+    }
+    if let Some(vf) = scale_filter(profile.scale, src) {
+        filter.push_str(&format!(";[vc]{vf}[vs]"));
+        vout = "[vs]".to_string();
+    }
+    if with_audio && profile.normalize_audio {
+        // -af cannot coexist with -filter_complex; fold loudnorm in here.
+        filter.push_str(";[ac]loudnorm[an]");
+        aout = "[an]".to_string();
+    }
+
+    let mut args: Vec<String> = vec![
+        "-y".into(),
+        "-hide_banner".into(),
+        "-i".into(),
+        input.into(),
+        "-filter_complex".into(),
+        filter,
+        "-map".into(),
+        vout,
+    ];
+    if with_audio {
+        args.push("-map".into());
+        args.push(aout);
+    }
+    if let FrameRate::Fixed(f) = profile.fps {
+        args.push("-r".into());
+        args.push(f.to_string());
+    }
+
+    args.push("-c:v".into());
+    args.push(encoder.into());
+    args.extend(preset_args(encoder));
+    args.extend(rate_control_args(
+        encoder,
+        profile.rate_control,
+        duration,
+        with_audio,
+        profile.audio_kbps,
+    ));
+    args.push("-pix_fmt".into());
+    args.push("yuv420p".into());
+
+    if with_audio {
+        // The concat output is a new stream: always transcoded.
+        let kbps = profile.audio_kbps.max(1);
+        args.push("-c:a".into());
+        args.push(audio_codec_for(profile.container).into());
+        args.push("-b:a".into());
+        args.push(format!("{kbps}k"));
+    }
+
+    if profile.container == Container::Mp4 {
+        args.push("-movflags".into());
+        args.push("+faststart".into());
+    }
+    args.push(output.into());
+
+    Ok(FfmpegPlan {
+        args,
+        encoder: encoder.to_string(),
+        uses_hardware: hardware,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,6 +844,111 @@ mod tests {
         let mut s = src();
         s.duration_secs = 0.0;
         assert!(build_plan("i", "o", &ExportProfile::high_quality(), &s, None, true).is_err());
+    }
+
+    fn segs() -> Vec<Trim> {
+        vec![
+            Trim {
+                start_secs: 2.0,
+                end_secs: 5.0,
+            },
+            Trim {
+                start_secs: 10.0,
+                end_secs: 14.0,
+            },
+        ]
+    }
+
+    #[test]
+    fn segments_plan_trims_and_concats_av() {
+        let p = ExportProfile::high_quality();
+        let plan = build_segments_plan("in.mkv", "o.mp4", &p, &src(), &segs(), true).unwrap();
+        let s = joined(&plan);
+        assert!(
+            s.contains("[0:v]trim=start=2.000:end=5.000,setpts=PTS-STARTPTS[v0]"),
+            "{s}"
+        );
+        assert!(
+            s.contains("[0:a]atrim=start=10.000:end=14.000,asetpts=PTS-STARTPTS[a1]"),
+            "{s}"
+        );
+        assert!(
+            s.contains("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vc][ac]"),
+            "{s}"
+        );
+        assert!(s.contains("-map [vc]") && s.contains("-map [ac]"), "{s}");
+        assert!(s.contains("-c:v av1_nvenc"), "{s}");
+        // The concatenated audio is a new stream: always transcoded (AAC in MP4).
+        assert!(s.contains("-c:a aac"), "{s}");
+        assert!(s.contains("-movflags +faststart"), "{s}");
+    }
+
+    #[test]
+    fn segments_plan_mute_drops_audio_chains() {
+        let mut p = ExportProfile::high_quality();
+        p.mute = true;
+        let plan = build_segments_plan("in.mkv", "o.mp4", &p, &src(), &segs(), true).unwrap();
+        let s = joined(&plan);
+        assert!(s.contains("concat=n=2:v=1:a=0[vc]"), "{s}");
+        assert!(!s.contains("atrim"), "{s}");
+        assert!(!s.contains("-c:a"), "{s}");
+        assert!(!s.contains("[ac]"), "{s}");
+    }
+
+    #[test]
+    fn segments_plan_scales_after_concat() {
+        let p = ExportProfile::discord(); // MaxHeight(1080) on a 1440p source
+        let plan = build_segments_plan("in.mkv", "o.mp4", &p, &src(), &segs(), true).unwrap();
+        let s = joined(&plan);
+        assert!(s.contains(";[vc]scale=-2:1080:flags=lanczos[vs]"), "{s}");
+        assert!(s.contains("-map [vs]"), "{s}");
+        // Target size math runs over the SUMMED kept duration (7 s here).
+        assert!(s.contains("-rc cbr"), "{s}");
+    }
+
+    #[test]
+    fn segments_plan_folds_loudnorm_into_graph() {
+        let mut p = ExportProfile::high_quality();
+        p.normalize_audio = true;
+        let plan = build_segments_plan("in.mkv", "o.mp4", &p, &src(), &segs(), true).unwrap();
+        let s = joined(&plan);
+        assert!(s.contains(";[ac]loudnorm[an]"), "{s}");
+        assert!(s.contains("-map [an]"), "{s}");
+        assert!(!s.contains("-af"), "{s}");
+    }
+
+    #[test]
+    fn segments_plan_rejects_bad_input() {
+        let p = ExportProfile::high_quality();
+        // Empty.
+        assert!(build_segments_plan("i", "o", &p, &src(), &[], true).is_err());
+        // Overlapping.
+        let overlap = vec![
+            Trim {
+                start_secs: 0.0,
+                end_secs: 5.0,
+            },
+            Trim {
+                start_secs: 4.0,
+                end_secs: 8.0,
+            },
+        ];
+        assert!(build_segments_plan("i", "o", &p, &src(), &overlap, true).is_err());
+        // Stream copy can't concat.
+        let copy = ExportProfile::source(Container::Mkv);
+        assert!(build_segments_plan("i", "o", &copy, &src(), &segs(), true).is_err());
+        // Non-video outputs unsupported.
+        assert!(
+            build_segments_plan("i", "o", &ExportProfile::gif(), &src(), &segs(), true).is_err()
+        );
+    }
+
+    #[test]
+    fn segments_plan_software_fallback() {
+        let p = ExportProfile::high_quality();
+        let plan = build_segments_plan("in.mkv", "o.mp4", &p, &src(), &segs(), false).unwrap();
+        assert_eq!(plan.encoder, "libsvtav1");
+        assert!(!plan.uses_hardware);
     }
 
     #[test]

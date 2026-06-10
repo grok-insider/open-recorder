@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::plan::{build_plan, Trim};
+use crate::plan::{build_plan, build_segments_plan, FfmpegPlan, Trim};
 use crate::probe::probe;
 use crate::profile::ExportProfile;
 use crate::{ffmpeg_bin, ExportError};
@@ -60,22 +60,65 @@ pub fn export_with(
 ) -> Result<ExportSummary, ExportError> {
     let src = probe(input)?;
     let duration = trim.map(|t| t.duration()).unwrap_or(src.duration_secs);
+    let input_s = input.to_string_lossy().to_string();
+    let output_s = output.to_string_lossy().to_string();
+    execute(
+        output,
+        profile,
+        duration,
+        &|hw| build_plan(&input_s, &output_s, profile, &src, trim, hw),
+        on_progress,
+        cancel,
+    )
+}
 
+/// Export several windows of `input` concatenated into one `output` (the
+/// editor's multi-segment cuts), with the same progress/cancel/fallback
+/// behavior as [`export_with`]. Segments must be ascending, non-overlapping.
+pub fn export_segments_with(
+    input: &Path,
+    output: &Path,
+    profile: &ExportProfile,
+    segments: &[Trim],
+    on_progress: &mut dyn FnMut(f64),
+    cancel: &AtomicBool,
+) -> Result<ExportSummary, ExportError> {
+    let src = probe(input)?;
+    let duration = segments.iter().map(|t| t.duration()).sum();
+    let input_s = input.to_string_lossy().to_string();
+    let output_s = output.to_string_lossy().to_string();
+    execute(
+        output,
+        profile,
+        duration,
+        &|hw| build_segments_plan(&input_s, &output_s, profile, &src, segments, hw),
+        on_progress,
+        cancel,
+    )
+}
+
+/// Run a planned export with the NVENC→software fallback and corrupt-output
+/// cleanup. `build` produces the plan for hardware (`true`) or software.
+fn execute(
+    output: &Path,
+    profile: &ExportProfile,
+    duration: f64,
+    build: &dyn Fn(bool) -> Result<FfmpegPlan, ExportError>,
+    on_progress: &mut dyn FnMut(f64),
+    cancel: &AtomicBool,
+) -> Result<ExportSummary, ExportError> {
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| ExportError::Io(e.to_string()))?;
         }
     }
 
-    let input_s = input.to_string_lossy().to_string();
-    let output_s = output.to_string_lossy().to_string();
-
     // From here ffmpeg (run with `-y`) may create `output`. If any step in this
     // phase fails, the file on disk is truncated/corrupt — remove it so a caller
     // (the UI library) never lists a broken clip.
     let phase = (|| -> Result<(String, bool, u64), ExportError> {
         // Attempt the profile as configured (hardware if requested).
-        let plan = build_plan(&input_s, &output_s, profile, &src, trim, true)?;
+        let plan = build(true)?;
         let (encoder, used_hardware) = match run_ffmpeg(&plan.args, duration, on_progress, cancel) {
             Ok(()) => (plan.encoder, plan.uses_hardware),
             // A cancellation is final — never retry it in software.
@@ -85,7 +128,7 @@ pub fn export_with(
                 // GPU for a re-encode; a copy or already-software run has nothing
                 // to gain.
                 if plan.uses_hardware && profile.reencodes() {
-                    let sw = build_plan(&input_s, &output_s, profile, &src, trim, false)?;
+                    let sw = build(false)?;
                     run_ffmpeg(&sw.args, duration, on_progress, cancel)?;
                     (sw.encoder, sw.uses_hardware)
                 } else {
