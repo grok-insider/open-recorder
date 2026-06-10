@@ -64,13 +64,13 @@ jobs:
       - name: test all features except waycap (devshell)
         run: nix develop -c cargo test --workspace --features "ord-core/mux,ord-daemon/mux,ord-overlay/layershell,ord-ui/gui"
 
-  # The nix build + cachix push only runs on version tags (v*) or a manual
-  # dispatch — NOT on every master push. This keeps the cache holding only
-  # tested releases and lets us iterate locally first (nix build / nix develop
-  # on the dev box) before publishing.
+  # The nix build + cachix push runs on every master push (plus tags and manual
+  # dispatch), so the cache always holds the current master closure and NixOS
+  # consumers pointing at github:0xfell/open-recorder pull instead of compiling.
+  # PRs never publish (no secrets on fork PRs anyway).
   build:
     name: build + cache (x86_64-linux)
-    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
