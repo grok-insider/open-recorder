@@ -70,6 +70,7 @@ fn mux_produces_probeable_file() {
             time_base_den: NANOS_PER_SEC,
         },
         audio_params: None,
+        chapters: vec![],
     };
 
     let out = std::env::temp_dir().join(format!("ord-mux-golden-{}.mkv", std::process::id()));
@@ -134,6 +135,7 @@ fn mux_with_audio_produces_two_streams() {
     let clip = PreparedClip {
         frames,
         audio,
+        chapters: vec![],
         params: StreamParams {
             width: 1920,
             height: 1080,
@@ -197,6 +199,7 @@ fn mux_interleaves_audio_and_video() {
     let clip = PreparedClip {
         frames,
         audio,
+        chapters: vec![],
         params: StreamParams {
             width: 1920,
             height: 1080,
@@ -274,6 +277,7 @@ fn mux_with_large_monotonic_base_stays_synced() {
     let clip = PreparedClip {
         frames,
         audio,
+        chapters: vec![],
         params: StreamParams {
             width: 1920,
             height: 1080,
@@ -336,9 +340,82 @@ fn mux_rejects_clip_without_keyframe() {
             time_base_den: NANOS_PER_SEC,
         },
         audio_params: None,
+        chapters: vec![],
     };
     let out = std::env::temp_dir().join(format!("ord-mux-nokf-{}.mkv", std::process::id()));
     let _ = std::fs::remove_file(&out);
     assert!(ord_core::write_clip(&clip, &out).is_err());
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn mux_writes_marker_chapters() {
+    // 60 frames over 1s with markers at ~250ms and ~750ms: the saved file must
+    // carry two chapters at those positions (how "clip that" bookmarks reach
+    // players/editors).
+    let step = NANOS_PER_SEC / 60;
+    let frames: Vec<EncodedFrame> = (0..60)
+        .map(|i| {
+            let kf = i % 10 == 0;
+            let pts = i as i64 * step;
+            EncodedFrame::new(access_unit(kf), kf, pts, pts)
+        })
+        .collect();
+
+    let clip = PreparedClip {
+        frames,
+        audio: vec![],
+        chapters: vec![250, 750],
+        params: StreamParams {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            codec: Codec::H264,
+            time_base_den: NANOS_PER_SEC,
+        },
+        audio_params: None,
+    };
+
+    let out = std::env::temp_dir().join(format!("ord-mux-chapters-{}.mkv", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    ord_core::write_clip(&clip, &out).expect("write_clip with chapters");
+
+    // In-process verification sees a valid file…
+    let check = ord_core::verify_clip(&out).expect("verify_clip");
+    assert!(check.has_video);
+    assert!(check.duration_ms > 500);
+
+    // …and ffprobe sees both chapters at the right times.
+    if ffprobe_available() {
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_chapters",
+                "-of",
+                "default=noprint_wrappers=1",
+            ])
+            .arg(&out)
+            .output()
+            .expect("run ffprobe");
+        let text = String::from_utf8_lossy(&probe.stdout);
+        let starts: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("start_time="))
+            .collect();
+        assert_eq!(starts.len(), 2, "chapters: {text}");
+        assert!(starts[0].contains("0.25"), "{text}");
+        assert!(starts[1].contains("0.75"), "{text}");
+        assert!(text.contains("TAG:title=Marker 1"), "{text}");
+    }
+
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn verify_clip_rejects_garbage_file() {
+    let out = std::env::temp_dir().join(format!("ord-verify-bad-{}.mkv", std::process::id()));
+    std::fs::write(&out, b"this is not a matroska file").unwrap();
+    assert!(ord_core::verify_clip(&out).is_err());
     let _ = std::fs::remove_file(&out);
 }

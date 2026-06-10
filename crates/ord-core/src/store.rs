@@ -41,6 +41,9 @@ pub trait FrameStore: Send {
     /// Drop all buffered frames and reset the eviction anchor.
     fn clear(&mut self);
 
+    /// Change the capacity window, evicting immediately if needed.
+    fn set_capacity_seconds(&mut self, capacity_seconds: u32);
+
     /// Number of frames currently buffered.
     fn len(&self) -> usize;
 
@@ -83,6 +86,10 @@ impl FrameStore for RingBuffer {
 
     fn clear(&mut self) {
         RingBuffer::clear(self)
+    }
+
+    fn set_capacity_seconds(&mut self, capacity_seconds: u32) {
+        RingBuffer::set_capacity_seconds(self, capacity_seconds)
     }
 
     fn len(&self) -> usize {

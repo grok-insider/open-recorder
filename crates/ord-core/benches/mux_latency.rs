@@ -53,6 +53,7 @@ mod bench {
         PreparedClip {
             frames,
             audio,
+            chapters: vec![],
             params: StreamParams {
                 width: 2560,
                 height: 1440,

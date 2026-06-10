@@ -15,9 +15,11 @@ fn usage() -> &'static str {
      \n\
      usage:\n  \
        ord save [--last N]   save the last N seconds (default 30)\n  \
+       ord mark              bookmark this moment (chapter in the next save)\n  \
        ord record            toggle manual recording\n  \
        ord status            show daemon status\n  \
        ord buffer on|off     enable/disable the replay buffer\n  \
+       ord config show       print the effective daemon configuration\n  \
        ord subscribe         stream daemon events (for the HUD)\n  \
        ord export <in> ...   transcode/trim a clip (see `ord export --help`)\n"
 }
@@ -45,6 +47,11 @@ fn parse() -> Result<Command, String> {
         "record" => Ok(Command::ToggleRecord),
         "status" => Ok(Command::Status),
         "subscribe" => Ok(Command::Subscribe),
+        "mark" => Ok(Command::Mark),
+        "config" => match args.next().as_deref() {
+            Some("show") => Ok(Command::GetConfig),
+            _ => Err("config needs a subcommand: show".into()),
+        },
         "buffer" => {
             let v = args.next().ok_or("buffer needs on|off")?;
             let enabled = match v.as_str() {
@@ -91,6 +98,25 @@ fn render(event: Event) -> String {
             buffered_keyframes
         ),
         Event::Error { message } => format!("error: {message}"),
+        Event::Marked { auto_saving } => {
+            if auto_saving {
+                "marked (auto-saving a clip)".to_string()
+            } else {
+                "marked".to_string()
+            }
+        }
+        Event::CaptureRestarted => "capture restarted".to_string(),
+        Event::Config { effective, base } => {
+            let overridden = effective.overridden_fields(&base);
+            let toml = effective
+                .to_toml_string()
+                .unwrap_or_else(|e| format!("error: {e}"));
+            if overridden.is_empty() {
+                toml
+            } else {
+                format!("{toml}\n# runtime overrides: {}", overridden.join(", "))
+            }
+        }
     }
 }
 

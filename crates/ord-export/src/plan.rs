@@ -198,6 +198,16 @@ fn scale_filter(scale: Scale, src: &SourceInfo) -> Option<String> {
             }
         }
         Scale::Exact { width, height } => Some(format!("scale={width}:{height}:flags=lanczos")),
+        Scale::Vertical { height } => {
+            // Center-crop the source to 9:16 (full height, 9/16·h wide — every
+            // gameplay source is wider than that), then scale to the target.
+            // `min(iw,…)` keeps the crop legal for already-narrow sources, and
+            // `floor(/2)*2` keeps the encoder's even-dimension requirement.
+            let width = (height * 9 / 16) & !1;
+            Some(format!(
+                "crop=min(iw\\,floor(ih*9/32)*2):ih,scale={width}:{height}:flags=lanczos"
+            ))
+        }
     }
 }
 
@@ -279,7 +289,7 @@ fn gif_args(args: &mut Vec<String>, profile: &ExportProfile, output: &str) {
     };
     let height = match profile.scale {
         Scale::MaxHeight(h) => h,
-        Scale::Exact { height, .. } => height,
+        Scale::Exact { height, .. } | Scale::Vertical { height } => height,
         Scale::Source => 480,
     };
     // One pass: generate a palette from the frames and apply it (Bayer dithering
@@ -439,6 +449,16 @@ mod tests {
 
     fn joined(plan: &FfmpegPlan) -> String {
         plan.args.join(" ")
+    }
+
+    #[test]
+    fn vertical_preset_crops_to_9x16_and_scales() {
+        let p = ExportProfile::vertical();
+        let plan = build_plan("in.mkv", "out.mp4", &p, &src(), None, true).unwrap();
+        let s = joined(&plan);
+        assert!(s.contains("crop=min(iw\\,floor(ih*9/32)*2):ih"), "{s}");
+        assert!(s.contains("scale=1080:1920"), "{s}");
+        assert_eq!(plan.encoder, "h264_nvenc");
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub enum Scale {
     MaxHeight(u32),
     /// Force an exact width × height (may change aspect ratio).
     Exact { width: u32, height: u32 },
+    /// Center-crop to 9:16 portrait and scale to `height` (e.g. 1920 →
+    /// 1080×1920) — the TikTok/Shorts/Reels reframe.
+    Vertical { height: u32 },
 }
 
 /// How the encoder decides bitrate/quality.
@@ -140,6 +143,24 @@ impl ExportProfile {
     /// X (Twitter)-friendly: H.264 High in MP4, capped 1080p, source fps, at a
     /// quality that keeps clips comfortably uploadable. H.264 because X re-encodes
     /// and AV1/HEVC uploads play back unreliably there.
+    /// Vertical 9:16 for TikTok / Shorts / Reels: center-crop + 1080×1920,
+    /// H.264 (every mobile platform ingests it) at a quality good enough for
+    /// the re-encode those platforms apply anyway.
+    pub fn vertical() -> Self {
+        Self {
+            codec: ExportCodec::H264,
+            container: Container::Mp4,
+            scale: Scale::Vertical { height: 1920 },
+            fps: FrameRate::Source,
+            rate_control: RateControl::Quality(21),
+            hardware: true,
+            audio_kbps: 128,
+            mute: false,
+            output: Output::Video,
+            normalize_audio: false,
+        }
+    }
+
     pub fn x_twitter() -> Self {
         Self {
             codec: ExportCodec::H264,
@@ -249,6 +270,7 @@ pub enum Preset {
     HighQuality,
     Discord,
     XTwitter,
+    Vertical,
     Hq1080p60,
     AudioOnly,
     Gif,
@@ -258,11 +280,12 @@ pub enum Preset {
 impl Preset {
     /// Every preset, in the order UIs should offer them. Menus iterate this so
     /// a new preset can never be forgotten in one of them.
-    pub const ALL: [Preset; 7] = [
+    pub const ALL: [Preset; 8] = [
         Preset::Discord,
         Preset::HighQuality,
         Preset::Hq1080p60,
         Preset::XTwitter,
+        Preset::Vertical,
         Preset::AudioOnly,
         Preset::Gif,
         Preset::Source,
@@ -274,6 +297,7 @@ impl Preset {
             Preset::HighQuality => "high",
             Preset::Discord => "discord",
             Preset::XTwitter => "x",
+            Preset::Vertical => "vertical",
             Preset::Hq1080p60 => "1080p60",
             Preset::AudioOnly => "audio",
             Preset::Gif => "gif",
@@ -287,6 +311,7 @@ impl Preset {
             Preset::HighQuality => ExportProfile::high_quality(),
             Preset::Discord => ExportProfile::discord(),
             Preset::XTwitter => ExportProfile::x_twitter(),
+            Preset::Vertical => ExportProfile::vertical(),
             Preset::Hq1080p60 => ExportProfile::hq_1080p60(),
             Preset::AudioOnly => ExportProfile::audio_only(Container::Mp4),
             Preset::Gif => ExportProfile::gif(),
@@ -300,6 +325,7 @@ impl Preset {
             Preset::HighQuality => "High quality",
             Preset::Discord => "Discord (≤10 MB)",
             Preset::XTwitter => "X / Twitter",
+            Preset::Vertical => "Vertical 9:16 (Shorts)",
             Preset::Hq1080p60 => "1080p60 HQ",
             Preset::AudioOnly => "Audio only",
             Preset::Gif => "GIF",
@@ -316,6 +342,7 @@ impl Preset {
             "1080p60" | "1080p" | "hq1080p60" | "hq-1080p60" => Some(Preset::Hq1080p60),
             "audio" | "audio-only" | "audio_only" | "audioonly" => Some(Preset::AudioOnly),
             "gif" => Some(Preset::Gif),
+            "vertical" | "shorts" | "tiktok" | "reels" | "9x16" => Some(Preset::Vertical),
             "source" | "copy" | "remux" => Some(Preset::Source),
             _ => None,
         }

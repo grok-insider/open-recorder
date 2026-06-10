@@ -27,6 +27,9 @@ pub struct PreparedClip {
     pub audio: Vec<EncodedAudioFrame>,
     pub params: StreamParams,
     pub audio_params: Option<AudioParams>,
+    /// Marker positions inside this clip, as milliseconds from the clip start.
+    /// Written as MKV chapters by the muxer; empty for unmarked clips.
+    pub chapters: Vec<i64>,
 }
 
 impl PreparedClip {
@@ -58,6 +61,9 @@ pub struct Engine<B: CaptureBackend, S: FrameStore = RingBuffer> {
     /// Active full-length recording, if any. Frames are tee'd here from
     /// `drain_available` in addition to the replay ring.
     recorder: Option<Recorder>,
+    /// Marker positions ("clip that" bookmarks) in the video pts tick base,
+    /// oldest first. Pruned alongside the ring's eviction window.
+    markers: Vec<i64>,
 }
 
 impl<B: CaptureBackend> Engine<B> {
@@ -86,6 +92,7 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
             rx: None,
             audio_rx: None,
             recorder: None,
+            markers: Vec::new(),
         }
     }
 
@@ -127,6 +134,48 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
         Ok(())
     }
 
+    /// Restart the capture session with the same backend (watchdog recovery
+    /// after a stall — suspend/resume, monitor change). Buffered frames are
+    /// retained; the backend renegotiates its streams.
+    pub fn restart(&mut self) -> Result<(), BackendError> {
+        match self.stop() {
+            Ok(()) | Err(BackendError::NotRunning) => {}
+            Err(e) => return Err(e),
+        }
+        self.start()
+    }
+
+    /// Resize the replay window (video + audio) to `capacity_seconds`,
+    /// evicting immediately when shrinking. Capture keeps running.
+    pub fn set_capacity_seconds(&mut self, capacity_seconds: u32) {
+        self.ring.set_capacity_seconds(capacity_seconds);
+        self.audio_ring.set_capacity_seconds(capacity_seconds);
+    }
+
+    /// Place a marker at the newest buffered frame. Returns `false` (and
+    /// records nothing) when the buffer is empty — there is nothing to mark.
+    /// Markers within a later save's window become MKV chapters.
+    pub fn mark(&mut self) -> bool {
+        match self.ring.newest_pts() {
+            Some(pts) => {
+                self.markers.push(pts);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Markers currently inside the buffered window (diagnostic).
+    pub fn marker_count(&self) -> usize {
+        self.markers.len()
+    }
+
+    /// Drop markers that have been evicted out of the buffered window.
+    fn prune_markers(&mut self) {
+        let oldest = self.ring.oldest_pts().unwrap_or(i64::MAX);
+        self.markers.retain(|&m| m >= oldest);
+    }
+
     /// Pull all currently-available video+audio frames from the backend into the
     /// ring buffers. Returns how many video frames were ingested. Non-blocking.
     pub fn drain_available(&mut self) -> usize {
@@ -158,6 +207,9 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
             }
             self.ring.push(frame);
         }
+        if n > 0 && !self.markers.is_empty() {
+            self.prune_markers();
+        }
         n
     }
 
@@ -183,11 +235,21 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
         let end_us = crate::ticks_to_micros(selection.end_pts, den);
         let audio = self.audio_ring.select_window(start_us, end_us);
 
+        // Markers inside the clip window, rebased to milliseconds from the
+        // clip start (the muxer's chapter time base).
+        let chapters: Vec<i64> = self
+            .markers
+            .iter()
+            .filter(|&&m| m >= selection.start_pts && m <= selection.end_pts)
+            .map(|&m| (m - selection.start_pts) * 1000 / den.max(1))
+            .collect();
+
         Ok(PreparedClip {
             frames,
             audio,
             params: self.backend.params(),
             audio_params: self.backend.audio_params(),
+            chapters,
         })
     }
 
@@ -212,10 +274,11 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
         self.backend.is_running()
     }
 
-    /// Drop all buffered frames (video + audio).
+    /// Drop all buffered frames (video + audio) and any markers.
     pub fn clear(&mut self) {
         self.ring.clear();
         self.audio_ring.clear();
+        self.markers.clear();
     }
 }
 
@@ -288,6 +351,70 @@ mod tests {
         let a = eng.take_clip(cd(2)).unwrap();
         let b = eng.take_clip(cd(2)).unwrap();
         assert_eq!(a, b); // replay buffer intact across saves
+    }
+
+    #[test]
+    fn mark_lands_as_chapter_in_clip() {
+        // 60fps, 600 frames = 10s, keyframe every second.
+        let mut eng = Engine::new(MockBackend::new(60, 600, 60), 60);
+        eng.start().unwrap();
+        eng.drain_available();
+        assert!(eng.mark()); // marker at newest pts (~9.98s)
+        let clip = eng.take_clip(cd(3)).unwrap();
+        assert_eq!(clip.chapters.len(), 1);
+        // Chapter is inside the clip and near its end (clip covers >= last 3s).
+        let span_ms = clip.span_ticks() * 1000 / clip.params.time_base_den;
+        assert!(clip.chapters[0] <= span_ms);
+        assert!(clip.chapters[0] >= span_ms - 1000, "{:?}", clip.chapters);
+    }
+
+    #[test]
+    fn mark_on_empty_buffer_is_rejected() {
+        let mut eng = Engine::new(MockBackend::new(60, 0, 1), 60);
+        assert!(!eng.mark());
+        assert_eq!(eng.marker_count(), 0);
+    }
+
+    #[test]
+    fn markers_outside_window_are_excluded() {
+        let mut eng = Engine::new(MockBackend::new(60, 600, 60), 60);
+        eng.start().unwrap();
+        // Drain in two stages: mark after the first half only.
+        eng.drain_available();
+        // Marker at 10s-end; ask for a clip of the last 2s -> marker at end is in.
+        eng.mark();
+        let clip = eng.take_clip(cd(2)).unwrap();
+        assert_eq!(clip.chapters.len(), 1);
+        // Clear wipes markers with the buffer.
+        eng.clear();
+        assert_eq!(eng.marker_count(), 0);
+    }
+
+    #[test]
+    fn capacity_resize_evicts_immediately() {
+        // 10s of footage in a 60s ring, then shrink to 3s.
+        let mut eng = Engine::new(MockBackend::new(60, 600, 60), 60);
+        eng.start().unwrap();
+        eng.drain_available();
+        assert!(eng.buffered_seconds() >= 9);
+        eng.set_capacity_seconds(3);
+        assert!(eng.buffered_seconds() <= 3, "{}", eng.buffered_seconds());
+        assert_eq!(eng.capacity_seconds(), 3);
+    }
+
+    #[test]
+    fn restart_recovers_capture() {
+        let mut eng = Engine::new(MockBackend::new(60, 120, 60), 60);
+        eng.start().unwrap();
+        eng.drain_available();
+        eng.restart().unwrap();
+        assert!(eng.is_running());
+        // The restarted mock emits a fresh batch of frames.
+        assert_eq!(eng.drain_available(), 120);
+        // Restarting from stopped also works (stop is tolerated).
+        eng.stop().unwrap();
+        eng.restart().unwrap();
+        assert!(eng.is_running());
     }
 
     #[test]

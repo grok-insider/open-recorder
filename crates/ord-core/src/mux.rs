@@ -115,6 +115,10 @@ pub fn write_clip(clip: &PreparedClip, path: impl AsRef<Path>) -> Result<(), Mux
         Some(ap) if clip.has_audio() => Some(stream::add_audio_stream(&mut octx, ap)?),
         _ => None,
     };
+    if !clip.chapters.is_empty() {
+        let end_ms = clip.span_ticks() * 1000 / clip.params.time_base_den.max(1);
+        stream::set_chapters(&mut octx, &clip.chapters, end_ms)?;
+    }
 
     octx.write_header()?;
 
@@ -222,6 +226,56 @@ pub fn write_clip(_clip: &PreparedClip, _path: impl AsRef<Path>) -> Result<(), M
     ))
 }
 
+/// What a quick post-save verification found in the written file.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClipCheck {
+    /// Container duration in milliseconds (0 when the container reports none).
+    pub duration_ms: i64,
+    pub has_video: bool,
+    pub has_audio: bool,
+}
+
+/// Open a just-written clip and confirm it is a readable container with a
+/// video stream and a positive duration. Runs in-process (no ffprobe child)
+/// and reads only headers, so it adds ~ms to the save path — cheap insurance
+/// against the classic "Saving… produced an empty file" failure mode.
+#[cfg(feature = "mux")]
+pub fn verify_clip(path: impl AsRef<Path>) -> Result<ClipCheck, MuxError> {
+    use ffmpeg_next::media::Type;
+    ffmpeg_next::init()?;
+    let ictx = ffmpeg_next::format::input(&path.as_ref())?;
+    let has_video = ictx.streams().best(Type::Video).is_some();
+    let has_audio = ictx.streams().best(Type::Audio).is_some();
+    let duration_ms = if ictx.duration() > 0 {
+        // AVFormatContext duration is in AV_TIME_BASE (microseconds).
+        ictx.duration() / 1000
+    } else {
+        0
+    };
+    if !has_video {
+        return Err(MuxError::Ffmpeg("written clip has no video stream".into()));
+    }
+    if duration_ms <= 0 {
+        return Err(MuxError::Ffmpeg("written clip has zero duration".into()));
+    }
+    Ok(ClipCheck {
+        duration_ms,
+        has_video,
+        has_audio,
+    })
+}
+
+/// Stub used when the `mux` feature is disabled: verification is skipped (the
+/// stub writer never produces files to verify anyway).
+#[cfg(not(feature = "mux"))]
+pub fn verify_clip(_path: impl AsRef<Path>) -> Result<ClipCheck, MuxError> {
+    Ok(ClipCheck {
+        duration_ms: 0,
+        has_video: true,
+        has_audio: true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +293,7 @@ mod tests {
                 time_base_den: crate::MICROS_PER_SEC,
             },
             audio_params: None,
+            chapters: vec![],
         }
     }
 

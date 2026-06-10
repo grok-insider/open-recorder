@@ -27,7 +27,7 @@ pub use audio::{AudioCodec, AudioParams, AudioRingBuffer, EncodedAudioFrame};
 pub use backend::{BackendError, CaptureBackend, CaptureStreams, Codec, MockBackend, StreamParams};
 pub use clip::{select_clip, ClipError, ClipSelection};
 pub use engine::{Engine, PreparedClip};
-pub use mux::{write_clip, MuxError};
+pub use mux::{verify_clip, write_clip, ClipCheck, MuxError};
 pub use record::Recorder;
 pub use ring::{EncodedFrame, RingBuffer};
 pub use store::{FrameMeta, FrameStore};

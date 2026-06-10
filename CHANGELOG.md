@@ -8,6 +8,55 @@ All notable changes to open-recorder are recorded here. The format follows
 
 ### Features
 
+- **Reliability watchdog.** If the buffer is armed but no frames arrive for
+  5 s (suspend/resume kills NVENC; output changes end the portal session),
+  `ordd` restarts the capture session and announces it (`CaptureRestarted`
+  toast). Every saved clip is **verified in-process** (readable container,
+  video stream, positive duration) before the daemon reports success — the
+  "silently stopped recording" / "Saving… produced an empty file" failure
+  modes that plague ShadowPlay/ReLive are now detected the moment they happen.
+  The HUD also shows a distinct grey dot while the daemon is unreachable.
+- **In-app settings.** A full Settings page in `ord-ui` edits the daemon
+  configuration over IPC (`GetConfig`/`SetConfig`): capture (fps, buffer,
+  quality, codec, CBR, clear-on-save), audio, storage, markers, hooks, and
+  export defaults. Changes are layered as **runtime overrides**
+  (`$XDG_STATE_HOME/open-recorder/overrides.toml`) merged over the base
+  `config.toml` — a read-only Home Manager base keeps working, overridden
+  fields are marked, and "Reset to base" drops them. Live-tier fields apply
+  instantly; encoder fields apply via an explicit "Apply (restarts capture)".
+  `ord config show` prints the effective config.
+- **Markers ("clip that").** `ord mark` (bind it next to save) bookmarks the
+  current moment; markers inside a later save become **MKV chapters**
+  (ffprobe/players/editors show them), and `markers.auto_save_seconds` turns a
+  mark into bookmark+clip in one keypress. Markers survive in the file — not
+  in a sidecar that desyncs (the Steam-markers complaint).
+- **Daemon controls in the library header**: arm/disarm the buffer, Save last
+  15/30/60/120 s, and toggle recording — one click each, no keybind needed.
+- **Storage policy.** `storage.clips_dir`, filename templates
+  (`{game}{rec}-{epoch}`, `{date}/{time}` tokens, `/` creates subfolders →
+  date folders), and **auto-prune** by total size (`max_gib`) and/or age
+  (`max_age_days`) — exports are never touched. `capture.clear_on_save`
+  drops the buffer after each save (no overlapping clips).
+- **Copy as file** on every clip card (`wl-copy text/uri-list`) — paste a clip
+  straight into Discord. **Vertical 9:16 export preset** (center-crop +
+  1080×1920 H.264) for Shorts/TikTok/Reels.
+
+### UI
+
+- **Full visual revamp** on a new design system (`ord-ui/src/theme.rs`):
+  Japanese-corporate minimalism — sumi ink-grey scale with hairline borders
+  and small radii (no shadows, no bubbles), one vermilion accent reserved for
+  record/danger/brand, muted matcha/kin functional colors, an 8-pt spacing
+  rhythm and a strict type scale. Library cards, header (brand mark + live
+  daemon badge + controls), status bar, editor timeline, and the new settings
+  page all draw from the same tokens.
+
+### Protocol
+
+- IPC protocol v2: `GetConfig`, `SetConfig`, `Mark` commands; `Config`,
+  `Marked`, `CaptureRestarted` events. Old `ord`/`ordd` pairs fail loudly with
+  a version mismatch instead of mis-decoding.
+
 - **HEVC/AV1 capture + CBR.** `capture.codec = "h264"|"hevc"|"av1"` and
   `capture.bitrate_kbps` (CBR) in `config.toml`, working end-to-end: the
   `0xfell/waycap-rs` fork now exposes `hevc_nvenc`/`av1_nvenc` and a

@@ -21,6 +21,8 @@ use crate::editor::{EditorAction, EditorState};
 use crate::format::{human_duration, human_size, relative_time, resolution};
 use crate::library::{filter_sort, scan_dir, Clip, SortOrder};
 use crate::meta::{self, ClipMeta};
+use crate::settings_view::{SettingsAction, SettingsView};
+use crate::theme;
 
 const CARD_INNER_W: f32 = 300.0;
 const THUMB_W: f32 = 300.0;
@@ -100,6 +102,11 @@ pub struct LibraryApp {
     daemon_rx: Receiver<Option<DaemonInfo>>,
     daemon_tx: Sender<Option<DaemonInfo>>,
     daemon_poll_started: bool,
+    /// Replies from one-shot daemon commands (save/record/buffer/config).
+    ctl_rx: Receiver<Result<Event, String>>,
+    ctl_tx: Sender<Result<Event, String>>,
+    /// When `Some`, the settings page is shown instead of the library grid.
+    settings: Option<SettingsView>,
 }
 
 impl LibraryApp {
@@ -109,6 +116,7 @@ impl LibraryApp {
         let (loader_tx, loader_rx) = channel();
         let (export_tx, export_rx) = channel();
         let (daemon_tx, daemon_rx) = channel();
+        let (ctl_tx, ctl_rx) = channel();
         Self {
             clips_dir,
             clips,
@@ -133,6 +141,84 @@ impl LibraryApp {
             daemon_rx,
             daemon_tx,
             daemon_poll_started: false,
+            ctl_rx,
+            ctl_tx,
+            settings: None,
+        }
+    }
+
+    /// Fire one daemon command on a worker thread; the reply (or the connect
+    /// error) lands in the control channel and is routed on the next repaint.
+    fn send_ctl(&self, cmd: Command, ctx: &egui::Context) {
+        let tx = self.ctl_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = ord_common::connect(ord_common::socket_path())
+                .map_err(|e| e.to_string())
+                .and_then(|mut c| c.request(&cmd).map_err(|e| e.to_string()));
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Route replies from one-shot daemon commands: config snapshots feed the
+    /// settings page, state changes become status-bar text.
+    fn drain_ctl(&mut self, ctx: &egui::Context) {
+        while let Ok(reply) = self.ctl_rx.try_recv() {
+            match reply {
+                Ok(Event::Config { effective, base }) => {
+                    if let Some(s) = self.settings.as_mut() {
+                        s.on_config(*effective, *base);
+                    }
+                }
+                Ok(Event::ClipSaved { path, duration }) => {
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or(path);
+                    self.set_status(format!("Saved {}s → {name}", duration.get()));
+                    self.refresh(ctx);
+                }
+                Ok(Event::BufferState { enabled }) => {
+                    if let Some(d) = self.daemon.as_mut() {
+                        d.buffer_enabled = enabled;
+                    }
+                    self.set_status(if enabled {
+                        "Replay buffer armed"
+                    } else {
+                        "Replay buffer off"
+                    });
+                }
+                Ok(Event::RecordState { recording }) => {
+                    if let Some(d) = self.daemon.as_mut() {
+                        d.recording = recording;
+                    }
+                    self.set_status(if recording {
+                        "Recording started"
+                    } else {
+                        "Recording stopped"
+                    });
+                }
+                Ok(Event::Error { message }) => {
+                    if let Some(s) = self.settings.as_mut() {
+                        if s.busy {
+                            s.on_error(message);
+                            continue;
+                        }
+                    }
+                    self.set_status(format!("Daemon: {message}"));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if let Some(s) = self.settings.as_mut() {
+                        if s.busy || s.model.is_none() {
+                            s.on_error(e);
+                            continue;
+                        }
+                    }
+                    self.set_status(format!("Daemon unreachable: {e}"));
+                }
+            }
         }
     }
 
@@ -352,27 +438,15 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-/// Dark theme with a violet accent, generous spacing and rounded widgets.
-fn apply_theme(ctx: &egui::Context) {
-    use egui::Color32;
-    let accent = Color32::from_rgb(124, 92, 255);
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = Color32::from_rgb(16, 16, 20);
-    v.window_fill = Color32::from_rgb(22, 22, 28);
-    v.extreme_bg_color = Color32::from_rgb(12, 12, 15);
-    v.override_text_color = Some(Color32::from_rgb(228, 228, 235));
-    v.hyperlink_color = accent;
-    v.selection.bg_fill = accent.linear_multiply(0.5);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(44, 44, 56);
-    v.widgets.active.bg_fill = accent.linear_multiply(0.7);
-    v.widgets.inactive.bg_fill = Color32::from_rgb(34, 34, 42);
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(30, 30, 38);
-    ctx.set_visuals(v);
-
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    ctx.set_style(style);
+/// Copy a clip onto the Wayland clipboard as a file (`text/uri-list` via
+/// `wl-copy`), so it can be pasted straight into Discord/Slack/a file manager.
+fn copy_clip_to_clipboard(path: &Path) -> bool {
+    let uri = format!("file://{}", path.display());
+    std::process::Command::new("wl-copy")
+        .args(["-t", "text/uri-list"])
+        .arg(&uri)
+        .spawn()
+        .is_ok()
 }
 
 impl eframe::App for LibraryApp {
@@ -380,10 +454,11 @@ impl eframe::App for LibraryApp {
         self.watchdog.beat("update");
         if !self.styled {
             crate::fonts::install(ctx);
-            apply_theme(ctx);
+            theme::apply(ctx);
             self.styled = true;
         }
         self.drain_channels(ctx);
+        self.drain_ctl(ctx);
 
         // Pause + idle when our window isn't focused (e.g. its Hyprland special
         // workspace was toggled away). Pausing stops audio playing into a hidden
@@ -421,6 +496,20 @@ impl eframe::App for LibraryApp {
             }
         }
 
+        // Settings page takes over the whole window when open.
+        if let Some(mut view) = self.settings.take() {
+            self.watchdog.beat("settings");
+            match view.ui(ctx) {
+                SettingsAction::Back => {} // dropped
+                SettingsAction::None => self.settings = Some(view),
+                SettingsAction::Apply(config) => {
+                    self.send_ctl(Command::SetConfig { config }, ctx);
+                    self.settings = Some(view);
+                }
+            }
+            return;
+        }
+
         // Trim editor takes over the whole window when open.
         if let Some(ed) = self.editor.as_mut() {
             self.watchdog.beat("editor");
@@ -454,61 +543,69 @@ impl eframe::App for LibraryApp {
             .filter_map(|s| s.meta.as_ref().map(|m| m.size_bytes))
             .sum();
 
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.heading("open-recorder");
-                self.daemon_badge(ui);
-                ui.add_space(8.0);
+        egui::TopBottomPanel::top("top")
+            .frame(theme::chrome())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    theme::brand(ui);
+                    ui.add_space(theme::SP_2);
+                    self.daemon_badge(ui);
+                    ui.add_space(theme::SP_3);
 
-                // Search-as-you-type over clip names; Esc clears.
-                let search = egui::TextEdit::singleline(&mut self.query)
-                    .hint_text("Search clips…")
-                    .desired_width(200.0);
-                let resp = ui.add(search);
-                if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.query.clear();
-                }
-                if !self.query.is_empty() && ui.small_button("✕").clicked() {
-                    self.query.clear();
-                }
-
-                egui::ComboBox::from_id_salt("sort")
-                    .selected_text(self.sort.label())
-                    .width(90.0)
-                    .show_ui(ui, |ui| {
-                        for order in SortOrder::ALL {
-                            ui.selectable_value(&mut self.sort, order, order.label());
-                        }
-                    });
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Refresh").clicked() {
-                        self.refresh(ctx);
+                    // Search-as-you-type over clip names; Esc clears.
+                    let search = egui::TextEdit::singleline(&mut self.query)
+                        .hint_text("Search clips…")
+                        .desired_width(180.0);
+                    let resp = ui.add(search);
+                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                        self.query.clear();
                     }
-                    let summary = if total_size > 0 {
-                        format!("{} clips · {}", self.clips.len(), human_size(total_size))
-                    } else {
-                        format!("{} clips", self.clips.len())
-                    };
-                    ui.label(egui::RichText::new(summary).color(ui.visuals().weak_text_color()));
+                    if !self.query.is_empty() && ui.small_button("✕").clicked() {
+                        self.query.clear();
+                    }
+
+                    egui::ComboBox::from_id_salt("sort")
+                        .selected_text(self.sort.label())
+                        .width(90.0)
+                        .show_ui(ui, |ui| {
+                            for order in SortOrder::ALL {
+                                ui.selectable_value(&mut self.sort, order, order.label());
+                            }
+                        });
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("Settings")
+                            .on_hover_text("Daemon configuration (applies live)")
+                            .clicked()
+                        {
+                            self.settings = Some(SettingsView::new());
+                            self.send_ctl(Command::GetConfig, ctx);
+                        }
+                        ui.add_space(theme::SP_1);
+                        self.daemon_controls(ui, ctx);
+                        ui.add_space(theme::SP_2);
+                        let summary = if total_size > 0 {
+                            format!("{} clips · {}", self.clips.len(), human_size(total_size))
+                        } else {
+                            format!("{} clips", self.clips.len())
+                        };
+                        ui.label(
+                            egui::RichText::new(summary)
+                                .size(theme::TEXT_LABEL)
+                                .color(theme::INK_3),
+                        );
+                    });
                 });
             });
-            ui.add_space(6.0);
-        });
 
         if let Some((msg, at)) = self.status.clone() {
             if at.elapsed() < Duration::from_secs(6) {
-                egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("•").color(egui::Color32::from_rgb(124, 92, 255)),
-                        );
-                        ui.label(msg);
+                egui::TopBottomPanel::bottom("status")
+                    .frame(theme::chrome())
+                    .show(ctx, |ui| {
+                        theme::status_dot(ui, theme::AI, &msg, "");
                     });
-                    ui.add_space(4.0);
-                });
                 if focused {
                     ctx.request_repaint_after(Duration::from_millis(500));
                 }
@@ -524,14 +621,20 @@ impl eframe::App for LibraryApp {
             .show(ctx, |ui| {
                 if self.clips.is_empty() {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
-                        ui.label(egui::RichText::new("No clips yet").size(20.0).strong());
-                        ui.add_space(6.0);
+                        ui.add_space(96.0);
+                        ui.label(
+                            egui::RichText::new("No clips yet")
+                                .size(theme::TEXT_TITLE)
+                                .strong()
+                                .color(theme::INK),
+                        );
+                        ui.add_space(theme::SP_2);
                         ui.label(
                             egui::RichText::new(
                                 "Press ALT+R in a game to save the last 30 seconds.",
                             )
-                            .color(ui.visuals().weak_text_color()),
+                            .size(theme::TEXT_BODY)
+                            .color(theme::INK_2),
                         );
                     });
                     return;
@@ -542,10 +645,11 @@ impl eframe::App for LibraryApp {
                 let clips = filter_sort(&self.clips, &self.query, self.sort);
                 if clips.is_empty() {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(80.0);
+                        ui.add_space(96.0);
                         ui.label(
                             egui::RichText::new(format!("No clips match “{}”", self.query))
-                                .size(16.0),
+                                .size(theme::TEXT_BODY)
+                                .color(theme::INK_2),
                         );
                     });
                     return;
@@ -565,87 +669,139 @@ impl eframe::App for LibraryApp {
 }
 
 impl LibraryApp {
-    /// Live daemon state in the header: buffer armed (green) / recording (red) /
-    /// buffer off (grey) / daemon unreachable (dim).
+    /// Live daemon state in the header: buffer armed (matcha) / recording
+    /// (shu) / buffer off (grey) / daemon unreachable (dim).
     fn daemon_badge(&self, ui: &mut egui::Ui) {
         let (dot, text, hover) = match self.daemon {
             Some(d) if d.recording => (
-                egui::Color32::from_rgb(248, 81, 73),
+                theme::SHU,
                 "recording".to_string(),
                 "ordd is writing a full-length recording".to_string(),
             ),
             Some(d) if d.buffer_enabled => (
-                egui::Color32::from_rgb(63, 185, 80),
+                theme::OK,
                 format!("buffer {}s", d.buffered_seconds),
                 "Replay buffer armed — seconds currently held in RAM".to_string(),
             ),
             Some(_) => (
-                egui::Color32::GRAY,
+                theme::INK_3,
                 "buffer off".to_string(),
                 "ordd is running but the replay buffer is disabled".to_string(),
             ),
             None => (
-                egui::Color32::from_rgb(90, 90, 104),
+                theme::INK_3,
                 "daemon offline".to_string(),
                 "Cannot reach ordd on its control socket".to_string(),
             ),
         };
-        ui.label(egui::RichText::new("●").color(dot).size(11.0))
-            .on_hover_text(hover.clone());
-        ui.label(
-            egui::RichText::new(text)
-                .color(ui.visuals().weak_text_color())
-                .size(12.5),
-        )
-        .on_hover_text(hover);
+        theme::status_dot(ui, dot, &text, &hover);
+    }
+
+    /// One-click daemon actions in the header (right-to-left layout): buffer
+    /// toggle, Save ▾ (15/30/60 s — the "multiple buffer lengths" everyone
+    /// asks OBS for), record toggle. Hidden while the daemon is unreachable.
+    fn daemon_controls(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(d) = self.daemon else { return };
+
+        let rec_label = if d.recording {
+            "■ Stop rec"
+        } else {
+            "● Record"
+        };
+        let rec = if d.recording {
+            theme::danger_button(ui, rec_label)
+        } else {
+            ui.button(rec_label)
+        };
+        if rec
+            .on_hover_text("Toggle a full-length recording (separate from the replay buffer)")
+            .clicked()
+        {
+            self.send_ctl(Command::ToggleRecord, ctx);
+        }
+
+        if d.buffer_enabled {
+            ui.menu_button("Save ▾", |ui| {
+                for secs in [15u32, 30, 60, 120] {
+                    if ui.button(format!("Last {secs} s")).clicked() {
+                        if let Some(duration) = ord_common::ClipDuration::new(secs) {
+                            self.send_ctl(Command::SaveLast { duration }, ctx);
+                        }
+                        ui.close_menu();
+                    }
+                }
+            });
+        }
+
+        let buf_label = if d.buffer_enabled {
+            "Buffer: on"
+        } else {
+            "Buffer: off"
+        };
+        if ui
+            .button(buf_label)
+            .on_hover_text("Enable/disable the always-on replay buffer")
+            .clicked()
+        {
+            self.send_ctl(
+                Command::SetBuffer {
+                    enabled: !d.buffer_enabled,
+                },
+                ctx,
+            );
+        }
     }
 
     fn card(&mut self, ui: &mut egui::Ui, clip: &Clip, now: u64, ctx: &egui::Context) {
-        let border = egui::Color32::from_rgb(48, 48, 60);
-        egui::Frame::none()
-            .fill(egui::Color32::from_rgb(26, 26, 33))
-            .stroke(egui::Stroke::new(1.0, border))
-            .rounding(12.0)
-            .inner_margin(egui::Margin::same(10.0))
-            .show(ui, |ui| {
-                ui.set_width(CARD_INNER_W);
-                ui.vertical(|ui| {
-                    if self.thumbnail(ui, clip) {
-                        self.open_editor(clip, ctx);
-                    }
-                    ui.add_space(8.0);
+        theme::card().show(ui, |ui| {
+            ui.set_width(CARD_INNER_W);
+            ui.vertical(|ui| {
+                if self.thumbnail(ui, clip) {
+                    self.open_editor(clip, ctx);
+                }
+                ui.add_space(theme::SP_2);
 
-                    ui.label(egui::RichText::new(clip.label()).strong().size(15.0));
-
-                    // Metadata line.
-                    let st = self.states.get(&clip.path);
-                    let meta_line = match st.and_then(|s| s.meta.as_ref()) {
-                        Some(m) => format!(
-                            "{} · {} · {}",
-                            human_duration(m.duration_secs),
-                            resolution(m.width, m.height),
-                            human_size(m.size_bytes),
-                        ),
-                        None if st.map(|s| s.meta_loaded).unwrap_or(false) => "—".to_string(),
-                        None => "loading".to_string(),
-                    };
+                // Title row: name left, relative age right (one line of *ma*
+                // instead of two stacked metadata lines).
+                ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(meta_line)
-                            .color(ui.visuals().weak_text_color())
-                            .size(12.5),
+                        egui::RichText::new(clip.label())
+                            .strong()
+                            .size(14.5)
+                            .color(theme::INK),
                     );
                     if let Some(epoch) = clip.epoch {
-                        ui.label(
-                            egui::RichText::new(relative_time(epoch, now))
-                                .color(ui.visuals().weak_text_color())
-                                .size(12.5),
-                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                egui::RichText::new(relative_time(epoch, now))
+                                    .color(theme::INK_3)
+                                    .size(theme::TEXT_MICRO),
+                            );
+                        });
                     }
-
-                    ui.add_space(8.0);
-                    self.actions(ui, clip, ctx);
                 });
+
+                let st = self.states.get(&clip.path);
+                let meta_line = match st.and_then(|s| s.meta.as_ref()) {
+                    Some(m) => format!(
+                        "{}   ·   {}   ·   {}",
+                        human_duration(m.duration_secs),
+                        resolution(m.width, m.height),
+                        human_size(m.size_bytes),
+                    ),
+                    None if st.map(|s| s.meta_loaded).unwrap_or(false) => "—".to_string(),
+                    None => "loading…".to_string(),
+                };
+                ui.label(
+                    egui::RichText::new(meta_line)
+                        .color(theme::INK_2)
+                        .size(theme::TEXT_LABEL),
+                );
+
+                ui.add_space(theme::SP_2);
+                self.actions(ui, clip, ctx);
             });
+        });
     }
 
     /// Render the thumbnail; returns true if it was clicked (opens the editor).
@@ -664,13 +820,13 @@ impl LibraryApp {
             None => {
                 let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                 ui.painter()
-                    .rect_filled(rect, 8.0, egui::Color32::from_rgb(18, 18, 23));
+                    .rect_filled(rect, theme::RADIUS, egui::Color32::from_rgb(10, 11, 13));
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     "▶",
-                    egui::FontId::proportional(28.0),
-                    egui::Color32::from_rgb(70, 70, 86),
+                    egui::FontId::proportional(26.0),
+                    theme::INK_3,
                 );
                 resp.on_hover_text("Edit / trim").clicked()
             }
@@ -685,9 +841,33 @@ impl LibraryApp {
     }
 
     fn actions(&mut self, ui: &mut egui::Ui, clip: &Clip, ctx: &egui::Context) {
-        // Row 1: primary actions.
+        // One quiet row: primary actions inline, the rest behind "⋯". A delete
+        // confirmation temporarily replaces the row (no accidental deletes,
+        // no modal).
+        let confirming = self.confirm_delete.as_deref() == Some(clip.path.as_path());
+        if confirming {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Delete this clip?")
+                        .size(theme::TEXT_LABEL)
+                        .color(theme::INK_2),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::danger_button(ui, "Delete").clicked() {
+                        let path = clip.path.clone();
+                        self.confirm_delete = None;
+                        self.delete_clip(&path, ctx);
+                    }
+                    if ui.button("Keep").clicked() {
+                        self.confirm_delete = None;
+                    }
+                });
+            });
+            return;
+        }
+
         ui.horizontal(|ui| {
-            if ui.button("▶  Open").clicked() {
+            if ui.button("Open").clicked() {
                 open_clip(&clip.path);
             }
             if ui.button("Edit").clicked() {
@@ -699,7 +879,11 @@ impl LibraryApp {
                 .get(&clip.path)
                 .map(|j| (*lock_tolerant(&j.progress), Arc::clone(&j.cancel)));
             if let Some((prog, cancel)) = job {
-                ui.label(format!("Exporting… {}%", (prog * 100.0) as u32));
+                ui.label(
+                    egui::RichText::new(format!("Exporting… {}%", (prog * 100.0) as u32))
+                        .size(theme::TEXT_LABEL)
+                        .color(theme::AI),
+                );
                 if ui.button("Cancel").clicked() {
                     cancel.store(true, Ordering::Relaxed);
                 }
@@ -713,36 +897,35 @@ impl LibraryApp {
                     }
                 });
             }
-        });
 
-        ui.add_space(4.0);
-
-        // Row 2: secondary actions.
-        ui.horizontal(|ui| {
-            if ui
-                .button("Reveal")
-                .on_hover_text("Show in file manager")
-                .clicked()
-            {
-                reveal(&clip.path);
-            }
-            let confirming = self.confirm_delete.as_deref() == Some(clip.path.as_path());
-            if confirming {
-                let danger = egui::Color32::from_rgb(255, 110, 110);
-                if ui
-                    .button(egui::RichText::new("Confirm delete").color(danger))
-                    .clicked()
-                {
-                    let path = clip.path.clone();
-                    self.confirm_delete = None;
-                    self.delete_clip(&path, ctx);
-                }
-                if ui.button("Cancel").clicked() {
-                    self.confirm_delete = None;
-                }
-            } else if ui.button("Delete").clicked() {
-                self.confirm_delete = Some(clip.path.clone());
-            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button("⋯", |ui| {
+                    if ui
+                        .button("Copy as file")
+                        .on_hover_text("Clipboard as text/uri-list — paste into Discord")
+                        .clicked()
+                    {
+                        if copy_clip_to_clipboard(&clip.path) {
+                            self.set_status("Copied — paste into Discord/your chat");
+                        } else {
+                            self.set_status("wl-copy not found; cannot copy");
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Reveal in file manager").clicked() {
+                        reveal(&clip.path);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .button(egui::RichText::new("Delete…").color(theme::SHU))
+                        .clicked()
+                    {
+                        self.confirm_delete = Some(clip.path.clone());
+                        ui.close_menu();
+                    }
+                });
+            });
         });
     }
 }
