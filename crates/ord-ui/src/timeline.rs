@@ -78,6 +78,147 @@ impl Timeline {
     }
 }
 
+/// Smallest piece a split may produce (avoids degenerate slivers).
+const MIN_SEG: f64 = 0.05;
+
+/// One contiguous piece of the clip between cut points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Segment {
+    pub start: f64,
+    pub end: f64,
+    /// Disabled segments are skipped during playback and dropped on export.
+    pub enabled: bool,
+}
+
+/// A multi-segment cut list over a clip: split at the playhead, toggle pieces
+/// off, and the kept pieces play (and export) joined back together. Pure —
+/// the editor view renders and drives it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Segments {
+    duration: f64,
+    segs: Vec<Segment>,
+}
+
+impl Segments {
+    /// One enabled segment covering the whole clip.
+    pub fn new(duration: f64) -> Self {
+        let d = if duration.is_finite() && duration > 0.0 {
+            duration
+        } else {
+            0.0
+        };
+        Self {
+            duration: d,
+            segs: vec![Segment {
+                start: 0.0,
+                end: d,
+                enabled: true,
+            }],
+        }
+    }
+
+    pub fn segments(&self) -> &[Segment] {
+        &self.segs
+    }
+
+    /// No cuts and nothing disabled — playback/export can ignore the model.
+    pub fn is_trivial(&self) -> bool {
+        self.segs.len() == 1 && self.segs[0].enabled
+    }
+
+    /// Interior cut boundaries (for drawing).
+    pub fn cuts(&self) -> impl Iterator<Item = f64> + '_ {
+        self.segs.iter().skip(1).map(|s| s.start)
+    }
+
+    /// Index of the segment containing `t`.
+    pub fn index_at(&self, t: f64) -> Option<usize> {
+        if self.segs.is_empty() || t < 0.0 || t > self.duration {
+            return None;
+        }
+        match self.segs.iter().position(|s| t < s.end) {
+            Some(i) => Some(i),
+            None => Some(self.segs.len() - 1), // t == duration
+        }
+    }
+
+    /// Split the segment containing `t` in two. No-op too close to an edge.
+    pub fn split_at(&mut self, t: f64) -> bool {
+        let Some(i) = self.index_at(t) else {
+            return false;
+        };
+        let seg = self.segs[i];
+        if t - seg.start < MIN_SEG || seg.end - t < MIN_SEG {
+            return false;
+        }
+        self.segs[i].end = t;
+        self.segs.insert(
+            i + 1,
+            Segment {
+                start: t,
+                end: seg.end,
+                enabled: seg.enabled,
+            },
+        );
+        true
+    }
+
+    /// Toggle the segment containing `t` between kept and cut.
+    pub fn toggle_at(&mut self, t: f64) -> bool {
+        let Some(i) = self.index_at(t) else {
+            return false;
+        };
+        self.segs[i].enabled = !self.segs[i].enabled;
+        true
+    }
+
+    /// Drop every cut, back to one enabled full-clip segment.
+    pub fn reset(&mut self) {
+        *self = Self::new(self.duration);
+    }
+
+    /// The kept spans intersected with `[in_p, out_p]`, adjacent spans merged —
+    /// exactly what plays and what an export concatenates.
+    pub fn kept_within(&self, in_p: f64, out_p: f64) -> Vec<(f64, f64)> {
+        let mut out: Vec<(f64, f64)> = Vec::new();
+        for s in self.segs.iter().filter(|s| s.enabled) {
+            let a = s.start.max(in_p);
+            let b = s.end.min(out_p);
+            if b - a <= MIN_SEG / 2.0 {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if (a - last.1).abs() < 1e-9 => last.1 = b,
+                _ => out.push((a, b)),
+            }
+        }
+        out
+    }
+
+    /// Total kept duration within `[in_p, out_p]`.
+    pub fn kept_duration(&self, in_p: f64, out_p: f64) -> f64 {
+        self.kept_within(in_p, out_p)
+            .iter()
+            .map(|(a, b)| b - a)
+            .sum()
+    }
+
+    /// Where playback should jump when the playhead sits in a cut segment:
+    /// the start of the next kept segment, or `out_p` when nothing kept
+    /// remains (the caller then stops/loops). `None` = no skip needed.
+    pub fn skip_target(&self, t: f64, out_p: f64) -> Option<f64> {
+        let i = self.index_at(t)?;
+        if self.segs[i].enabled {
+            return None;
+        }
+        let next = self.segs[i + 1..]
+            .iter()
+            .find(|s| s.enabled && s.end > t)
+            .map(|s| s.start.max(t));
+        Some(next.unwrap_or(out_p).min(out_p))
+    }
+}
+
 /// A zoom/scroll window over the clip, mapping time <-> on-track fraction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct View {
@@ -178,5 +319,69 @@ mod tests {
         let mut t = Timeline::new(10.0);
         t.set_in(2.0);
         assert!(!t.is_full());
+    }
+
+    #[test]
+    fn segments_start_trivial_and_split() {
+        let mut s = Segments::new(10.0);
+        assert!(s.is_trivial());
+        assert!(s.split_at(4.0));
+        assert!(!s.is_trivial());
+        assert_eq!(s.segments().len(), 2);
+        assert!(approx(s.segments()[0].end, 4.0));
+        assert!(approx(s.segments()[1].start, 4.0));
+        assert_eq!(s.cuts().collect::<Vec<_>>(), vec![4.0]);
+        // Splitting on (or too near) an existing edge is a no-op.
+        assert!(!s.split_at(4.0));
+        assert!(!s.split_at(0.01));
+        assert!(!s.split_at(9.99));
+        assert_eq!(s.segments().len(), 2);
+    }
+
+    #[test]
+    fn segments_toggle_and_kept_spans() {
+        let mut s = Segments::new(10.0);
+        s.split_at(3.0);
+        s.split_at(7.0);
+        assert!(s.toggle_at(5.0)); // disable the middle piece
+        assert!(!s.segments()[1].enabled);
+        assert_eq!(s.kept_within(0.0, 10.0), vec![(0.0, 3.0), (7.0, 10.0)]);
+        assert!(approx(s.kept_duration(0.0, 10.0), 6.0));
+        // Intersected with a narrower in/out window.
+        assert_eq!(s.kept_within(1.0, 8.0), vec![(1.0, 3.0), (7.0, 8.0)]);
+        // Re-enabling merges adjacent kept spans back into one.
+        s.toggle_at(5.0);
+        assert_eq!(s.kept_within(0.0, 10.0), vec![(0.0, 10.0)]);
+    }
+
+    #[test]
+    fn segments_skip_target_jumps_over_cuts() {
+        let mut s = Segments::new(10.0);
+        s.split_at(3.0);
+        s.split_at(7.0);
+        s.toggle_at(5.0);
+        assert_eq!(s.skip_target(1.0, 10.0), None); // in a kept piece
+        assert!(approx(s.skip_target(4.0, 10.0).unwrap(), 7.0));
+        // A trailing cut with nothing kept after lands on out.
+        s.toggle_at(8.0);
+        assert!(approx(s.skip_target(4.0, 10.0).unwrap(), 10.0));
+        assert!(approx(s.skip_target(8.0, 9.0).unwrap(), 9.0));
+    }
+
+    #[test]
+    fn segments_reset_restores_full_clip() {
+        let mut s = Segments::new(10.0);
+        s.split_at(5.0);
+        s.toggle_at(6.0);
+        s.reset();
+        assert!(s.is_trivial());
+        assert_eq!(s.kept_within(0.0, 10.0), vec![(0.0, 10.0)]);
+    }
+
+    #[test]
+    fn segments_invalid_duration_is_safe() {
+        let mut s = Segments::new(f64::NAN);
+        assert!(!s.split_at(1.0));
+        assert!(s.kept_within(0.0, 1.0).is_empty());
     }
 }

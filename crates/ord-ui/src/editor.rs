@@ -2,8 +2,10 @@
 //!
 //! An inline A/V editor built on [`Player`]: a video preview with real
 //! play/pause/loop + audio, a draggable in/out timeline with a time ruler,
-//! filmstrip and markers, keyboard shortcuts, and an "Export selection" that
-//! hands the trim to `ord-export`.
+//! filmstrip, markers (the clip's `ord mark` chapters load automatically) and
+//! multi-segment cuts (split at the playhead, toggle pieces off — playback and
+//! export skip them), keyboard shortcuts, and an "Export selection" that hands
+//! the result to `ord-export`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -15,9 +17,11 @@ use ord_export::{Preset, Trim};
 
 use crate::format::human_duration;
 use crate::player::{Player, PreviewFrame};
-use crate::timeline::{Timeline, View};
+use crate::timeline::{Segments, Timeline, View};
 
 const FILMSTRIP_TILES: usize = 14;
+/// Snap radius (px) for markers under the in/out/playhead drags and clicks.
+const SNAP_PX: f32 = 6.0;
 
 /// What the editor wants the app to do after a frame.
 pub enum EditorAction {
@@ -26,6 +30,9 @@ pub enum EditorAction {
     Export {
         preset: Preset,
         trim: Option<Trim>,
+        /// Multi-segment cut list (ascending, non-overlapping). When `Some`,
+        /// it supersedes `trim` and the pieces are concatenated on export.
+        segments: Option<Vec<Trim>>,
         mute: bool,
     },
 }
@@ -43,9 +50,12 @@ pub struct EditorState {
     label: String,
     player: Player,
     timeline: Timeline,
+    segments: Segments,
     zoom: f32,
     scroll: f32,
     markers: Vec<f64>,
+    /// Chapters probed off-thread land here (the clip's `ord mark` bookmarks).
+    chapters_rx: Receiver<Vec<f64>>,
     mute_export: bool,
     volume: f32,
     drag: Option<Drag>,
@@ -60,15 +70,19 @@ impl EditorState {
     pub fn new(clip: PathBuf, label: String, ctx: &egui::Context) -> Result<Self, String> {
         let player = Player::open(&clip)?;
         let timeline = Timeline::new(player.duration());
+        let segments = Segments::new(player.duration());
         let strip_rx = spawn_filmstrip(&clip, player.duration(), ctx.clone());
+        let chapters_rx = spawn_chapters(&clip, ctx.clone());
         Ok(Self {
             clip,
             label,
             player,
             timeline,
+            segments,
             zoom: 1.0,
             scroll: 0.0,
             markers: Vec::new(),
+            chapters_rx,
             mute_export: false,
             volume: 1.0,
             drag: None,
@@ -104,12 +118,30 @@ impl EditorState {
                     Some(ctx.load_texture(format!("strip-{i}"), img, egui::TextureOptions::LINEAR));
             }
         }
+        // The clip's chapters (`ord mark` bookmarks) arrive as markers.
+        while let Ok(chapters) = self.chapters_rx.try_recv() {
+            for t in chapters {
+                if !self.markers.iter().any(|m| (m - t).abs() < 1e-3) {
+                    self.markers.push(t);
+                }
+            }
+            self.markers
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
 
         // Player drives the playhead during playback; keep its range in sync.
         self.player
             .set_range(self.timeline.in_point(), self.timeline.out_point());
         if self.player.is_playing() {
             self.timeline.set_playhead(self.player.position());
+            // Cut segments are skipped live, so the preview plays exactly what
+            // an export would contain.
+            if !self.segments.is_trivial() {
+                let pos = self.timeline.playhead();
+                if let Some(target) = self.segments.skip_target(pos, self.timeline.out_point()) {
+                    self.seek_to(target);
+                }
+            }
         }
 
         let mut action = self.keyboard(ctx);
@@ -125,10 +157,17 @@ impl EditorState {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(
-                            "Space play · I/O set in-out · ←/→ seek · ,/. frame · M marker · scroll=zoom",
+                            "Space play · I/O in-out · S split · X cut/keep · M marker · [/] jump marker · wheel zoom",
                         )
                         .color(ui.visuals().weak_text_color())
                         .size(12.0),
+                    )
+                    .on_hover_text(
+                        "←/→ seek 1s (Shift: 5s) · ,/. frame-step · Home/End to in/out\n\
+                         M places a marker · Shift+M removes the nearest · [/] jump between markers\n\
+                         S splits the clip at the playhead; X (or right-click a piece) toggles it\n\
+                         cut/kept — cut pieces are skipped when playing and joined out on export\n\
+                         Mouse wheel zooms at the pointer; Shift+wheel pans when zoomed",
                     );
                 });
             });
@@ -163,6 +202,13 @@ impl EditorState {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) -> EditorAction {
+        // Don't steal keys (I/O/M/S/X/arrows…) while a widget has focus.
+        if let Some(focused) = ctx.memory(|m| m.focused()) {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                ctx.memory_mut(|m| m.surrender_focus(focused));
+            }
+            return EditorAction::None;
+        }
         let (
             space,
             key_i,
@@ -194,6 +240,14 @@ impl EditorState {
                 i.key_pressed(egui::Key::Minus),
                 i.key_pressed(egui::Key::M),
                 i.key_pressed(egui::Key::Escape),
+            )
+        });
+        let (split, toggle_seg, prev_marker, next_marker) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::S),
+                i.key_pressed(egui::Key::X),
+                i.key_pressed(egui::Key::OpenBracket),
+                i.key_pressed(egui::Key::CloseBracket),
             )
         });
 
@@ -237,13 +291,85 @@ impl EditorState {
         if minus {
             self.zoom = (self.zoom / 1.5).max(1.0);
         }
-        if mkey {
+        if mkey && !shift && !self.markers.iter().any(|m| (m - ph).abs() < 1e-3) {
             self.markers.push(ph);
+            self.markers
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        if mkey && shift {
+            self.remove_nearest_marker(ph);
+        }
+        if prev_marker {
+            if let Some(t) = self.prev_marker(ph) {
+                self.seek_to(t);
+            }
+        }
+        if next_marker {
+            if let Some(t) = self.next_marker(ph) {
+                self.seek_to(t);
+            }
+        }
+        if split {
+            self.segments.split_at(ph);
+        }
+        if toggle_seg {
+            self.segments.toggle_at(ph);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
             self.debug = !self.debug;
         }
         EditorAction::None
+    }
+
+    /// The nearest marker strictly before `t`.
+    fn prev_marker(&self, t: f64) -> Option<f64> {
+        self.markers
+            .iter()
+            .copied()
+            .filter(|m| *m < t - 1e-3)
+            .fold(None, |acc: Option<f64>, m| {
+                Some(acc.map_or(m, |a| a.max(m)))
+            })
+    }
+
+    /// The nearest marker strictly after `t`.
+    fn next_marker(&self, t: f64) -> Option<f64> {
+        self.markers
+            .iter()
+            .copied()
+            .filter(|m| *m > t + 1e-3)
+            .fold(None, |acc: Option<f64>, m| {
+                Some(acc.map_or(m, |a| a.min(m)))
+            })
+    }
+
+    /// Remove the marker closest to `t` (within a second), e.g. a misplaced M.
+    fn remove_nearest_marker(&mut self, t: f64) {
+        let nearest = self
+            .markers
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (i, (m - t).abs()))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((i, d)) = nearest {
+            if d <= 1.0 {
+                self.markers.remove(i);
+            }
+        }
+    }
+
+    /// Snap `t` to the nearest marker within [`SNAP_PX`] on screen.
+    fn snap_to_marker(&self, t: f64, view: &View, track_w: f32) -> f64 {
+        let px_per_sec = track_w as f64 / view.span.max(1e-9);
+        let radius = SNAP_PX as f64 / px_per_sec.max(1e-9);
+        self.markers
+            .iter()
+            .copied()
+            .map(|m| (m, (m - t).abs()))
+            .filter(|(_, d)| *d <= radius)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(m, _)| m)
+            .unwrap_or(t)
     }
 
     /// Debug overlay + throttled log to `/tmp/ord-ui-debug.log` (toggle: F3 or
@@ -418,18 +544,41 @@ impl EditorState {
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 84.0), egui::Sense::hover());
 
-        // Zoom / scroll from the mouse wheel over the timeline.
+        // Mouse wheel over the timeline: plain scroll ZOOMS, anchored at the
+        // pointer (the moment under the cursor stays put); Shift+wheel or a
+        // horizontal wheel/trackpad pans when zoomed in.
         let hovered = ui.rect_contains_pointer(rect);
         if hovered {
-            let scroll_y = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll_y != 0.0 {
-                let zooming = ui.input(|i| i.modifiers.ctrl || i.modifiers.alt) || self.zoom > 1.0;
-                if zooming && ui.input(|i| i.modifiers.ctrl || i.modifiers.alt) {
-                    let f = if scroll_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                    self.zoom = (self.zoom * f).clamp(1.0, 60.0);
-                } else if self.zoom > 1.0 {
-                    self.scroll = (self.scroll - scroll_y * 0.01 / self.zoom).clamp(0.0, 1.0);
-                }
+            let (scroll_x, scroll_y, shift, pointer) = ui.input(|i| {
+                (
+                    i.raw_scroll_delta.x,
+                    i.raw_scroll_delta.y,
+                    i.modifiers.shift,
+                    i.pointer.hover_pos(),
+                )
+            });
+            let track_guess = egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 4.0, rect.top() + 18.0),
+                egui::pos2(rect.right() - 4.0, rect.bottom() - 4.0),
+            );
+            let pan = scroll_x + if shift { scroll_y } else { 0.0 };
+            if pan != 0.0 && self.zoom > 1.0 {
+                self.scroll = (self.scroll - pan * 0.01 / self.zoom).clamp(0.0, 1.0);
+            } else if scroll_y != 0.0 && !shift {
+                let old = View::new(dur, self.zoom, self.scroll);
+                let frac = pointer
+                    .map(|p| {
+                        ((p.x - track_guess.left()) / track_guess.width().max(1.0)).clamp(0.0, 1.0)
+                    })
+                    .unwrap_or(0.5);
+                let anchor = old.time_at(frac);
+                let factor = (scroll_y as f64 * 0.005).exp() as f32;
+                self.zoom = (self.zoom * factor).clamp(1.0, 60.0);
+                // Re-derive scroll so `anchor` stays under the pointer.
+                let span = dur / self.zoom as f64;
+                let start = (anchor - frac as f64 * span).clamp(0.0, (dur - span).max(0.0));
+                let max_start = (dur - span).max(1e-9);
+                self.scroll = (start / max_start).clamp(0.0, 1.0) as f32;
             }
         }
 
@@ -472,10 +621,56 @@ impl EditorState {
             dim,
         );
 
+        // Cut segments: heavy dim + a vermilion edge strip on pieces toggled
+        // off, and a hairline at every cut point.
+        if !self.segments.is_trivial() {
+            for seg in self.segments.segments() {
+                if seg.enabled {
+                    continue;
+                }
+                let x0 = cl(x_of(seg.start));
+                let x1 = cl(x_of(seg.end));
+                if x1 <= x0 {
+                    continue;
+                }
+                let r = egui::Rect::from_min_max(
+                    egui::pos2(x0, track.top()),
+                    egui::pos2(x1, track.bottom()),
+                );
+                painter.rect_filled(r, 0.0, egui::Color32::from_black_alpha(190));
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, track.bottom() - 3.0),
+                        egui::pos2(x1, track.bottom()),
+                    ),
+                    0.0,
+                    crate::theme::SHU,
+                );
+                if r.width() > 42.0 {
+                    painter.text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "✕ cut",
+                        egui::FontId::proportional(10.0),
+                        crate::theme::SHU,
+                    );
+                }
+            }
+            for cut in self.segments.cuts() {
+                let x = x_of(cut);
+                if track.x_range().contains(x) {
+                    painter.line_segment(
+                        [egui::pos2(x, track.top()), egui::pos2(x, track.bottom())],
+                        egui::Stroke::new(1.0, crate::theme::HAIRLINE_HI),
+                    );
+                }
+            }
+        }
+
         // Ruler ticks.
         self.paint_ruler(&painter, ruler, track, &view);
 
-        // Markers.
+        // Markers: a gold line with a small flag head (click to jump to it).
         for &m in &self.markers {
             let mx = x_of(m);
             if track.x_range().contains(mx) {
@@ -483,6 +678,15 @@ impl EditorState {
                     [egui::pos2(mx, track.top()), egui::pos2(mx, track.bottom())],
                     egui::Stroke::new(1.5, crate::theme::KIN),
                 );
+                painter.add(egui::Shape::convex_polygon(
+                    vec![
+                        egui::pos2(mx - 4.0, track.top()),
+                        egui::pos2(mx + 4.0, track.top()),
+                        egui::pos2(mx, track.top() + 6.0),
+                    ],
+                    crate::theme::KIN,
+                    egui::Stroke::NONE,
+                ));
             }
         }
 
@@ -553,7 +757,9 @@ impl EditorState {
         }
         if resp.dragged() {
             if let (Some(drag), Some(p)) = (self.drag, resp.interact_pointer_pos()) {
-                let t = time_at(p.x);
+                // Handles and the playhead snap to nearby markers, so a mark
+                // placed in-game becomes a precise trim point.
+                let t = self.snap_to_marker(time_at(p.x), &view, track.width());
                 match drag {
                     Drag::In => {
                         self.timeline.set_in(t);
@@ -572,7 +778,14 @@ impl EditorState {
         }
         if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                self.seek_to(time_at(p.x));
+                let t = self.snap_to_marker(time_at(p.x), &view, track.width());
+                self.seek_to(t);
+            }
+        }
+        // Right-click a piece to toggle it cut/kept (same as X at the playhead).
+        if resp.secondary_clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                self.segments.toggle_at(time_at(p.x));
             }
         }
     }
@@ -639,6 +852,10 @@ impl EditorState {
     }
 
     fn export_ui(&mut self, ui: &mut egui::Ui, action: &mut EditorAction) {
+        let cuts_active = !self.segments.is_trivial();
+        let kept = self
+            .segments
+            .kept_duration(self.timeline.in_point(), self.timeline.out_point());
         ui.horizontal(|ui| {
             let weak = ui.visuals().weak_text_color();
             ui.label(egui::RichText::new("In").color(weak));
@@ -647,17 +864,55 @@ impl EditorState {
             ui.label(egui::RichText::new("Out").color(weak));
             ui.monospace(human_duration(self.timeline.out_point()));
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("Selection").color(weak));
-            ui.monospace(human_duration(self.timeline.selection_duration()));
+            ui.label(
+                egui::RichText::new(if cuts_active { "Kept" } else { "Selection" }).color(weak),
+            );
+            ui.monospace(human_duration(if cuts_active {
+                kept
+            } else {
+                self.timeline.selection_duration()
+            }));
+            if cuts_active {
+                ui.add_space(6.0);
+                let n = self.segments.cuts().count();
+                ui.label(
+                    egui::RichText::new(format!("{} cut{}", n, if n == 1 { "" } else { "s" }))
+                        .color(crate::theme::KIN)
+                        .size(12.0),
+                );
+                if ui
+                    .button("Reset cuts")
+                    .on_hover_text("Remove every split and keep the whole clip again")
+                    .clicked()
+                {
+                    self.segments.reset();
+                }
+            }
             ui.add_space(12.0);
             ui.checkbox(&mut self.mute_export, "Mute audio");
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button(egui::RichText::new("Export selection").strong(), |ui| {
                     let trim = self.current_trim();
+                    let segments = self.export_segments();
                     let mute = self.mute_export;
-                    let dur = self.timeline.selection_duration();
+                    let dur = if cuts_active {
+                        kept
+                    } else {
+                        self.timeline.selection_duration()
+                    };
+                    if segments.as_ref().is_some_and(|s| s.is_empty()) {
+                        ui.label(
+                            egui::RichText::new("Every piece is cut — nothing to export")
+                                .color(crate::theme::KIN),
+                        );
+                        return;
+                    }
                     for preset in Preset::ALL {
+                        // Joining cuts re-encodes through the concat filter, so
+                        // stream-copy / GIF / audio presets need a whole clip.
+                        let unsupported = segments.is_some()
+                            && matches!(preset, Preset::Source | Preset::Gif | Preset::AudioOnly);
                         // Size-predictable presets show an honest estimate from
                         // the planner's own bitrate math.
                         let mut profile = preset.profile();
@@ -668,8 +923,21 @@ impl EditorState {
                             }
                             _ => preset.label().to_string(),
                         };
-                        if ui.button(label).clicked() {
-                            *action = EditorAction::Export { preset, trim, mute };
+                        let btn = ui.add_enabled(!unsupported, egui::Button::new(label));
+                        let btn = if unsupported {
+                            btn.on_disabled_hover_text(
+                                "Not available with cuts (joining pieces re-encodes video)",
+                            )
+                        } else {
+                            btn
+                        };
+                        if btn.clicked() {
+                            *action = EditorAction::Export {
+                                preset,
+                                trim,
+                                segments: segments.clone(),
+                                mute,
+                            };
                             ui.close_menu();
                         }
                     }
@@ -688,6 +956,29 @@ impl EditorState {
             })
         }
     }
+
+    /// The cut list for export: the kept spans inside in/out, or `None` when
+    /// nothing is actually cut out (a plain trim covers it — no re-encode
+    /// detour through the concat filter).
+    fn export_segments(&self) -> Option<Vec<Trim>> {
+        if self.segments.is_trivial() {
+            return None;
+        }
+        let (i, o) = (self.timeline.in_point(), self.timeline.out_point());
+        let spans = self.segments.kept_within(i, o);
+        if spans.len() == 1 && spans[0].0 <= i + 1e-6 && spans[0].1 >= o - 1e-6 {
+            return None; // splits exist but every piece is kept
+        }
+        Some(
+            spans
+                .into_iter()
+                .map(|(a, b)| Trim {
+                    start_secs: a,
+                    end_secs: b,
+                })
+                .collect(),
+        )
+    }
 }
 
 /// A "nice" ruler step (seconds) so ~6-10 labels fit a span.
@@ -701,6 +992,21 @@ fn nice_step(span: f64) -> f64 {
         }
     }
     600.0
+}
+
+/// Probe the clip's chapters (`ord mark` bookmarks become MKV chapters)
+/// off-thread; they surface as timeline markers.
+fn spawn_chapters(clip: &std::path::Path, ctx: egui::Context) -> Receiver<Vec<f64>> {
+    let (tx, rx) = channel();
+    let clip = clip.to_path_buf();
+    std::thread::spawn(move || {
+        if let Ok(chapters) = ord_export::probe::probe_chapters(&clip) {
+            if !chapters.is_empty() && tx.send(chapters).is_ok() {
+                ctx.request_repaint();
+            }
+        }
+    });
+    rx
 }
 
 /// Decode `count` evenly-spaced thumbnails for the timeline filmstrip off-thread.

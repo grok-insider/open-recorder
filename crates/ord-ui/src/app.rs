@@ -105,6 +105,12 @@ pub struct LibraryApp {
     /// Replies from one-shot daemon commands (save/record/buffer/config).
     ctl_rx: Receiver<Result<Event, String>>,
     ctl_tx: Sender<Result<Event, String>>,
+    /// Pushed daemon events (a persistent `Subscribe` connection): new clips
+    /// appear in the library the moment a hotkey saves them, record/buffer
+    /// state updates instantly instead of on the next 2 s poll.
+    events_rx: Receiver<Event>,
+    events_tx: Sender<Event>,
+    events_started: bool,
     /// When `Some`, the settings page is shown instead of the library grid.
     settings: Option<SettingsView>,
 }
@@ -117,6 +123,7 @@ impl LibraryApp {
         let (export_tx, export_rx) = channel();
         let (daemon_tx, daemon_rx) = channel();
         let (ctl_tx, ctl_rx) = channel();
+        let (events_tx, events_rx) = channel();
         Self {
             clips_dir,
             clips,
@@ -143,6 +150,9 @@ impl LibraryApp {
             daemon_poll_started: false,
             ctl_rx,
             ctl_tx,
+            events_rx,
+            events_tx,
+            events_started: false,
             settings: None,
         }
     }
@@ -193,11 +203,12 @@ impl LibraryApp {
                     if let Some(d) = self.daemon.as_mut() {
                         d.recording = recording;
                     }
-                    self.set_status(if recording {
-                        "Recording started"
+                    if recording {
+                        self.set_status("Recording started — writing until you press Stop");
                     } else {
-                        "Recording stopped"
-                    });
+                        self.set_status("Recording stopped — added to the library");
+                        self.refresh(ctx);
+                    }
                 }
                 Ok(Event::Error { message }) => {
                     if let Some(s) = self.settings.as_mut() {
@@ -218,6 +229,93 @@ impl LibraryApp {
                     }
                     self.set_status(format!("Daemon unreachable: {e}"));
                 }
+            }
+        }
+    }
+
+    /// Keep a persistent `Subscribe` connection to the daemon so pushed events
+    /// (clip saved via hotkey, record/buffer toggles from any client) update
+    /// the UI immediately — no manual refresh. Reconnects when the daemon
+    /// restarts.
+    fn start_event_stream(&mut self, ctx: &egui::Context) {
+        if self.events_started {
+            return;
+        }
+        self.events_started = true;
+        let tx = self.events_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || loop {
+            let stream = ord_common::connect(ord_common::socket_path())
+                .ok()
+                .and_then(|c| c.subscribe().ok());
+            if let Some(events) = stream {
+                for ev in events {
+                    if tx.send(ev).is_err() {
+                        return; // app gone
+                    }
+                    ctx.request_repaint();
+                }
+            }
+            // Daemon unreachable or disconnected (restart): retry shortly.
+            std::thread::sleep(Duration::from_secs(1));
+        });
+    }
+
+    /// Route pushed daemon events into the model. A `ClipSaved` (from any
+    /// client — hotkey, CLI, auto-save-on-mark) refreshes the library, so new
+    /// clips appear without touching anything.
+    fn drain_events(&mut self, ctx: &egui::Context) {
+        while let Ok(ev) = self.events_rx.try_recv() {
+            match ev {
+                Event::ClipSaved { path, duration } => {
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or(path);
+                    self.set_status(format!("Saved {}s → {name}", duration.get()));
+                    self.refresh(ctx);
+                }
+                Event::RecordState { recording } => {
+                    if let Some(d) = self.daemon.as_mut() {
+                        d.recording = recording;
+                    }
+                    if recording {
+                        self.set_status("Recording started — writing until you press Stop");
+                    } else {
+                        self.set_status("Recording stopped — added to the library");
+                        // The finished recording is a new file on disk.
+                        self.refresh(ctx);
+                    }
+                }
+                Event::BufferState { enabled } => {
+                    if let Some(d) = self.daemon.as_mut() {
+                        d.buffer_enabled = enabled;
+                    }
+                }
+                Event::Status {
+                    buffer_enabled,
+                    recording,
+                    buffered_seconds,
+                    ..
+                } => {
+                    // The initial snapshot right after subscribing.
+                    self.daemon = Some(DaemonInfo {
+                        buffer_enabled,
+                        recording,
+                        buffered_seconds,
+                    });
+                }
+                Event::Marked { auto_saving } => {
+                    self.set_status(if auto_saving {
+                        "Marked — saving clip"
+                    } else {
+                        "Marked"
+                    });
+                }
+                Event::CaptureRestarted => self.set_status("Capture restarted"),
+                // One-shot Config replies drive the settings page; a pushed
+                // Config mid-edit must not clobber the user's draft.
+                Event::Config { .. } | Event::Error { .. } => {}
             }
         }
     }
@@ -354,13 +452,16 @@ impl LibraryApp {
             clip.label(),
             preset,
             None,
+            None,
             false,
             ctx,
         );
     }
 
-    /// Export `input` with `preset`, optionally trimmed/muted. Runs off-thread
-    /// and reports via the export channel; ignores a duplicate in-flight export.
+    /// Export `input` with `preset`, optionally trimmed/muted — or, when
+    /// `segments` is set, the editor's kept pieces concatenated into one file.
+    /// Runs off-thread and reports via the export channel; ignores a duplicate
+    /// in-flight export.
     #[allow(clippy::too_many_arguments)]
     fn run_export(
         &mut self,
@@ -369,6 +470,7 @@ impl LibraryApp {
         label: &str,
         preset: Preset,
         trim: Option<Trim>,
+        segments: Option<Vec<Trim>>,
         mute: bool,
         ctx: &egui::Context,
     ) {
@@ -379,7 +481,13 @@ impl LibraryApp {
         profile.mute = mute;
         let ext = profile.output_extension();
         let preset_name = preset.slug();
-        let suffix = if trim.is_some() { "-trim" } else { "" };
+        let suffix = if segments.is_some() {
+            "-cut"
+        } else if trim.is_some() {
+            "-trim"
+        } else {
+            ""
+        };
         let out =
             meta::exports_dir(&self.clips_dir).join(format!("{stem}-{preset_name}{suffix}.{ext}"));
         let input = input.to_path_buf();
@@ -401,8 +509,18 @@ impl LibraryApp {
                 *lock_tolerant(&progress) = p as f32;
                 ctx.request_repaint();
             };
-            let result = export_with(&input, &out, &profile, trim, &mut on_progress, &cancel)
-                .map_err(|e| e.to_string());
+            let result = match &segments {
+                Some(segs) => ord_export::export_segments_with(
+                    &input,
+                    &out,
+                    &profile,
+                    segs,
+                    &mut on_progress,
+                    &cancel,
+                ),
+                None => export_with(&input, &out, &profile, trim, &mut on_progress, &cancel),
+            }
+            .map_err(|e| e.to_string());
             let _ = tx.send(ExportMsg {
                 clip: input,
                 result,
@@ -459,6 +577,8 @@ impl eframe::App for LibraryApp {
         }
         self.drain_channels(ctx);
         self.drain_ctl(ctx);
+        self.drain_events(ctx);
+        self.start_event_stream(ctx);
 
         // Pause + idle when our window isn't focused (e.g. its Hyprland special
         // workspace was toggled away). Pausing stops audio playing into a hidden
@@ -517,13 +637,18 @@ impl eframe::App for LibraryApp {
             match ed.ui(ctx, &wd) {
                 EditorAction::None => {}
                 EditorAction::Back => self.editor = None,
-                EditorAction::Export { preset, trim, mute } => {
+                EditorAction::Export {
+                    preset,
+                    trim,
+                    segments,
+                    mute,
+                } => {
                     let clip = ed.clip().clone();
                     let stem = clip
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| "clip".to_string());
-                    self.run_export(&clip, &stem, &stem, preset, trim, mute, ctx);
+                    self.run_export(&clip, &stem, &stem, preset, trim, segments, mute, ctx);
                     self.editor = None;
                 }
             }
@@ -714,10 +839,19 @@ impl LibraryApp {
             ui.button(rec_label)
         };
         if rec
-            .on_hover_text("Toggle a full-length recording (separate from the replay buffer)")
+            .on_hover_text(
+                "Toggle a full-length recording that writes to disk continuously \
+                 until stopped (separate from the replay buffer). The file shows \
+                 up in the library when you stop.",
+            )
             .clicked()
         {
             self.send_ctl(Command::ToggleRecord, ctx);
+            self.set_status(if d.recording {
+                "Stopping recording…"
+            } else {
+                "Starting recording…"
+            });
         }
 
         if d.buffer_enabled {
