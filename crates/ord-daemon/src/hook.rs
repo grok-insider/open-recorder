@@ -77,7 +77,17 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let clip = dir.join("game-123.mkv");
-        let handle = spawn_clip_hook(&script.to_string_lossy(), &clip).expect("script spawns");
+        // Retry: a concurrently forking test (e.g. the missing-hook test) can
+        // briefly hold the script's write fd between fork and exec, making the
+        // first exec fail with ETXTBSY.
+        let handle = (0..100)
+            .find_map(|_| {
+                spawn_clip_hook(&script.to_string_lossy(), &clip).or_else(|| {
+                    std::thread::yield_now();
+                    None
+                })
+            })
+            .expect("script spawns");
         handle.join().unwrap();
 
         let recorded = std::fs::read_to_string(&marker).unwrap();
