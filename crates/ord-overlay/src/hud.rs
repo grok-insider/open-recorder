@@ -24,7 +24,7 @@ pub struct Toast {
 }
 
 /// HUD state: a persistent buffer indicator and a queue of timed toasts.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hud {
     pub buffer_active: bool,
     /// The daemon is unreachable: the renderer shows a distinct hollow/grey
@@ -32,7 +32,21 @@ pub struct Hud {
     /// glance instead of looking identical to "buffer off". (The silent-death
     /// failure mode every incumbent recorder is hated for.)
     pub daemon_offline: bool,
+    /// Whether the persistent corner dot is drawn at all
+    /// (`overlay.show_status_dot` in the config). Toasts are unaffected.
+    pub show_status_dot: bool,
     toasts: Vec<Toast>,
+}
+
+impl Default for Hud {
+    fn default() -> Self {
+        Self {
+            buffer_active: false,
+            daemon_offline: false,
+            show_status_dot: true,
+            toasts: Vec::new(),
+        }
+    }
 }
 
 /// Default toast lifetime in milliseconds.
@@ -52,6 +66,16 @@ impl Hud {
         if offline {
             self.buffer_active = false;
         }
+    }
+
+    /// Show or hide the persistent status dot (`overlay.show_status_dot`).
+    pub fn set_show_status_dot(&mut self, show: bool) {
+        self.show_status_dot = show;
+    }
+
+    /// Whether the renderer should draw the persistent corner dot this frame.
+    pub fn status_dot_visible(&self) -> bool {
+        self.show_status_dot && (self.buffer_active || self.daemon_offline)
     }
 
     /// Push a toast that expires `DEFAULT_TOAST_MS` after `now_ms`.
@@ -112,7 +136,7 @@ impl Hud {
 
     /// Whether there is anything to draw (indicator or toasts).
     pub fn has_content(&self) -> bool {
-        self.buffer_active || self.daemon_offline || !self.toasts.is_empty()
+        self.status_dot_visible() || !self.toasts.is_empty()
     }
 }
 
@@ -217,6 +241,25 @@ mod tests {
         assert!(!hud.is_animating(), "offline indicator is static");
         hud.set_daemon_offline(false);
         assert!(!hud.has_content());
+    }
+
+    #[test]
+    fn hidden_status_dot_is_not_content() {
+        let mut hud = Hud::default();
+        hud.set_buffer_active(true);
+        assert!(hud.status_dot_visible());
+        hud.set_show_status_dot(false);
+        assert!(!hud.status_dot_visible());
+        assert!(!hud.has_content(), "hidden dot must not force draws");
+        // Toasts still show even with the dot hidden.
+        hud.toast(ToastKind::Saved, "saved", 0);
+        assert!(hud.has_content());
+        // Offline indicator is also governed by the toggle.
+        hud.tick(DEFAULT_TOAST_MS);
+        hud.set_daemon_offline(true);
+        assert!(!hud.status_dot_visible());
+        hud.set_show_status_dot(true);
+        assert!(hud.status_dot_visible());
     }
 
     #[test]

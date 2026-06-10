@@ -55,8 +55,21 @@ fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {
         Event::CaptureRestarted => {
             hud.toast(ToastKind::Recording, "Capture recovered", now_ms);
         }
-        // Config replies are for settings UIs; nothing to show.
-        Event::Config { .. } => {}
+        // Pushed on every settings apply: the overlay section governs us.
+        Event::Config { effective, .. } => {
+            hud.set_show_status_dot(effective.overlay.show_status_dot);
+        }
+    }
+}
+
+/// One-shot fetch of the effective config (for `overlay.*`) on (re)connect.
+/// Best-effort: an unreachable daemon just leaves the current HUD settings.
+fn apply_overlay_config(hud: &mut Hud, path: &PathBuf) {
+    let reply = ord_common::connect(path)
+        .ok()
+        .and_then(|mut c| c.request(&ord_common::Command::GetConfig).ok());
+    if let Some(Event::Config { effective, .. }) = reply {
+        hud.set_show_status_dot(effective.overlay.show_status_dot);
     }
 }
 
@@ -107,6 +120,10 @@ fn main() {
             continue;
         };
         hud.set_daemon_offline(false);
+        // The subscription only pushes config *changes*; fetch the current
+        // overlay settings once per (re)connect so a restart-with-overrides
+        // daemon is honored immediately.
+        apply_overlay_config(&mut hud, &path);
 
         // Inner loop: render + drain events until the daemon disconnects. We only
         // repaint when something actually changed (an event arrived or a toast

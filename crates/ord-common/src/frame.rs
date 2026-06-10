@@ -11,7 +11,7 @@
 use std::io::{self, Read, Write};
 
 /// Wire protocol version. Bump on any incompatible `Command`/`Event` change.
-pub const PROTOCOL_VERSION: u8 = 2;
+pub const PROTOCOL_VERSION: u8 = 3;
 
 /// Frame magic identifying an open-recorder control message.
 const MAGIC: [u8; 3] = *b"ORD";
