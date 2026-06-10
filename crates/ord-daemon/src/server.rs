@@ -9,10 +9,10 @@ use std::io;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use ord_common::{lock_tolerant, read_frame, write_frame, Command, Event};
-use ord_core::{CaptureBackend, PreparedClip};
+use ord_common::{lock_tolerant, read_frame, write_frame, BufferSeconds, Command, Config, Event};
+use ord_core::{CaptureBackend, Engine, PreparedClip};
 
 use crate::handler::Handler;
 
@@ -20,6 +20,31 @@ use crate::handler::Handler;
 /// real daemon uses the ffmpeg muxer and tests use a fake. The server invokes it
 /// **off the handler lock** so a slow mux never starves capture-frame draining.
 pub type ClipWriter = Box<dyn FnMut(&PreparedClip) -> Result<PathBuf, String> + Send>;
+
+/// Builds a fresh (not yet started) engine from a configuration — how a
+/// `SetConfig` with changed encoder settings restarts capture. Injected so the
+/// daemon supplies the real backend and tests a mock.
+pub type EngineFactory<B> = Box<dyn Fn(&Config) -> Engine<B> + Send + Sync>;
+
+/// Persists the sparse overrides document (the diff against the base config).
+/// Injected so tests capture writes instead of touching the state dir.
+pub type OverridesWriter = Box<dyn FnMut(&str) -> Result<(), String> + Send>;
+
+/// Everything the server needs beyond the handler: the configuration store and
+/// the apply machinery for `SetConfig`, plus the capture watchdog policy.
+pub struct ServerCtx<B: CaptureBackend> {
+    /// Effective configuration (base + overrides), shared with the writer.
+    pub config: Arc<Mutex<Config>>,
+    /// The immutable base layer (user/HM config file at startup).
+    pub base: Config,
+    pub engine_factory: EngineFactory<B>,
+    pub write_overrides: OverridesWriter,
+    /// Restart capture when the buffer is enabled but no frames arrived for
+    /// this long (suspend/resume, output change). `None` disables the watchdog
+    /// (tests; the mock emits a finite burst and would otherwise restart
+    /// forever).
+    pub watchdog: Option<Duration>,
+}
 
 /// Shared list of subscriber connections that receive pushed events.
 type Subscribers = Arc<Mutex<Vec<UnixStream>>>;
@@ -70,10 +95,13 @@ pub fn serve<B: CaptureBackend + 'static>(
     listener: UnixListener,
     handler: Handler<B>,
     writer: ClipWriter,
+    ctx: ServerCtx<B>,
 ) -> Result<(), ServerError> {
     let handler = Arc::new(Mutex::new(handler));
     let writer = Arc::new(Mutex::new(writer));
     let subs: Subscribers = Arc::new(Mutex::new(Vec::new()));
+    let watchdog = ctx.watchdog;
+    let ctx = Arc::new(Mutex::new(ctx));
 
     // Continuously drain captured frames into the (evicting) ring buffer,
     // independent of client activity. The capture forwarder thread produces
@@ -82,13 +110,44 @@ pub fn serve<B: CaptureBackend + 'static>(
     // the HUD subscribes it stops sending commands, so during idle/gaming nothing
     // drained the channel and it grew unbounded at the encode bitrate (~8 MB/s)
     // until the OOM killer fired. A ~250 ms periodic pump keeps the channel
-    // drained and the ring bounded to `buffer_seconds`. `pump()` is pure
-    // ingestion (no events/side effects), so this is safe to call on a timer.
+    // drained and the ring bounded to `buffer_seconds`.
+    //
+    // The same thread runs the capture WATCHDOG: if the buffer is enabled but
+    // no frames have arrived for `watchdog` (NVENC dies on suspend/resume, the
+    // portal session ends on output changes), restart the capture session and
+    // tell subscribers — the answer to the "it silently stopped recording"
+    // failure mode every incumbent suffers from.
     {
         let handler = Arc::clone(&handler);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(250));
-            lock_tolerant(&handler).pump();
+        let subs = Arc::clone(&subs);
+        std::thread::spawn(move || {
+            let mut last_frames = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(250));
+                let mut h = lock_tolerant(&handler);
+                if h.pump() > 0 {
+                    last_frames = Instant::now();
+                    continue;
+                }
+                let Some(timeout) = watchdog else { continue };
+                if !h.is_buffer_enabled() || last_frames.elapsed() < timeout {
+                    continue;
+                }
+                tracing::warn!(
+                    stalled_for = ?last_frames.elapsed(),
+                    "no frames from capture; restarting the session"
+                );
+                let event = match h.restart_capture() {
+                    Ok(()) => Event::CaptureRestarted,
+                    Err(e) => Event::Error {
+                        message: format!("capture stalled and restart failed: {e}"),
+                    },
+                };
+                drop(h);
+                // Either way, wait a full window before the next attempt.
+                last_frames = Instant::now();
+                broadcast(&subs, &event);
+            }
         });
     }
 
@@ -105,8 +164,9 @@ pub fn serve<B: CaptureBackend + 'static>(
         let handler = Arc::clone(&handler);
         let writer = Arc::clone(&writer);
         let subs = Arc::clone(&subs);
+        let ctx = Arc::clone(&ctx);
         std::thread::spawn(move || {
-            if let Err(e) = handle_connection(stream, &handler, &writer, &subs) {
+            if let Err(e) = handle_connection(stream, &handler, &writer, &subs, &ctx) {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
                     tracing::warn!(error = %e, "connection error");
                 }
@@ -124,6 +184,7 @@ fn handle_connection<B: CaptureBackend>(
     handler: &Arc<Mutex<Handler<B>>>,
     writer: &Arc<Mutex<ClipWriter>>,
     subs: &Subscribers,
+    ctx: &Arc<Mutex<ServerCtx<B>>>,
 ) -> io::Result<()> {
     loop {
         let bytes = match read_frame(&mut stream) {
@@ -146,32 +207,39 @@ fn handle_connection<B: CaptureBackend>(
         let is_subscribe = matches!(cmd, Command::Subscribe);
 
         let event = match cmd {
-            Command::SaveLast { duration } => {
-                // Prepare the clip under the handler lock — cheap: keyframe
-                // selection + a refcount clone of the encoded window. Then write
-                // it OFF the lock so the ~hundreds-of-ms ffmpeg mux (and the
-                // hyprctl game probe inside the writer) never block the 250 ms
-                // capture-drain pump, which would otherwise fill the bounded
-                // forward channel and drop freshly-captured frames after a save.
-                let prepared = {
-                    let mut h = lock_tolerant(handler);
-                    h.pump();
-                    h.prepare_save(duration)
-                };
-                match prepared {
-                    Ok((clip, clamped)) => {
-                        let mut w = lock_tolerant(writer);
-                        match w(&clip) {
-                            Ok(path) => Event::ClipSaved {
-                                path: path.to_string_lossy().into_owned(),
-                                duration: clamped,
-                            },
-                            Err(e) => Event::Error {
-                                message: format!("failed to write clip: {e}"),
-                            },
-                        }
+            Command::SaveLast { duration } => save_flow(handler, writer, ctx, duration),
+            Command::GetConfig => {
+                let c = lock_tolerant(ctx);
+                let effective = lock_tolerant(&c.config).clone();
+                Event::Config {
+                    effective: Box::new(effective),
+                    base: Box::new(c.base.clone()),
+                }
+            }
+            Command::SetConfig { config } => apply_config(handler, ctx, subs, *config),
+            Command::Mark => {
+                let marked = lock_tolerant(handler).mark();
+                if !marked {
+                    Event::Error {
+                        message: "nothing buffered yet — is the replay buffer enabled?".into(),
                     }
-                    Err(ev) => ev,
+                } else {
+                    let auto = {
+                        let c = lock_tolerant(ctx);
+                        let cfg = lock_tolerant(&c.config);
+                        cfg.markers.auto_save_seconds
+                    };
+                    if let Some(secs) = auto.and_then(ord_common::ClipDuration::new) {
+                        // Marker doubles as "clip that": run the normal save
+                        // flow (broadcasts ClipSaved to subscribers as usual).
+                        let saved = save_flow(handler, writer, ctx, secs);
+                        if saved.is_state_change() {
+                            broadcast(subs, &saved);
+                        }
+                        Event::Marked { auto_saving: true }
+                    } else {
+                        Event::Marked { auto_saving: false }
+                    }
                 }
             }
             other => {
@@ -198,6 +266,124 @@ fn handle_connection<B: CaptureBackend>(
         if event.is_state_change() {
             broadcast(subs, &event);
         }
+    }
+}
+
+/// The save pipeline: prepare under the handler lock (cheap selection +
+/// refcount clone), then write OFF the lock so the ~hundreds-of-ms ffmpeg mux
+/// (and the hyprctl game probe inside the writer) never block the 250 ms
+/// capture-drain pump, which would otherwise fill the bounded forward channel
+/// and drop freshly-captured frames after a save. Honors `clear_on_save`.
+fn save_flow<B: CaptureBackend>(
+    handler: &Arc<Mutex<Handler<B>>>,
+    writer: &Arc<Mutex<ClipWriter>>,
+    ctx: &Arc<Mutex<ServerCtx<B>>>,
+    duration: ord_common::ClipDuration,
+) -> Event {
+    let prepared = {
+        let mut h = lock_tolerant(handler);
+        h.pump();
+        h.prepare_save(duration)
+    };
+    match prepared {
+        Ok((clip, clamped)) => {
+            let written = {
+                let mut w = lock_tolerant(writer);
+                w(&clip)
+            };
+            match written {
+                Ok(path) => {
+                    let clear = {
+                        let c = lock_tolerant(ctx);
+                        let cfg = lock_tolerant(&c.config);
+                        cfg.capture.clear_on_save
+                    };
+                    if clear {
+                        lock_tolerant(handler).clear_buffer();
+                    }
+                    Event::ClipSaved {
+                        path: path.to_string_lossy().into_owned(),
+                        duration: clamped,
+                    }
+                }
+                Err(e) => Event::Error {
+                    message: format!("failed to write clip: {e}"),
+                },
+            }
+        }
+        Err(ev) => ev,
+    }
+}
+
+/// Apply a new configuration: persist the sparse overrides, swap the shared
+/// config, then apply by tier — encoder/audio changes rebuild and restart the
+/// capture engine, a buffer-length change resizes the ring in place, and
+/// everything else (storage, hooks, markers, export) is read live by its
+/// consumer. Replies with the new effective config.
+fn apply_config<B: CaptureBackend>(
+    handler: &Arc<Mutex<Handler<B>>>,
+    ctx: &Arc<Mutex<ServerCtx<B>>>,
+    subs: &Subscribers,
+    new: Config,
+) -> Event {
+    if new.capture.fps == 0 || new.capture.fps > 240 {
+        return Event::Error {
+            message: "capture.fps must be between 1 and 240".into(),
+        };
+    }
+    let Some(buffer) = BufferSeconds::new(new.capture.buffer_seconds) else {
+        return Event::Error {
+            message: "capture.buffer_seconds must be at least 1".into(),
+        };
+    };
+
+    let mut c = lock_tolerant(ctx);
+    let overrides = match Config::diff_overrides(&c.base, &new) {
+        Ok(o) => o,
+        Err(e) => {
+            return Event::Error {
+                message: format!("could not compute settings overrides: {e}"),
+            }
+        }
+    };
+    if let Err(e) = (c.write_overrides)(&overrides) {
+        return Event::Error {
+            message: format!("could not persist settings: {e}"),
+        };
+    }
+
+    let old = lock_tolerant(&c.config).clone();
+    *lock_tolerant(&c.config) = new.clone();
+
+    let capture_restart = old.capture.fps != new.capture.fps
+        || old.capture.quality != new.capture.quality
+        || old.capture.codec != new.capture.codec
+        || old.capture.bitrate_kbps != new.capture.bitrate_kbps
+        || old.audio != new.audio;
+    let resize = old.capture.buffer_seconds != new.capture.buffer_seconds;
+
+    if capture_restart {
+        let mut engine = (c.engine_factory)(&new);
+        let mut h = lock_tolerant(handler);
+        if h.is_buffer_enabled() {
+            if let Err(e) = engine.start() {
+                // The old engine keeps running; the persisted overrides will
+                // be retried on the next daemon start.
+                return Event::Error {
+                    message: format!("new capture settings failed to start: {e}"),
+                };
+            }
+        }
+        h.replace_engine(engine);
+        drop(h);
+        broadcast(subs, &Event::CaptureRestarted);
+    } else if resize {
+        lock_tolerant(handler).set_capacity(buffer);
+    }
+
+    Event::Config {
+        effective: Box::new(new),
+        base: Box::new(c.base.clone()),
     }
 }
 
@@ -238,6 +424,29 @@ mod tests {
         Box::new(|_clip: &PreparedClip| Ok(PathBuf::from("/tmp/open-recorder/x.mkv")))
     }
 
+    /// A server context over the mock backend: default config, factory that
+    /// builds a mock engine from the requested settings, overrides discarded,
+    /// watchdog off (the mock's finite frame burst would trip it forever).
+    fn mock_ctx() -> ServerCtx<MockBackend> {
+        ServerCtx {
+            config: Arc::new(Mutex::new(Config::default())),
+            base: Config::default(),
+            engine_factory: Box::new(|cfg| {
+                Engine::new(
+                    MockBackend::new(cfg.capture.fps, 600, 60),
+                    cfg.capture.buffer_seconds,
+                )
+            }),
+            write_overrides: Box::new(|_| Ok(())),
+            watchdog: None,
+        }
+    }
+
+    fn request(client: &mut UnixStream, cmd: &Command) -> Event {
+        write_frame(client, &cmd.encode().unwrap()).unwrap();
+        Event::decode(&read_frame(client).unwrap()).unwrap()
+    }
+
     /// End-to-end over a real Unix socket against the mock backend: a client
     /// sends Status + SaveLast and gets well-formed events back.
     #[test]
@@ -247,7 +456,7 @@ mod tests {
 
         let server = thread::spawn(move || {
             // Serve exactly one client then return (the client closes the conn).
-            serve(listener, mock_handler(), mock_writer()).unwrap();
+            serve(listener, mock_handler(), mock_writer(), mock_ctx()).unwrap();
         });
 
         // Client.
@@ -286,7 +495,7 @@ mod tests {
         let path = temp_sock("subscribe");
         let listener = bind(&path).unwrap();
         let _server = thread::spawn(move || {
-            let _ = serve(listener, mock_handler(), mock_writer());
+            let _ = serve(listener, mock_handler(), mock_writer(), mock_ctx());
         });
 
         // Subscriber connects and subscribes -> gets an initial Status snapshot.
@@ -314,7 +523,7 @@ mod tests {
         let path = temp_sock("badcmd");
         let listener = bind(&path).unwrap();
         let _server = thread::spawn(move || {
-            let _ = serve(listener, mock_handler(), mock_writer());
+            let _ = serve(listener, mock_handler(), mock_writer(), mock_ctx());
         });
 
         let mut client = UnixStream::connect(&path).unwrap();
@@ -371,7 +580,7 @@ mod tests {
         });
 
         let _server = thread::spawn(move || {
-            let _ = serve(listener, mock_handler(), writer);
+            let _ = serve(listener, mock_handler(), writer, mock_ctx());
         });
 
         // Client A kicks off a save; the writer blocks mid-write.
@@ -400,6 +609,203 @@ mod tests {
         let saved = Event::decode(&read_frame(&mut a).unwrap()).unwrap();
         assert!(matches!(saved, Event::ClipSaved { .. }));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn get_and_set_config_round_trip() {
+        let path = temp_sock("config");
+        let listener = bind(&path).unwrap();
+
+        // Capture what the daemon persists as overrides.
+        let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&written);
+        let mut ctx = mock_ctx();
+        ctx.write_overrides = Box::new(move |s| {
+            lock_tolerant(&sink).push(s.to_string());
+            Ok(())
+        });
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), ctx);
+        });
+
+        let mut client = UnixStream::connect(&path).unwrap();
+
+        // GetConfig returns the defaults.
+        let Event::Config { effective, base } = request(&mut client, &Command::GetConfig) else {
+            panic!("expected Config");
+        };
+        assert_eq!(*effective, Config::default());
+        assert_eq!(*base, Config::default());
+
+        // SetConfig with a changed buffer length: applied live + persisted.
+        let mut desired = Config::default();
+        desired.capture.buffer_seconds = 17;
+        desired.hooks.on_clip_saved = Some("/bin/true".into());
+        let reply = request(
+            &mut client,
+            &Command::SetConfig {
+                config: Box::new(desired.clone()),
+            },
+        );
+        let Event::Config { effective, .. } = reply else {
+            panic!("expected Config reply, got {reply:?}");
+        };
+        assert_eq!(*effective, desired);
+
+        // The persisted overrides are sparse (only the changed leaves).
+        let writes = lock_tolerant(&written);
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].contains("buffer_seconds"), "{}", writes[0]);
+        assert!(!writes[0].contains("fps"), "{}", writes[0]);
+
+        // GetConfig now reflects the override.
+        let Event::Config { effective, .. } = request(&mut client, &Command::GetConfig) else {
+            panic!("expected Config");
+        };
+        assert_eq!(effective.capture.buffer_seconds, 17);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_config_rejects_invalid_fps() {
+        let path = temp_sock("badcfg");
+        let listener = bind(&path).unwrap();
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), mock_ctx());
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        let mut bad = Config::default();
+        bad.capture.fps = 0;
+        let reply = request(
+            &mut client,
+            &Command::SetConfig {
+                config: Box::new(bad),
+            },
+        );
+        assert!(matches!(reply, Event::Error { .. }));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_config_encoder_change_restarts_capture() {
+        let path = temp_sock("restartcfg");
+        let listener = bind(&path).unwrap();
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), mock_ctx());
+        });
+
+        // A subscriber should observe the CaptureRestarted broadcast.
+        let mut sub = UnixStream::connect(&path).unwrap();
+        write_frame(&mut sub, &Command::Subscribe.encode().unwrap()).unwrap();
+        let _snapshot = read_frame(&mut sub).unwrap();
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        let mut desired = Config::default();
+        desired.capture.fps = 30; // encoder-tier change
+        let reply = request(
+            &mut client,
+            &Command::SetConfig {
+                config: Box::new(desired),
+            },
+        );
+        assert!(matches!(reply, Event::Config { .. }), "{reply:?}");
+
+        sub.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
+        assert_eq!(pushed, Event::CaptureRestarted);
+
+        // The replacement engine works: a save still succeeds.
+        let saved = request(
+            &mut client,
+            &Command::SaveLast {
+                duration: ClipDuration::new(2).unwrap(),
+            },
+        );
+        assert!(matches!(saved, Event::ClipSaved { .. }), "{saved:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mark_replies_and_auto_saves_when_configured() {
+        let path = temp_sock("mark");
+        let listener = bind(&path).unwrap();
+        let ctx = mock_ctx();
+        {
+            let mut cfg = lock_tolerant(&ctx.config);
+            cfg.markers.auto_save_seconds = Some(5);
+        }
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), ctx);
+        });
+
+        // Subscriber sees the ClipSaved triggered by the auto-saving mark.
+        let mut sub = UnixStream::connect(&path).unwrap();
+        write_frame(&mut sub, &Command::Subscribe.encode().unwrap()).unwrap();
+        let _snapshot = read_frame(&mut sub).unwrap();
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        let reply = request(&mut client, &Command::Mark);
+        assert_eq!(reply, Event::Marked { auto_saving: true });
+
+        sub.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
+        assert!(matches!(pushed, Event::ClipSaved { .. }), "{pushed:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clear_on_save_empties_the_buffer() {
+        let path = temp_sock("clearsave");
+        let listener = bind(&path).unwrap();
+        let ctx = mock_ctx();
+        {
+            let mut cfg = lock_tolerant(&ctx.config);
+            cfg.capture.clear_on_save = true;
+        }
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), ctx);
+        });
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        let saved = request(
+            &mut client,
+            &Command::SaveLast {
+                duration: ClipDuration::new(2).unwrap(),
+            },
+        );
+        assert!(matches!(saved, Event::ClipSaved { .. }));
+
+        // The buffer is now empty: a second immediate save has nothing.
+        let again = request(
+            &mut client,
+            &Command::SaveLast {
+                duration: ClipDuration::new(2).unwrap(),
+            },
+        );
+        assert!(matches!(again, Event::Error { .. }), "{again:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn watchdog_restarts_stalled_capture() {
+        let path = temp_sock("watchdog");
+        let listener = bind(&path).unwrap();
+        let mut ctx = mock_ctx();
+        // The mock emits its whole burst up-front; after the first pump drains
+        // it the stream is "stalled", so a short watchdog must fire.
+        ctx.watchdog = Some(Duration::from_millis(600));
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), ctx);
+        });
+
+        let mut sub = UnixStream::connect(&path).unwrap();
+        write_frame(&mut sub, &Command::Subscribe.encode().unwrap()).unwrap();
+        let _snapshot = read_frame(&mut sub).unwrap();
+
+        sub.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
+        assert_eq!(pushed, Event::CaptureRestarted);
         let _ = std::fs::remove_file(&path);
     }
 }

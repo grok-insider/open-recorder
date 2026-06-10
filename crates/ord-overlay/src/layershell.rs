@@ -279,8 +279,19 @@ impl State {
         // Persistent replay-buffer indicator: a small dot in the top-right
         // corner (within the shadow margin, clear of the cards) whenever the
         // buffer is armed. Static, so with the caller's dirty-tracking it
-        // costs nothing while idle.
-        if hud.buffer_active {
+        // costs nothing while idle. When the daemon is unreachable the dot
+        // turns grey — visibly distinct from "armed", never silently absent.
+        if hud.daemon_offline {
+            draw_dot(
+                canvas,
+                w,
+                h,
+                w as f32 - 11.0,
+                11.0,
+                4.5,
+                accent(ToastKind::Stopped),
+            );
+        } else if hud.buffer_active {
             draw_dot(
                 canvas,
                 w,
@@ -317,6 +328,7 @@ fn accent(kind: ToastKind) -> (f32, f32, f32) {
         ToastKind::Recording => (248.0, 81.0, 73.0), // #F85149
         ToastKind::Stopped => (139.0, 148.0, 158.0), // #8B949E
         ToastKind::Error => (248.0, 81.0, 73.0),     // #F85149
+        ToastKind::Marked => (217.0, 164.0, 65.0),   // #D9A441
     }
 }
 
@@ -535,6 +547,14 @@ fn draw_icon(
                         cx + r,
                         cy - r,
                     )) - stroke;
+                    (0.5 - d).clamp(0.0, 1.0)
+                }
+                ToastKind::Marked => {
+                    // A bookmark flag: vertical pole + a short top stroke.
+                    let r = ICON_BOX * 0.30;
+                    let d = sd_segment(fx, fy, cx - r * 0.4, cy - r, cx - r * 0.4, cy + r).min(
+                        sd_segment(fx, fy, cx - r * 0.4, cy - r, cx + r * 0.8, cy - r * 0.35),
+                    ) - stroke;
                     (0.5 - d).clamp(0.0, 1.0)
                 }
             };

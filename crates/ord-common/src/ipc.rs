@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
 use crate::newtypes::ClipDuration;
 
 /// A request sent from a client (CLI/GUI) to the daemon.
@@ -21,6 +22,17 @@ pub enum Command {
     /// subsequent [`Event`] (e.g. `ClipSaved`, `BufferState`) until the client
     /// disconnects. Used by the HUD overlay.
     Subscribe,
+    /// Ask for the effective configuration (base + runtime overrides).
+    GetConfig,
+    /// Replace the runtime configuration. The daemon persists the sparse diff
+    /// against the base config as overrides and applies it: storage/hooks/
+    /// markers/export apply instantly; buffer length resizes the ring; encoder
+    /// fields (fps/quality/codec/bitrate/audio) restart the capture session.
+    SetConfig { config: Box<Config> },
+    /// Place a marker ("clip that" bookmark) at the current buffer position.
+    /// Markers inside a later save's window become MKV chapters. May also
+    /// auto-save (see `markers.auto_save_seconds` in the config).
+    Mark,
 }
 
 /// A message sent from the daemon to clients.
@@ -45,6 +57,19 @@ pub enum Event {
     },
     /// An error occurred handling a command. User-facing, actionable text.
     Error { message: String },
+    /// Reply to [`Command::GetConfig`]: the effective configuration and the
+    /// base layer it was derived from (so UIs can show which fields carry a
+    /// runtime override).
+    Config {
+        effective: Box<Config>,
+        base: Box<Config>,
+    },
+    /// A marker was placed. `auto_saving` is true when the daemon will also
+    /// save a clip because of it (`markers.auto_save_seconds`).
+    Marked { auto_saving: bool },
+    /// The capture session was restarted (watchdog recovery after a stall —
+    /// e.g. suspend/resume — or a settings change that requires it).
+    CaptureRestarted,
 }
 
 /// Errors encoding/decoding protocol frames.
@@ -75,7 +100,11 @@ impl Event {
     pub fn is_state_change(&self) -> bool {
         matches!(
             self,
-            Event::ClipSaved { .. } | Event::BufferState { .. } | Event::RecordState { .. }
+            Event::ClipSaved { .. }
+                | Event::BufferState { .. }
+                | Event::RecordState { .. }
+                | Event::Marked { .. }
+                | Event::CaptureRestarted
         )
     }
 
@@ -107,6 +136,11 @@ mod tests {
             Command::SetBuffer { enabled: false },
             Command::Status,
             Command::Subscribe,
+            Command::GetConfig,
+            Command::Mark,
+            Command::SetConfig {
+                config: Box::new(Config::default()),
+            },
         ];
         for cmd in cases {
             let bytes = cmd.encode().unwrap();
@@ -134,12 +168,30 @@ mod tests {
             Event::Error {
                 message: "no keyframe in window".to_string(),
             },
+            Event::Config {
+                effective: Box::new(Config::default()),
+                base: Box::new(Config::default()),
+            },
+            Event::Marked { auto_saving: true },
+            Event::CaptureRestarted,
         ];
         for ev in cases {
             let bytes = ev.encode().unwrap();
             let back = Event::decode(&bytes).unwrap();
             assert_eq!(ev, back);
         }
+    }
+
+    #[test]
+    fn broadcast_filter_covers_new_events() {
+        assert!(Event::Marked { auto_saving: false }.is_state_change());
+        assert!(Event::CaptureRestarted.is_state_change());
+        // Config replies are point-to-point, never broadcast.
+        assert!(!Event::Config {
+            effective: Box::new(Config::default()),
+            base: Box::new(Config::default()),
+        }
+        .is_state_change());
     }
 
     #[test]

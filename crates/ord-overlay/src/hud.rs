@@ -9,6 +9,8 @@ pub enum ToastKind {
     Recording,
     Stopped,
     Error,
+    /// A marker ("clip that" bookmark) was placed.
+    Marked,
 }
 
 /// A transient on-screen message with creation + expiry times (monotonic ms).
@@ -25,6 +27,11 @@ pub struct Toast {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Hud {
     pub buffer_active: bool,
+    /// The daemon is unreachable: the renderer shows a distinct hollow/grey
+    /// indicator so "not recording because ordd is down" is visible at a
+    /// glance instead of looking identical to "buffer off". (The silent-death
+    /// failure mode every incumbent recorder is hated for.)
+    pub daemon_offline: bool,
     toasts: Vec<Toast>,
 }
 
@@ -35,6 +42,16 @@ impl Hud {
     /// Set the persistent "replay buffer active" indicator.
     pub fn set_buffer_active(&mut self, active: bool) {
         self.buffer_active = active;
+    }
+
+    /// Set the daemon-offline indicator. Going offline also clears the buffer
+    /// indicator (we no longer know its state — claiming "armed" would be the
+    /// silent-failure lie this HUD exists to prevent).
+    pub fn set_daemon_offline(&mut self, offline: bool) {
+        self.daemon_offline = offline;
+        if offline {
+            self.buffer_active = false;
+        }
     }
 
     /// Push a toast that expires `DEFAULT_TOAST_MS` after `now_ms`.
@@ -95,7 +112,7 @@ impl Hud {
 
     /// Whether there is anything to draw (indicator or toasts).
     pub fn has_content(&self) -> bool {
-        self.buffer_active || !self.toasts.is_empty()
+        self.buffer_active || self.daemon_offline || !self.toasts.is_empty()
     }
 }
 
@@ -188,6 +205,18 @@ mod tests {
         hud.set_buffer_active(true);
         assert!(hud.has_content());
         assert!(!hud.is_animating());
+    }
+
+    #[test]
+    fn offline_clears_buffer_indicator_and_draws() {
+        let mut hud = Hud::default();
+        hud.set_buffer_active(true);
+        hud.set_daemon_offline(true);
+        assert!(!hud.buffer_active, "offline must not claim an armed buffer");
+        assert!(hud.has_content(), "offline state itself is drawn");
+        assert!(!hud.is_animating(), "offline indicator is static");
+        hud.set_daemon_offline(false);
+        assert!(!hud.has_content());
     }
 
     #[test]

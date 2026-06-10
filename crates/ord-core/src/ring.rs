@@ -187,6 +187,16 @@ impl RingBuffer {
         self.frames.iter()
     }
 
+    /// Change the capacity window to `capacity_seconds`, evicting immediately
+    /// if the buffer now holds more than the new window.
+    pub fn set_capacity_seconds(&mut self, capacity_seconds: u32) {
+        debug_assert!(capacity_seconds >= 1, "buffer capacity must be >= 1s");
+        self.capacity_ticks = capacity_seconds.max(1) as i64 * self.ticks_per_sec;
+        if self.max_pts != i64::MIN {
+            self.evict_before(self.max_pts - self.capacity_ticks);
+        }
+    }
+
     /// Clear all buffered frames.
     pub fn clear(&mut self) {
         self.frames.clear();

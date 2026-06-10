@@ -34,8 +34,8 @@ workspace member entry in the root `Cargo.toml`.
 |-------|------|
 | `crates/ord-common` | Shared types + the bincode IPC wire protocol (commands/events). No I/O. |
 | `crates/ord-core`   | The engine: wraps `waycap-rs`, owns the encoded-frame ring buffer, and the keyframe-aware "save last N seconds" muxer (ffmpeg-next, stream-copy, no re-encode). |
-| `crates/ord-daemon` | `ordd`: runs `ord-core`, supervises the buffer, exposes the Unix-socket control plane, game detection (`hyprctl`), and the post-save hook. Hotkeys are compositor keybinds invoking `ord` (no evdev). |
-| `crates/ord-cli`    | `ord`: thin client. Talks to the daemon socket (`save --last N`, `record toggle`, `status`, `buffer on/off`, `subscribe`). What compositor keybinds call. |
+| `crates/ord-daemon` | `ordd`: runs `ord-core`, supervises the buffer, exposes the Unix-socket control plane, game detection (`hyprctl`), storage policy (templates + prune), the capture watchdog, post-save verification + hook, and the layered-config apply (`SetConfig`). Hotkeys are compositor keybinds invoking `ord` (no evdev). |
+| `crates/ord-cli`    | `ord`: thin client. Talks to the daemon socket (`save --last N`, `mark`, `record toggle`, `status`, `buffer on/off`, `config show`, `subscribe`). What compositor keybinds call. |
 | `crates/ord-overlay`| Platform overlay abstraction: the `Overlay` trait + `wlr-layer-shell` (Wayland) implementation + the `ord-hud` binary. X11/Win32 are future implementations of the same trait. |
 | `crates/ord-ui`     | `egui` clip library/manager window: browse, play, trim, export. |
 | `crates/ord-export` | Pure ffmpeg-arg export planning (`plan.rs`, no I/O) + ffprobe wrapper + ffmpeg runner with NVENC→software fallback. Presets (social/GIF/quality) are data, not code. |
@@ -72,6 +72,14 @@ plane or presentation and must never block or copy frames on that path.
 - **All `Mutex` access is lock-tolerant.** Use the shared poisoned-lock-recovery
   helper (`lock_tolerant` pattern) everywhere — including UI crates. A panicked
   worker thread must degrade, not cascade panics through `lock().unwrap()`.
+- **Config is layered; only the daemon writes overrides.** The base
+  `config.toml` (often a read-only Home Manager symlink) is never modified at
+  runtime. Settings changes persist as a sparse diff in
+  `$XDG_STATE_HOME/open-recorder/overrides.toml` (`Config::from_layers` /
+  `diff_overrides` in `ord-common`), written only by `ordd` via `SetConfig`.
+- **UI follows the design system.** All colors, spacing, radii, and type sizes
+  in `ord-ui` come from `ord-ui/src/theme.rs` (sumi grey scale, one vermilion
+  accent, 8-pt rhythm). No hardcoded `Color32`s in views.
 
 ## Testing standards (the quality guarantee)
 

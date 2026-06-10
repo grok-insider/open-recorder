@@ -102,6 +102,52 @@ unsafe fn set_extradata(par: *mut ff::ffi::AVCodecParameters, data: &[u8]) -> Re
     Ok(())
 }
 
+/// Attach chapter marks (millisecond offsets from the clip start) to the
+/// output before `write_header`. Each chapter is titled "Marker N" and runs to
+/// the next mark (the last one to `end_ms`). Markers are how "clip that"
+/// bookmarks survive into the saved file — players and editors show them as a
+/// chapter list.
+pub(crate) fn set_chapters(
+    octx: &mut ff::format::context::Output,
+    marks_ms: &[i64],
+    end_ms: i64,
+) -> Result<(), MuxError> {
+    if marks_ms.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: we build an av_malloc'd AVChapter array exactly as ffmpeg's own
+    // demuxers do and hand ownership to the AVFormatContext, which frees the
+    // chapters, their metadata, and the array in avformat_free_context.
+    unsafe {
+        let n = marks_ms.len();
+        let arr = ff::ffi::av_calloc(n, std::mem::size_of::<*mut ff::ffi::AVChapter>())
+            as *mut *mut ff::ffi::AVChapter;
+        if arr.is_null() {
+            return Err(MuxError::Ffmpeg("av_calloc failed for chapters".into()));
+        }
+        for (i, &start) in marks_ms.iter().enumerate() {
+            let ch = ff::ffi::av_mallocz(std::mem::size_of::<ff::ffi::AVChapter>())
+                as *mut ff::ffi::AVChapter;
+            if ch.is_null() {
+                return Err(MuxError::Ffmpeg("av_mallocz failed for chapter".into()));
+            }
+            (*ch).id = i as i64 + 1;
+            (*ch).time_base = ff::ffi::AVRational { num: 1, den: 1000 };
+            (*ch).start = start.max(0);
+            let end = marks_ms.get(i + 1).copied().unwrap_or(end_ms).max(start);
+            (*ch).end = end;
+            let title = std::ffi::CString::new(format!("Marker {}", i + 1))
+                .unwrap_or_else(|_| std::ffi::CString::default());
+            ff::ffi::av_dict_set(&mut (*ch).metadata, c"title".as_ptr(), title.as_ptr(), 0);
+            *arr.add(i) = ch;
+        }
+        let raw = octx.as_mut_ptr();
+        (*raw).chapters = arr;
+        (*raw).nb_chapters = n as u32;
+    }
+    Ok(())
+}
+
 /// Keeps a millisecond timestamp sequence strictly increasing (the muxer
 /// requires monotonic DTS): equal-or-earlier values are bumped 1 ms past the
 /// previous one.

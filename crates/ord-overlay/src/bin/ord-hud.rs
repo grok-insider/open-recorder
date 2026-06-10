@@ -44,6 +44,19 @@ fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {
         }
         Event::Status { buffer_enabled, .. } => hud.set_buffer_active(*buffer_enabled),
         Event::Error { message } => hud.toast(ToastKind::Error, message.clone(), now_ms),
+        Event::Marked { auto_saving } => {
+            let text = if *auto_saving {
+                "Marked — saving clip"
+            } else {
+                "Marked"
+            };
+            hud.toast(ToastKind::Marked, text, now_ms);
+        }
+        Event::CaptureRestarted => {
+            hud.toast(ToastKind::Recording, "Capture recovered", now_ms);
+        }
+        // Config replies are for settings UIs; nothing to show.
+        Event::Config { .. } => {}
     }
 }
 
@@ -84,12 +97,16 @@ fn main() {
     // reconnecting rather than exiting (which systemd's on-failure would ignore).
     loop {
         let Some(rx) = subscribe(&path) else {
-            // Daemon not up yet; keep the overlay alive and retry shortly.
+            // Daemon not up yet; show the offline indicator (grey dot) so the
+            // user can see at a glance that nothing is being buffered, keep
+            // the overlay alive, and retry shortly.
+            hud.set_daemon_offline(true);
             hud.tick(now_ms());
             overlay.render(&hud, now_ms());
             std::thread::sleep(Duration::from_secs(1));
             continue;
         };
+        hud.set_daemon_offline(false);
 
         // Inner loop: render + drain events until the daemon disconnects. We only
         // repaint when something actually changed (an event arrived or a toast
@@ -115,7 +132,10 @@ fn main() {
                 }
             }
             if disconnected {
-                break; // reconnect, keeping the overlay up
+                // Show offline immediately; the outer loop reconnects.
+                hud.set_daemon_offline(true);
+                overlay.render(&hud, now_ms());
+                break;
             }
             if hud.tick(now_ms()) {
                 dirty = true; // a toast just expired -> repaint the new state once

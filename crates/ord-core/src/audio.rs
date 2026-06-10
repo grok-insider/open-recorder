@@ -143,6 +143,13 @@ impl AudioRingBuffer {
         self.bytes
     }
 
+    /// Change the capacity window to `capacity_seconds`. Takes effect on the
+    /// next push (audio eviction is timestamp-window based, like video).
+    pub fn set_capacity_seconds(&mut self, capacity_seconds: u32) {
+        debug_assert!(capacity_seconds >= 1);
+        self.capacity_micros = capacity_seconds.max(1) as i64 * MICROS_PER_SEC;
+    }
+
     pub fn clear(&mut self) {
         self.frames.clear();
         self.bytes = 0;

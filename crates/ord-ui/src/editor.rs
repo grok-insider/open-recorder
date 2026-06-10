@@ -413,7 +413,7 @@ impl EditorState {
     }
 
     fn timeline_ui(&mut self, ui: &mut egui::Ui) {
-        let accent = egui::Color32::from_rgb(124, 92, 255);
+        let accent = crate::theme::AI;
         let dur = self.player.duration().max(1e-6);
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 84.0), egui::Sense::hover());
@@ -448,7 +448,7 @@ impl EditorState {
         let ph_x = x_of(self.timeline.playhead());
 
         // Track background.
-        painter.rect_filled(track, 4.0, egui::Color32::from_rgb(30, 30, 38));
+        painter.rect_filled(track, 4.0, crate::theme::RAISED);
 
         // Filmstrip tiles spread across the (whole-clip) track, clipped to view.
         self.paint_filmstrip(&painter, track, &view, dur);
@@ -481,7 +481,7 @@ impl EditorState {
             if track.x_range().contains(mx) {
                 painter.line_segment(
                     [egui::pos2(mx, track.top()), egui::pos2(mx, track.bottom())],
-                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 196, 0)),
+                    egui::Stroke::new(1.5, crate::theme::KIN),
                 );
             }
         }

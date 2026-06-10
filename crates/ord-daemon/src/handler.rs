@@ -48,6 +48,46 @@ impl<B: CaptureBackend> Handler<B> {
         self.engine.drain_available()
     }
 
+    /// Whether the replay buffer is meant to be live (the watchdog only
+    /// recovers a stalled capture when the user wants it running).
+    pub fn is_buffer_enabled(&self) -> bool {
+        self.buffer_enabled
+    }
+
+    /// Place a marker at the newest buffered frame (drains first so "now" is
+    /// current). Returns `false` when nothing is buffered.
+    pub fn mark(&mut self) -> bool {
+        self.engine.drain_available();
+        self.engine.mark()
+    }
+
+    /// Drop everything buffered (used by `clear_on_save`).
+    pub fn clear_buffer(&mut self) {
+        self.engine.clear();
+    }
+
+    /// Resize the replay window without touching capture.
+    pub fn set_capacity(&mut self, buffer: BufferSeconds) {
+        self.engine.set_capacity_seconds(buffer.get());
+        self.buffer = buffer;
+    }
+
+    /// Restart the capture session in place (same parameters) — the watchdog's
+    /// recovery for a stalled backend (suspend/resume, output change).
+    pub fn restart_capture(&mut self) -> Result<(), String> {
+        self.engine.restart().map_err(|e| e.to_string())
+    }
+
+    /// Swap in a freshly built engine (encoder settings changed). The caller
+    /// starts the new engine if capture should be live; buffered footage from
+    /// the old engine is dropped with it (a capture restart is a clean cut).
+    pub fn replace_engine(&mut self, engine: Engine<B>) {
+        self.buffer = BufferSeconds::new(engine.capacity_seconds())
+            .unwrap_or_else(|| BufferSeconds::new(1).expect("1 is non-zero"));
+        self.buffer_enabled = engine.is_running();
+        self.engine = engine;
+    }
+
     /// Handle one command, returning the event to send back.
     ///
     /// [`Command::SaveLast`] is intentionally **not** handled here: the server
@@ -67,6 +107,12 @@ impl<B: CaptureBackend> Handler<B> {
             // open and pushes events). The handler replies with an initial status
             // snapshot so the subscriber has current state immediately.
             Command::Subscribe => self.handle_status(),
+            // Config and marker commands are server-dispatched (they touch the
+            // config store / run save flows off-lock). Reaching these arms means
+            // a dispatch wiring bug, same as SaveLast.
+            Command::GetConfig | Command::SetConfig { .. } | Command::Mark => Event::Error {
+                message: "internal: command was not dispatched by the server".into(),
+            },
         }
     }
 

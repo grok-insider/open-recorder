@@ -1,13 +1,17 @@
 //! open-recorder clip library GUI.
 //!
-//! The pure [`library`] model (discover + sort clips) is always available and
-//! tested. The egui view (`app`, behind the `gui` feature) renders from it.
+//! The pure models ([`library`] discover/sort, [`timeline`] trim math,
+//! [`settings`] config editing) are always available and tested. The egui
+//! views (`app`, `editor`, `settings_view`, behind the `gui` feature) render
+//! from them through the [`theme`] design system.
 
 pub mod format;
 pub mod library;
+pub mod settings;
 pub mod timeline;
 
 pub use library::{parse_clip, scan_dir, sort_newest_first, Clip};
+pub use settings::{ApplyTier, SettingsModel};
 
 #[cfg(feature = "gui")]
 pub mod app;
@@ -23,5 +27,9 @@ pub mod glvideo;
 pub mod meta;
 #[cfg(feature = "gui")]
 pub mod player;
+#[cfg(feature = "gui")]
+pub mod settings_view;
+#[cfg(feature = "gui")]
+pub mod theme;
 #[cfg(feature = "gui")]
 pub mod tuning;
