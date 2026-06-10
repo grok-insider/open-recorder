@@ -192,18 +192,34 @@
                   fps = 60;
                   buffer_seconds = 30;
                   quality = "high";
+                  codec = "h264";
+                  clear_on_save = false;
                 };
                 audio = {
                   desktop = true;
                   mic = true;
                 };
+                storage = {
+                  clips_dir = "~/Videos/open-recorder";
+                  template = "{game}{rec}-{epoch}";
+                  max_gib = 25;
+                };
+                markers.auto_save_seconds = 30;
+                hooks.on_clip_saved = "~/bin/clip-hook";
+                overlay.show_status_dot = true;
               };
               description = ''
                 Declarative `~/.config/open-recorder/config.toml`. When null (the
                 default), ordd writes its own default config on first run and the
                 user edits it by hand. When set, the config is managed by Home
-                Manager (read-only). Sections: `capture` (fps, buffer_seconds,
-                quality), `audio` (desktop, mic), `export` (codec, container).
+                Manager (read-only) and stays the BASE layer: in-app settings
+                changes persist as a sparse overrides file in
+                `$XDG_STATE_HOME/open-recorder/overrides.toml`, never here.
+                Sections: `capture` (fps, buffer_seconds, quality, codec,
+                bitrate_kbps, clear_on_save), `audio` (desktop, mic), `storage`
+                (clips_dir, template, max_gib, max_age_days), `markers`
+                (auto_save_seconds), `hooks` (on_clip_saved), `overlay`
+                (show_status_dot), `export` (codec, container).
               '';
             };
           };
