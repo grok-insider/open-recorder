@@ -381,10 +381,15 @@ fn apply_config<B: CaptureBackend>(
         lock_tolerant(handler).set_capacity(buffer);
     }
 
-    Event::Config {
+    let event = Event::Config {
         effective: Box::new(new),
         base: Box::new(c.base.clone()),
-    }
+    };
+    // Config replies are point-to-point, but subscribers (the HUD, an open
+    // settings UI) still need to learn that the effective config changed —
+    // e.g. `overlay.show_status_dot` applies live. Push it explicitly.
+    broadcast(subs, &event);
+    event
 }
 
 fn write_event(stream: &mut UnixStream, event: &Event) -> io::Result<()> {
@@ -664,6 +669,39 @@ mod tests {
             panic!("expected Config");
         };
         assert_eq!(effective.capture.buffer_seconds, 17);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn set_config_pushes_config_to_subscribers() {
+        let path = temp_sock("cfgpush");
+        let listener = bind(&path).unwrap();
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), mock_ctx());
+        });
+
+        let mut sub = UnixStream::connect(&path).unwrap();
+        write_frame(&mut sub, &Command::Subscribe.encode().unwrap()).unwrap();
+        let _snapshot = read_frame(&mut sub).unwrap();
+
+        // A live-tier change (no capture restart): subscribers still see it.
+        let mut client = UnixStream::connect(&path).unwrap();
+        let mut desired = Config::default();
+        desired.overlay.show_status_dot = false;
+        let reply = request(
+            &mut client,
+            &Command::SetConfig {
+                config: Box::new(desired.clone()),
+            },
+        );
+        assert!(matches!(reply, Event::Config { .. }), "{reply:?}");
+
+        sub.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
+        let Event::Config { effective, .. } = pushed else {
+            panic!("expected pushed Config, got {pushed:?}");
+        };
+        assert!(!effective.overlay.show_status_dot);
         let _ = std::fs::remove_file(&path);
     }
 

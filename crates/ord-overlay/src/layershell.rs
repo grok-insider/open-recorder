@@ -281,26 +281,14 @@ impl State {
         // buffer is armed. Static, so with the caller's dirty-tracking it
         // costs nothing while idle. When the daemon is unreachable the dot
         // turns grey — visibly distinct from "armed", never silently absent.
-        if hud.daemon_offline {
-            draw_dot(
-                canvas,
-                w,
-                h,
-                w as f32 - 11.0,
-                11.0,
-                4.5,
-                accent(ToastKind::Stopped),
-            );
-        } else if hud.buffer_active {
-            draw_dot(
-                canvas,
-                w,
-                h,
-                w as f32 - 11.0,
-                11.0,
-                4.5,
-                accent(ToastKind::Recording),
-            );
+        // `overlay.show_status_dot = false` suppresses it entirely.
+        if hud.status_dot_visible() {
+            let color = if hud.daemon_offline {
+                accent(ToastKind::Stopped)
+            } else {
+                accent(ToastKind::Recording)
+            };
+            draw_dot(canvas, w, h, w as f32 - 11.0, 11.0, 4.5, color);
         }
 
         let surface = self.layer.wl_surface();

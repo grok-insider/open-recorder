@@ -24,6 +24,7 @@ pub struct Config {
     pub hooks: HooksConfig,
     pub storage: StorageConfig,
     pub markers: MarkersConfig,
+    pub overlay: OverlayConfig,
 }
 
 impl Config {
@@ -240,6 +241,23 @@ pub struct HooksConfig {
     pub on_clip_saved: Option<String>,
 }
 
+/// The on-screen HUD overlay (`ord-hud`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OverlayConfig {
+    /// Show the persistent status dot in the screen corner (red = buffer
+    /// armed, grey = daemon offline). Toasts are unaffected. Applies live.
+    pub show_status_dot: bool,
+}
+
+impl Default for OverlayConfig {
+    fn default() -> Self {
+        Self {
+            show_status_dot: true,
+        }
+    }
+}
+
 /// Audio capture settings. Both sources are mixed into one track.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -390,6 +408,7 @@ mod tests {
         assert_eq!(c.storage.template, "{game}{rec}-{epoch}");
         assert_eq!(c.storage.max_gib, None);
         assert_eq!(c.markers.auto_save_seconds, None);
+        assert!(c.overlay.show_status_dot);
     }
 
     #[test]
@@ -517,9 +536,23 @@ mod tests {
             markers: MarkersConfig {
                 auto_save_seconds: Some(30),
             },
+            overlay: OverlayConfig {
+                show_status_dot: false,
+            },
         };
         let toml = c.to_toml_string().unwrap();
         assert_eq!(Config::from_toml_str(&toml).unwrap(), c);
+    }
+
+    #[test]
+    fn overlay_section_parses_and_diffs() {
+        let c = Config::from_toml_str("[overlay]\nshow_status_dot = false").unwrap();
+        assert!(!c.overlay.show_status_dot);
+        let base = Config::default();
+        assert_eq!(
+            c.overridden_fields(&base),
+            vec!["overlay.show_status_dot".to_string()]
+        );
     }
 
     #[test]
