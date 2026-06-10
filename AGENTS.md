@@ -158,6 +158,17 @@ post-save hook), `ord-cli` (`ord` incl. `subscribe` and `export`), `ord-overlay`
 (pure plan + runner with NVENC→software fallback). The HUD is verified live on
 Hyprland over fullscreen games. Run `cargo test --all` for the CI set.
 
+The settings/editor feedback round shipped: spinner number inputs + per-row
+captions in settings (aligned label column), a `[overlay] show_status_dot`
+config (HUD dot can be hidden; `SetConfig` broadcasts the new `Config` to
+subscribers, protocol v3), Browse… path pickers (zenity/kdialog), a persistent
+`Subscribe` connection in `ord-ui` (new clips/record state appear live),
+chapter-backed editor markers with snap/jump keys, pointer-anchored wheel
+zoom, frame-accurate paused scrubbing (post-seek keyframe run-up discarded in
+the player), and multi-segment cuts (S split / X toggle; playback skips cut
+pieces; `ord_export::export_segments_with` concatenates kept pieces via
+filter_complex with the NVENC→software fallback).
+
 HEVC/AV1 capture and CBR bitrate control are wired end-to-end: the pinned
 `0xfell/waycap-rs` rev exposes `hevc_nvenc`/`av1_nvenc` and
 `RateControl::ConstantBitrate`, selected via `capture.codec` /
