@@ -428,9 +428,10 @@ impl Player {
             while q.front().map(|f| f.pts() <= pos + 0.005).unwrap_or(false) {
                 chosen = q.pop_front();
             }
-            // Right after a seek the queue may only hold frames slightly ahead;
-            // show the closest upcoming one so a paused scrub isn't blank.
-            if chosen.is_none() && self.shown_pts < 0.0 {
+            // Right after a seek the queue may only hold frames slightly ahead
+            // of the clock; show the closest upcoming one so a (paused) scrub
+            // updates to the seeked image instead of freezing on the old frame.
+            if chosen.is_none() && self.needs_frame {
                 chosen = q.pop_front();
             }
         }
@@ -616,6 +617,10 @@ struct DecodeSession {
     /// or NV12 (GPU path). Skipped entirely when cuvid already gives
     /// preview-sized NV12.
     scaler: Option<ff::software::scaling::context::Context>,
+    /// Precise-seek window: after a seek the demuxer lands on the previous
+    /// keyframe, so frames decoded before this target are discarded instead of
+    /// queued — a scrub shows the frame you pointed at, not the GOP start.
+    drop_until: Option<f64>,
     audio: Option<(usize, ff::decoder::Audio)>,
     /// Built lazily from the first decoded audio frame, because a decoder's
     /// channel layout / format can be unset until then (building it upfront
@@ -673,6 +678,7 @@ impl DecodeSession {
             video_tb,
             vdec,
             scaler: None,
+            drop_until: None,
             audio,
             resampler: None,
             out_rate,
@@ -721,6 +727,9 @@ impl DecodeSession {
             }
             lock_tolerant(&self.shared.frames).clear();
             lock_tolerant(&self.shared.audio_buf).clear();
+            // The demuxer is now at the keyframe BEFORE `t`; decode-and-drop up
+            // to the target so the first queued frame is the one asked for.
+            self.drop_until = Some(t);
         }
     }
 
@@ -774,6 +783,15 @@ impl DecodeSession {
         let mut frame = ff::frame::Video::empty();
         while self.vdec.receive_frame(&mut frame).is_ok() {
             let pts = frame.pts().or_else(|| frame.timestamp()).unwrap_or(0) as f64 * self.video_tb;
+
+            // Precise seek: discard the keyframe-to-target run-up (decode only,
+            // no convert/pack) so a scrub displays the pointed-at frame.
+            if let Some(target) = self.drop_until {
+                if pts < target - 0.005 {
+                    continue;
+                }
+                self.drop_until = None;
+            }
 
             // Skip convert+pack when the queue is full — we'd only drop the
             // result. (We still drained `receive_frame`, so the decoder keeps
