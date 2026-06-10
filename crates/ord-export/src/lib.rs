@@ -21,9 +21,11 @@ pub mod probe;
 pub mod profile;
 pub mod run;
 
-pub use plan::{build_plan, estimated_output_mib, FfmpegPlan, SourceInfo, Trim};
+pub use plan::{
+    build_plan, build_segments_plan, estimated_output_mib, FfmpegPlan, SourceInfo, Trim,
+};
 pub use profile::{ExportProfile, FrameRate, Preset, RateControl, Scale};
-pub use run::{export, export_with, ExportSummary};
+pub use run::{export, export_segments_with, export_with, ExportSummary};
 
 /// The `ffmpeg` binary, overridable via `ORD_FFMPEG` (e.g. a Nix store path).
 /// The single resolver shared by the runner, the probe path, and the GUI so the

@@ -118,6 +118,47 @@ pub fn parse_probe_json(json: &[u8]) -> Result<SourceInfo, ExportError> {
     })
 }
 
+#[derive(Deserialize)]
+struct ChaptersOutput {
+    #[serde(default)]
+    chapters: Vec<ChapterJson>,
+}
+
+#[derive(Deserialize)]
+struct ChapterJson {
+    start_time: Option<String>,
+}
+
+/// Chapter start times (seconds) embedded in `input` — e.g. the markers
+/// `ord mark` writes into saved clips. Missing/none is an empty list.
+pub fn probe_chapters(input: &Path) -> Result<Vec<f64>, ExportError> {
+    let out = Command::new(ffprobe_bin())
+        .args(["-v", "error", "-print_format", "json", "-show_chapters"])
+        .arg(input)
+        .output()
+        .map_err(|e| ExportError::Probe(format!("spawn ffprobe: {e}")))?;
+    if !out.status.success() {
+        return Err(ExportError::Probe(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    parse_chapters_json(&out.stdout)
+}
+
+/// Parse `ffprobe -show_chapters` JSON into start times (testable offline).
+pub fn parse_chapters_json(json: &[u8]) -> Result<Vec<f64>, ExportError> {
+    let parsed: ChaptersOutput =
+        serde_json::from_slice(json).map_err(|e| ExportError::Probe(format!("parse json: {e}")))?;
+    let mut starts: Vec<f64> = parsed
+        .chapters
+        .iter()
+        .filter_map(|c| c.start_time.as_deref().and_then(|s| s.parse::<f64>().ok()))
+        .filter(|t| t.is_finite() && *t >= 0.0)
+        .collect();
+    starts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(starts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +206,23 @@ mod tests {
         assert_eq!(parse_fps("60/1"), 60.0);
         assert_eq!(parse_fps("0/0"), 0.0);
         assert_eq!(parse_fps("24"), 24.0);
+    }
+
+    #[test]
+    fn parses_chapters_sorted() {
+        let json = br#"{"chapters":[
+            {"id":1,"start_time":"12.500","end_time":"12.6","tags":{"title":"m2"}},
+            {"id":0,"start_time":"3.000","end_time":"3.1"},
+            {"id":2,"start_time":"bogus"}
+        ]}"#;
+        assert_eq!(parse_chapters_json(json).unwrap(), vec![3.0, 12.5]);
+    }
+
+    #[test]
+    fn no_chapters_is_empty() {
+        assert!(parse_chapters_json(br#"{}"#).unwrap().is_empty());
+        assert!(parse_chapters_json(br#"{"chapters":[]}"#)
+            .unwrap()
+            .is_empty());
     }
 }
