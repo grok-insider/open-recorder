@@ -7,13 +7,17 @@
 //! repaint to advance the clock, enforce the loop range, and get the video frame
 //! whose pts matches the clock.
 //!
-//! Clips with no audio (or no audio device) fall back to a wall-clock master so
-//! playback still advances. Export stays CLI-based (`ord-export`); this player is
+//! Because the clock counts samples, the audio buffer must track *stream time*:
+//! spans where the stream has no audio (a track that starts late, ends before
+//! the video, or interior holes) are fed to the clock as silence by the decode
+//! thread, paced by the pure decisions in [`crate::pace`]. Clips with no audio
+//! (or no audio device) fall back to a wall-clock master so playback still
+//! advances. Export stays CLI-based (`ord-export`); this player is
 //! preview/playback only and decodes at a reduced width to stay light.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -22,6 +26,8 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use ffmpeg_next as ff;
 use ord_common::lock_tolerant;
+
+use crate::pace::{self, PaceAction, PaceInput};
 
 /// Decode/scale cap for the preview. With the GPU render path the GPU scales the
 /// full-res frame down to the preview widget in one pass (crisp), so we keep the
@@ -41,10 +47,11 @@ const VIDEO_QUEUE_MAX: usize = 30;
 /// between ~22 MB and ~165 MB (NV12), or ~59 MB vs ~442 MB (RGBA), resident while
 /// the editor simply sits paused.
 const PAUSED_QUEUE_MAX: usize = 4;
-/// Audio look-ahead ceiling (interleaved f32 samples) ≈ 2s stereo @ 48k. In
-/// practice the video queue fills first and paces the demuxer, so audio settles
-/// well under this; it's just an upper bound.
-const AUDIO_BUF_MAX: usize = 48_000 * 2 * 2;
+/// How many consecutive (16 ms) UI frames the "this seek can never produce a
+/// frame" condition must hold before [`Player::frame`] stops driving repaints:
+/// long enough for the decode thread's end-of-clip tail-GOP re-run to land its
+/// final frame, short enough that a truly dead seek idles within ~half a second.
+const EOF_SETTLE_TICKS: u8 = 30;
 
 /// Which video decoder the decode thread ended up using.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +99,8 @@ pub struct Stats {
     pub decoded: u64,
     pub dropped: u64,
     pub decoder: DecKind,
+    /// pts (seconds) of the most recently displayed frame.
+    pub shown_pts: f64,
 }
 
 /// A decoded RGBA video frame tagged with its presentation time (seconds).
@@ -166,7 +175,9 @@ struct Shared {
     eof: AtomicBool,
     in_secs: Mutex<f64>,
     out_secs: Mutex<f64>,
-    volume: Mutex<f32>,
+    /// Playback volume as `f32` bits — atomic so the realtime audio callback
+    /// never takes a lock for it.
+    volume_bits: AtomicU32,
     /// Wall-clock anchor used as the master clock when there is no audio.
     play_anchor: Mutex<Option<Instant>>,
     audio_buf: Mutex<VecDeque<f32>>,
@@ -197,6 +208,9 @@ pub struct Player {
     /// True while a freshly-seeked frame hasn't been displayed yet. Drives
     /// repaints when paused so a scrub/seek shows promptly, then we go idle.
     needs_frame: bool,
+    /// Consecutive UI frames the pending seek has looked unsatisfiable (EOF, no
+    /// queued frames, no seek in flight). See [`EOF_SETTLE_TICKS`].
+    eof_settle_ticks: u8,
     shown_pts: f64,
     duration: f64,
     fps: f64,
@@ -226,7 +240,7 @@ impl Player {
             eof: AtomicBool::new(false),
             in_secs: Mutex::new(0.0),
             out_secs: Mutex::new(duration),
-            volume: Mutex::new(1.0),
+            volume_bits: AtomicU32::new(1.0f32.to_bits()),
             play_anchor: Mutex::new(None),
             audio_buf: Mutex::new(VecDeque::new()),
             frames: Mutex::new(VecDeque::new()),
@@ -269,6 +283,7 @@ impl Player {
             render_gl,
             frame_size: None,
             needs_frame: true,
+            eof_settle_ticks: 0,
             shown_pts: -1.0,
             duration,
             fps,
@@ -308,6 +323,7 @@ impl Player {
             decoded: self.shared.decoded.load(Ordering::Relaxed),
             dropped: self.shared.dropped.load(Ordering::Relaxed),
             decoder: self.decoder_kind(),
+            shown_pts: self.shown_pts,
         }
     }
 
@@ -333,7 +349,9 @@ impl Player {
     }
 
     pub fn set_volume(&self, v: f32) {
-        *lock_tolerant(&self.shared.volume) = v.clamp(0.0, 1.0);
+        self.shared
+            .volume_bits
+            .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn set_range(&self, in_s: f64, out_s: f64) {
@@ -364,6 +382,7 @@ impl Player {
         *lock_tolerant(&self.shared.seek_to) = Some(t);
         // Drive repaints until the seeked frame is shown (then we idle if paused).
         self.needs_frame = true;
+        self.eof_settle_ticks = 0;
         if !self.has_audio() {
             let playing = self.is_playing();
             *lock_tolerant(&self.shared.play_anchor) = playing.then(Instant::now);
@@ -481,6 +500,25 @@ impl Player {
             }
         }
 
+        // A pending seek that can never produce a frame (stream exhausted,
+        // nothing queued, no seek in flight — e.g. container duration metadata
+        // outrunning the last real frame) must not drive 60fps repaints
+        // forever. Debounced so the decode thread's end-of-clip tail-GOP
+        // re-run still gets its final frame shown through the repaint stream.
+        if self.needs_frame {
+            let dead = self.shared.eof.load(Ordering::Acquire)
+                && lock_tolerant(&self.shared.seek_to).is_none()
+                && lock_tolerant(&self.shared.frames).is_empty();
+            if dead {
+                self.eof_settle_ticks = self.eof_settle_ticks.saturating_add(1);
+                if self.eof_settle_ticks >= EOF_SETTLE_TICKS {
+                    self.needs_frame = false;
+                }
+            } else {
+                self.eof_settle_ticks = 0;
+            }
+        }
+
         // Only drive continuous repaints while playing or while a seeked frame is
         // still pending; otherwise stay reactive so a paused/idle (or hidden)
         // editor doesn't render at 60fps for nothing.
@@ -576,25 +614,28 @@ fn build_audio_stream(shared: &Arc<Shared>) -> Result<(cpal::Stream, u32, u16), 
                 // open and the editor "auto-plays". Gating here makes paused mean
                 // paused regardless of backend pause support.
                 if !shared_cb.playing.load(Ordering::Acquire) {
-                    data.iter_mut().for_each(|s| *s = 0.0);
+                    data.fill(0.0);
                     return;
                 }
-                let vol = *lock_tolerant(&shared_cb.volume);
-                let mut buf = lock_tolerant(&shared_cb.audio_buf);
-                let mut consumed = 0u64;
-                for s in data.iter_mut() {
-                    match buf.pop_front() {
-                        Some(v) => {
-                            *s = v * vol;
-                            consumed += 1;
-                        }
-                        None => *s = 0.0, // underrun: silence, do NOT advance the clock
+                // Bulk-drain under the lock (two memcpys + a front drain), then
+                // do volume + the underrun zero-fill after releasing it: this is
+                // a realtime callback contending with the decode thread, so the
+                // hold must stay minimal.
+                let consumed = {
+                    let mut buf = lock_tolerant(&shared_cb.audio_buf);
+                    pace::drain_into(data, &mut buf)
+                };
+                let vol = f32::from_bits(shared_cb.volume_bits.load(Ordering::Relaxed));
+                if vol != 1.0 {
+                    for s in &mut data[..consumed] {
+                        *s *= vol;
                     }
                 }
-                drop(buf);
+                // Underrun shortfall: silence, do NOT advance the clock.
+                data[consumed..].fill(0.0);
                 shared_cb
                     .samples_played
-                    .fetch_add(consumed, Ordering::Relaxed);
+                    .fetch_add(consumed as u64, Ordering::Relaxed);
             },
             |e| eprintln!("ord-ui: audio stream error: {e}"),
             None,
@@ -634,6 +675,16 @@ struct DecodeSession {
     /// keyframe, so frames decoded before this target are discarded instead of
     /// queued — a scrub shows the frame you pointed at, not the GOP start.
     drop_until: Option<f64>,
+    /// Last pts discarded by the precise-seek run-up. A target at/past the
+    /// final frame is recovered at EOF by re-running the tail GOP and
+    /// presenting this frame (see [`Self::on_eof`]).
+    runup_last_pts: Option<f64>,
+    /// Furthest decoded video pts (seconds): how far the demuxer has actually
+    /// read. Drives the audio-hole detection in [`pace::pace`].
+    video_demux_pos: f64,
+    /// Container duration (seconds; 0 when unknown) — what the trailing
+    /// silence feed fills toward when audio ends before the video.
+    media_end: f64,
     audio: Option<(usize, ff::decoder::Audio)>,
     /// Audio stream time base (seconds per pts tick), for pts-aware buffering.
     audio_tb: f64,
@@ -657,6 +708,11 @@ struct DecodeSession {
     out_rate: u32,
     out_ch: u16,
     out_layout: ff::channel_layout::ChannelLayout,
+    /// Audio look-ahead cap (samples) at the device rate × channels.
+    audio_buf_max: usize,
+    /// Reused staging for resampled samples, so each push into the shared
+    /// buffer is one bulk extend under the lock instead of a per-sample loop.
+    audio_scratch: Vec<f32>,
 }
 
 impl DecodeSession {
@@ -686,11 +742,9 @@ impl DecodeSession {
 
         let out_rate = shared.sample_rate.load(Ordering::Relaxed) as u32;
         let out_ch = shared.channels.load(Ordering::Relaxed) as u16;
-        let out_layout = if out_ch >= 2 {
-            ff::channel_layout::ChannelLayout::STEREO
-        } else {
-            ff::channel_layout::ChannelLayout::MONO
-        };
+        let out_layout = output_layout(out_ch);
+        let audio_buf_max =
+            (f64::from(out_rate) * f64::from(out_ch) * pace::AUDIO_BUF_SECS) as usize;
         let mut audio: Option<(usize, ff::decoder::Audio)> = None;
         let mut audio_tb = 0.0;
         let mut audio_start = 0.0;
@@ -706,6 +760,11 @@ impl DecodeSession {
             }
         }
 
+        let media_end = match ictx.duration() {
+            d if d > 0 => d as f64 / f64::from(ff::ffi::AV_TIME_BASE),
+            _ => 0.0,
+        };
+
         Some(Self {
             shared,
             render_gl,
@@ -715,6 +774,9 @@ impl DecodeSession {
             vdec,
             scaler: None,
             drop_until: None,
+            runup_last_pts: None,
+            video_demux_pos: 0.0,
+            media_end,
             audio,
             audio_tb,
             audio_start,
@@ -723,6 +785,8 @@ impl DecodeSession {
             out_rate,
             out_ch,
             out_layout,
+            audio_buf_max,
+            audio_scratch: Vec::new(),
         })
     }
 
@@ -731,9 +795,17 @@ impl DecodeSession {
         while !self.shared.stop.load(Ordering::Acquire) {
             self.apply_pending_seek();
 
-            if self.queues_full() {
-                std::thread::sleep(Duration::from_millis(3));
-                continue;
+            match self.pace() {
+                PaceAction::FillSilence(secs) => {
+                    push_silence(&self.shared, secs, self.out_rate, self.out_ch);
+                    self.audio_fill += secs;
+                    continue;
+                }
+                PaceAction::Park => {
+                    std::thread::sleep(Duration::from_millis(3));
+                    continue;
+                }
+                PaceAction::Demux => {}
             }
 
             match packet.read(&mut self.ictx) {
@@ -769,6 +841,8 @@ impl DecodeSession {
             // The demuxer is now at the keyframe BEFORE `t`; decode-and-drop up
             // to the target so the first queued frame is the one asked for.
             self.drop_until = Some(t);
+            self.runup_last_pts = None;
+            self.video_demux_pos = t;
             self.audio_fill = t;
             // Leading audio gap: fill it with silence right now so the audio
             // master clock can advance through it (see `audio_start`).
@@ -792,43 +866,67 @@ impl DecodeSession {
         }
     }
 
-    /// Backpressure: pace the demuxer so it stays only a small, BALANCED amount
-    /// ahead of the master clock — pause demuxing when EITHER buffer is full.
-    ///
-    /// A previous "sleep only when audio is full" let the demuxer read ~2s ahead
-    /// to fill the audio buffer while the small video queue overflowed and
-    /// dropped most frames; video then starved (the same frame held for seconds)
-    /// while audio kept playing. Because video frames arrive at the frame rate,
-    /// the video queue fills first and becomes the pacer, so the demuxer stays
-    /// ~0.5s ahead, audio settles at a similar depth, and no video is dropped in
-    /// steady state.
-    fn queues_full(&self) -> bool {
-        let video_full = lock_tolerant(&self.shared.frames).len() >= self.queue_target();
-        let audio_full =
-            self.audio.is_some() && lock_tolerant(&self.shared.audio_buf).len() >= AUDIO_BUF_MAX;
-        // While the audio clock is starved (playing, no samples buffered), the
-        // demuxer must keep reading toward the next audio packet even with a
-        // full video queue, or pacing deadlocks: the clock can't advance, so
-        // frames never pop, so the queue never drains. Excess video frames are
-        // dropped by the on_video_packet safety valve instead of growing RAM.
-        let audio_starved = self.audio.is_some()
-            && self.shared.playing.load(Ordering::Acquire)
-            && lock_tolerant(&self.shared.audio_buf).is_empty();
-        (video_full && !audio_starved) || audio_full
+    /// Backpressure + master-clock feed: pause demuxing when either look-ahead
+    /// buffer is full, and feed the clock with silence when it runs dry over a
+    /// span the demuxer has already read past without finding audio. The
+    /// decision itself is pure ([`pace::pace`]) — see there for why a dry
+    /// clock must be fed rather than parked on (frozen-clock deadlock) or
+    /// raced after (the old unbounded decode-and-drop CPU runaway).
+    fn pace(&self) -> PaceAction {
+        pace::pace(PaceInput {
+            playing: self.shared.playing.load(Ordering::Acquire),
+            has_audio: self.audio.is_some(),
+            video_queued: lock_tolerant(&self.shared.frames).len(),
+            video_queue_target: self.queue_target(),
+            audio_buffered: lock_tolerant(&self.shared.audio_buf).len(),
+            audio_buf_max: self.audio_buf_max,
+            video_demux_pos: self.video_demux_pos,
+            audio_fill: self.audio_fill,
+        })
     }
 
-    /// End of file: loop back to the in-point when looping + playing, otherwise
-    /// idle (the UI may still seek backwards).
-    fn on_eof(&self) {
+    /// End of file. In order: a pending precise-seek target past the last real
+    /// frame re-runs the tail GOP so its final frame can be shown (a seek to
+    /// the very end would otherwise leave the UI waiting forever); an audio
+    /// track shorter than the video/container keeps the master clock fed with
+    /// trailing silence so the tail plays out at speed and reaches the
+    /// out-point (the UI then stops or loops — the loop wrap is solely the
+    /// UI's seek, which also rebases the clock); otherwise idle (the UI may
+    /// still seek backwards).
+    fn on_eof(&mut self) {
         self.shared.eof.store(true, Ordering::Release);
-        if self.shared.looping.load(Ordering::Acquire)
-            && self.shared.playing.load(Ordering::Acquire)
-        {
-            let (in_s, _) = self.shared.range();
-            *lock_tolerant(&self.shared.seek_to) = Some(in_s);
-        } else {
-            std::thread::sleep(Duration::from_millis(15));
+
+        if self.drop_until.is_some() {
+            if let Some(last) = self.runup_last_pts.take() {
+                let ts = (last * f64::from(ff::ffi::AV_TIME_BASE)) as i64;
+                let _ = self.ictx.seek(ts, ..ts);
+                self.vdec.flush();
+                if let Some((_, adec)) = self.audio.as_mut() {
+                    adec.flush();
+                }
+                self.drop_until = Some(last);
+                // We're decoding again, not at EOF: a stale flag would let the
+                // UI's starved rescue fire mid-recovery and re-seek for nothing.
+                self.shared.eof.store(false, Ordering::Release);
+                return;
+            }
         }
+
+        let end = self.media_end.max(self.video_demux_pos);
+        let fill = pace::eof_silence(
+            self.shared.playing.load(Ordering::Acquire),
+            self.audio.is_some(),
+            self.audio_fill,
+            end,
+            lock_tolerant(&self.shared.audio_buf).len(),
+            self.out_rate as usize * usize::from(self.out_ch),
+        );
+        if let Some(secs) = fill {
+            push_silence(&self.shared, secs, self.out_rate, self.out_ch);
+            self.audio_fill += secs;
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(15));
     }
 
     /// Decode a video packet and queue the converted frames (RGBA or NV12).
@@ -840,14 +938,21 @@ impl DecodeSession {
         let mut frame = ff::frame::Video::empty();
         while self.vdec.receive_frame(&mut frame).is_ok() {
             let pts = frame.pts().or_else(|| frame.timestamp()).unwrap_or(0) as f64 * self.video_tb;
+            if pts > self.video_demux_pos {
+                self.video_demux_pos = pts;
+            }
 
             // Precise seek: discard the keyframe-to-target run-up (decode only,
-            // no convert/pack) so a scrub displays the pointed-at frame.
+            // no convert/pack) so a scrub displays the pointed-at frame. The
+            // last discarded pts is remembered so a target past the final
+            // frame can be recovered at EOF (see `on_eof`).
             if let Some(target) = self.drop_until {
                 if pts < target - 0.005 {
+                    self.runup_last_pts = Some(pts);
                     continue;
                 }
                 self.drop_until = None;
+                self.runup_last_pts = None;
             }
 
             // Skip convert+pack when the queue is full — we'd only drop the
@@ -916,7 +1021,7 @@ impl DecodeSession {
                         }
                         None => self.audio_fill += dur,
                     }
-                    push_audio(&self.shared, &out, self.out_ch);
+                    push_audio(&self.shared, &mut self.audio_scratch, &out, self.out_ch);
                 }
             }
         }
@@ -958,9 +1063,13 @@ fn open_video_decoder(params: ff::codec::Parameters) -> Option<(ff::decoder::Vid
             if let Some(dec) = open_cuvid(&params, name, src_w, src_h) {
                 return Some((dec, DecKind::Nvdec));
             }
-            if force_hw {
-                eprintln!("ord-ui: ORD_DECODE={want} but NVDEC unavailable; using software");
-            }
+            // Never fall back silently: software decode of a 1440p60 clip is a
+            // very different CPU profile, and "the editor is sometimes heavy"
+            // must be diagnosable from the log (the editor also shows a badge).
+            eprintln!(
+                "ord-ui: {name} (NVDEC) unavailable; falling back to software decode — \
+                 preview will use more CPU"
+            );
         } else if force_hw {
             eprintln!("ord-ui: no NVDEC decoder for this codec; using software");
         }
@@ -1079,21 +1188,9 @@ fn pack_nv12(
     let w = src.width() as usize;
     let h = src.height() as usize;
 
-    let ys = src.stride(0);
-    let yd = src.data(0);
-    let mut y = vec![0u8; w * h];
-    for r in 0..h {
-        y[r * w..(r + 1) * w].copy_from_slice(&yd[r * ys..r * ys + w]);
-    }
-
+    let y = pack_plane(src.data(0), src.stride(0), w, h);
     // NV12 chroma: h/2 rows of w bytes (w/2 interleaved Cb,Cr pairs).
-    let ch = h / 2;
-    let us = src.stride(1);
-    let ud = src.data(1);
-    let mut uv = vec![0u8; w * ch];
-    for r in 0..ch {
-        uv[r * w..(r + 1) * w].copy_from_slice(&ud[r * us..r * us + w]);
-    }
+    let uv = pack_plane(src.data(1), src.stride(1), w, h / 2);
 
     crate::glvideo::Nv12 {
         w,
@@ -1110,36 +1207,97 @@ fn pack_nv12(
 fn pack_rgba(rgba: &ff::frame::Video, pts: f64) -> VideoFrame {
     let w = rgba.width() as usize;
     let h = rgba.height() as usize;
-    let stride = rgba.stride(0);
-    let data = rgba.data(0);
-    let row = w * 4;
-    let mut buf = vec![0u8; row * h];
-    for y in 0..h {
-        let src = &data[y * stride..y * stride + row];
-        buf[y * row..(y + 1) * row].copy_from_slice(src);
-    }
     VideoFrame {
         width: w,
         height: h,
-        rgba: buf,
+        rgba: pack_plane(rgba.data(0), rgba.stride(0), w * 4, h),
         pts,
     }
 }
 
+/// Copy `h` rows of `row` bytes out of a (possibly padded) plane into a tight
+/// buffer. `with_capacity` + extend: no zero-fill memset of multi-MB buffers
+/// on the per-frame path, and a single memcpy when the plane is already tight.
+fn pack_plane(data: &[u8], stride: usize, row: usize, h: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(row * h);
+    if stride == row {
+        buf.extend_from_slice(&data[..row * h]);
+    } else {
+        for r in 0..h {
+            buf.extend_from_slice(&data[r * stride..r * stride + row]);
+        }
+    }
+    buf
+}
+
+/// The resampler's output layout must describe the device's REAL channel
+/// count: the buffer, the callback, and the master clock all count interleaved
+/// samples at `out_ch` channels, so resampling to a fixed stereo layout on a
+/// 5.1/7.1 sink would scramble channels and drain the buffer at the wrong rate
+/// (chronic underrun + distortion).
+fn output_layout(out_ch: u16) -> ff::channel_layout::ChannelLayout {
+    ff::channel_layout::ChannelLayout::default(i32::from(out_ch.max(1)))
+}
+
 /// Append `secs` of silence to the audio buffer (pts-gap filler: keeps the
 /// sample-counting master clock aligned with stream time across audio holes).
+/// Extends in ≤250 ms chunks, releasing the lock between them — the buffer is
+/// shared with the realtime audio callback and a leading gap can be tens of
+/// seconds wide.
 fn push_silence(shared: &Arc<Shared>, secs: f64, rate: u32, channels: u16) {
-    let n = (secs * rate.max(1) as f64) as usize * channels.max(1) as usize;
-    let mut buf = lock_tolerant(&shared.audio_buf);
-    buf.extend(std::iter::repeat_n(0.0f32, n));
+    let per_sec = rate.max(1) as usize * channels.max(1) as usize;
+    let mut left = (secs * rate.max(1) as f64) as usize * channels.max(1) as usize;
+    let chunk = (per_sec / 4).max(1);
+    while left > 0 {
+        let n = left.min(chunk);
+        lock_tolerant(&shared.audio_buf).extend(std::iter::repeat_n(0.0f32, n));
+        left -= n;
+    }
 }
 
 /// Push interleaved F32 samples from a resampled audio frame into the buffer.
-fn push_audio(shared: &Arc<Shared>, out: &ff::frame::Audio, channels: u16) {
+/// The byte→f32 conversion happens into `scratch` first so the lock — shared
+/// with the realtime audio callback — is held for one bulk extend only.
+fn push_audio(shared: &Arc<Shared>, scratch: &mut Vec<f32>, out: &ff::frame::Audio, channels: u16) {
     let n = out.samples() * channels as usize;
     let bytes = out.data(0);
-    let mut buf = lock_tolerant(&shared.audio_buf);
-    for chunk in bytes.chunks_exact(4).take(n) {
-        buf.push_back(f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    scratch.clear();
+    scratch.extend(
+        bytes
+            .chunks_exact(4)
+            .take(n)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]])),
+    );
+    lock_tolerant(&shared.audio_buf).extend(scratch.iter().copied());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The resampler output layout, the buffer accounting, and the clock all
+    /// assume the device's channel count — a fixed stereo layout on a 5.1 sink
+    /// scrambled channels and drained the buffer 3× too fast.
+    #[test]
+    fn output_layout_matches_device_channel_count() {
+        for ch in [1u16, 2, 6, 8] {
+            assert_eq!(output_layout(ch).channels(), i32::from(ch));
+        }
+        // Degenerate input clamps to mono rather than an empty layout.
+        assert_eq!(output_layout(0).channels(), 1);
+    }
+
+    #[test]
+    fn pack_plane_strips_row_padding() {
+        // 3 rows of 4 bytes with stride 6 (2 padding bytes per row).
+        let data: Vec<u8> = (0..18).collect();
+        let tight = pack_plane(&data, 6, 4, 3);
+        assert_eq!(tight, vec![0, 1, 2, 3, 6, 7, 8, 9, 12, 13, 14, 15]);
+    }
+
+    #[test]
+    fn pack_plane_tight_stride_is_one_copy() {
+        let data: Vec<u8> = (0..12).collect();
+        assert_eq!(pack_plane(&data, 4, 4, 3), data);
     }
 }

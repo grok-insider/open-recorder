@@ -85,6 +85,10 @@ pub struct LibraryApp {
     loading: bool,
     /// When `Some`, the trim editor is shown instead of the library grid.
     editor: Option<EditorState>,
+    /// A library rescan (new clip saved / recording stopped) arrived while the
+    /// editor was open: deferred until it closes, so the full ffprobe sweep
+    /// doesn't compete with the preview decoder mid-playback.
+    pending_refresh: bool,
     watchdog: crate::diag::Watchdog,
     /// One-shot: honor `ORD_OPEN=<clip>` (debug) to open straight into the editor.
     auto_open_tried: bool,
@@ -138,6 +142,7 @@ impl LibraryApp {
             styled: false,
             loading: false,
             editor: None,
+            pending_refresh: false,
             watchdog: crate::diag::Watchdog::start(std::time::Duration::from_secs(4)),
             auto_open_tried: false,
             was_focused: true,
@@ -187,7 +192,7 @@ impl LibraryApp {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or(path);
                     self.set_status(format!("Saved {}s → {name}", duration.get()));
-                    self.refresh(ctx);
+                    self.request_refresh(ctx);
                 }
                 Ok(Event::BufferState { enabled }) => {
                     if let Some(d) = self.daemon.as_mut() {
@@ -207,7 +212,7 @@ impl LibraryApp {
                         self.set_status("Recording started — writing until you press Stop");
                     } else {
                         self.set_status("Recording stopped — added to the library");
-                        self.refresh(ctx);
+                        self.request_refresh(ctx);
                     }
                 }
                 Ok(Event::Error { message }) => {
@@ -273,7 +278,7 @@ impl LibraryApp {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or(path);
                     self.set_status(format!("Saved {}s → {name}", duration.get()));
-                    self.refresh(ctx);
+                    self.request_refresh(ctx);
                 }
                 Event::RecordState { recording } => {
                     if let Some(d) = self.daemon.as_mut() {
@@ -284,7 +289,7 @@ impl LibraryApp {
                     } else {
                         self.set_status("Recording stopped — added to the library");
                         // The finished recording is a new file on disk.
-                        self.refresh(ctx);
+                        self.request_refresh(ctx);
                     }
                 }
                 Event::BufferState { enabled } => {
@@ -368,6 +373,17 @@ impl LibraryApp {
         self.states.clear();
         self.confirm_delete = None;
         self.start_loading(ctx);
+    }
+
+    /// Rescan now — unless the editor is open, in which case defer until it
+    /// closes: a refresh runs one ffprobe per clip plus thumbnail decodes, and
+    /// that sweep competing with the preview decoder is audible/visible.
+    fn request_refresh(&mut self, ctx: &egui::Context) {
+        if self.editor.is_some() {
+            self.pending_refresh = true;
+        } else {
+            self.refresh(ctx);
+        }
     }
 
     /// Spawn the loader thread for the current clip set.
@@ -651,6 +667,11 @@ impl eframe::App for LibraryApp {
                     self.run_export(&clip, &stem, &stem, preset, trim, segments, mute, ctx);
                     self.editor = None;
                 }
+            }
+            // Clips saved while editing were deferred; rescan now it's closed.
+            if self.editor.is_none() && self.pending_refresh {
+                self.pending_refresh = false;
+                self.refresh(ctx);
             }
             return;
         }
