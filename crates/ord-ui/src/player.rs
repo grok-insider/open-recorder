@@ -160,6 +160,10 @@ struct Shared {
     dec_kind: AtomicU8,
     seek_base: Mutex<f64>,
     seek_to: Mutex<Option<f64>>,
+    /// The demuxer reached end of file (cleared by a seek). Lets the UI end
+    /// playback when the audio clock can no longer advance (e.g. the audio
+    /// track is shorter than the container duration).
+    eof: AtomicBool,
     in_secs: Mutex<f64>,
     out_secs: Mutex<f64>,
     volume: Mutex<f32>,
@@ -219,6 +223,7 @@ impl Player {
             dec_kind: AtomicU8::new(0),
             seek_base: Mutex::new(0.0),
             seek_to: Mutex::new(Some(0.0)),
+            eof: AtomicBool::new(false),
             in_secs: Mutex::new(0.0),
             out_secs: Mutex::new(duration),
             volume: Mutex::new(1.0),
@@ -410,7 +415,15 @@ impl Player {
         // Loop / stop at the out-point when playing the selection.
         if self.is_playing() {
             let (in_s, out_s) = self.shared.range();
-            if self.position() >= out_s.min(self.duration) - 0.001 {
+            // The stream is exhausted and the audio clock has nothing left to
+            // count — e.g. an audio track shorter than the container. Without
+            // this the clock freezes shy of the out-point and "play" looks
+            // stuck near the end forever.
+            let starved = self.shared.eof.load(Ordering::Acquire)
+                && self.has_audio()
+                && lock_tolerant(&self.shared.audio_buf).is_empty()
+                && lock_tolerant(&self.shared.frames).is_empty();
+            if self.position() >= out_s.min(self.duration) - 0.001 || starved {
                 if self.looping() {
                     self.seek(in_s);
                 } else {
@@ -622,6 +635,21 @@ struct DecodeSession {
     /// queued — a scrub shows the frame you pointed at, not the GOP start.
     drop_until: Option<f64>,
     audio: Option<(usize, ff::decoder::Audio)>,
+    /// Audio stream time base (seconds per pts tick), for pts-aware buffering.
+    audio_tb: f64,
+    /// The audio stream's start time (seconds). A recording whose audio
+    /// begins after its video has a leading gap that must be silence-filled
+    /// IMMEDIATELY on seek: the gap is wider than the video look-ahead queue,
+    /// so waiting to *decode* the first audio packet would deadlock the
+    /// demux pacing (full video queue + empty audio buffer + frozen clock).
+    audio_start: f64,
+    /// Stream time (seconds) the audio buffer has been filled up to. The audio
+    /// clock counts *samples*, so the buffer must follow the stream's pts:
+    /// leading/internal gaps are filled with silence (a recording whose audio
+    /// starts late would otherwise freeze the clock at 0 — "play does
+    /// nothing"), and pre-seek-target frames from the keyframe run-up are
+    /// dropped instead of playing early.
+    audio_fill: f64,
     /// Built lazily from the first decoded audio frame, because a decoder's
     /// channel layout / format can be unset until then (building it upfront
     /// produced a mis-configured resampler → silent audio).
@@ -640,10 +668,14 @@ impl DecodeSession {
         let video_tb = f64::from(video_stream.time_base());
         let video_params = video_stream.parameters();
 
-        let audio_info = ictx
-            .streams()
-            .best(ff::media::Type::Audio)
-            .map(|s| (s.index(), s.parameters()));
+        let audio_info = ictx.streams().best(ff::media::Type::Audio).map(|s| {
+            let tb = f64::from(s.time_base());
+            let start = match s.start_time() {
+                ff::ffi::AV_NOPTS_VALUE => 0.0,
+                ts => ts as f64 * tb,
+            };
+            (s.index(), s.parameters(), tb, start)
+        });
 
         // Choose the video decoder: NVDEC (GPU decode + GPU downscale) when
         // available, else frame-threaded software decode. NVDEC moves the
@@ -660,12 +692,16 @@ impl DecodeSession {
             ff::channel_layout::ChannelLayout::MONO
         };
         let mut audio: Option<(usize, ff::decoder::Audio)> = None;
+        let mut audio_tb = 0.0;
+        let mut audio_start = 0.0;
         if shared.has_audio.load(Ordering::Acquire) {
-            if let Some((aidx, aparams)) = audio_info {
+            if let Some((aidx, aparams, tb, start)) = audio_info {
                 if let Ok(adec) = ff::codec::context::Context::from_parameters(aparams)
                     .and_then(|c| c.decoder().audio())
                 {
                     audio = Some((aidx, adec));
+                    audio_tb = tb;
+                    audio_start = start;
                 }
             }
         }
@@ -680,6 +716,9 @@ impl DecodeSession {
             scaler: None,
             drop_until: None,
             audio,
+            audio_tb,
+            audio_start,
+            audio_fill: 0.0,
             resampler: None,
             out_rate,
             out_ch,
@@ -730,6 +769,15 @@ impl DecodeSession {
             // The demuxer is now at the keyframe BEFORE `t`; decode-and-drop up
             // to the target so the first queued frame is the one asked for.
             self.drop_until = Some(t);
+            self.audio_fill = t;
+            // Leading audio gap: fill it with silence right now so the audio
+            // master clock can advance through it (see `audio_start`).
+            if self.audio.is_some() && self.audio_start > t + 0.05 {
+                let gap = (self.audio_start - t).clamp(0.0, 30.0);
+                push_silence(&self.shared, gap, self.out_rate, self.out_ch);
+                self.audio_fill = self.audio_start;
+            }
+            self.shared.eof.store(false, Ordering::Release);
         }
     }
 
@@ -758,12 +806,21 @@ impl DecodeSession {
         let video_full = lock_tolerant(&self.shared.frames).len() >= self.queue_target();
         let audio_full =
             self.audio.is_some() && lock_tolerant(&self.shared.audio_buf).len() >= AUDIO_BUF_MAX;
-        video_full || audio_full
+        // While the audio clock is starved (playing, no samples buffered), the
+        // demuxer must keep reading toward the next audio packet even with a
+        // full video queue, or pacing deadlocks: the clock can't advance, so
+        // frames never pop, so the queue never drains. Excess video frames are
+        // dropped by the on_video_packet safety valve instead of growing RAM.
+        let audio_starved = self.audio.is_some()
+            && self.shared.playing.load(Ordering::Acquire)
+            && lock_tolerant(&self.shared.audio_buf).is_empty();
+        (video_full && !audio_starved) || audio_full
     }
 
     /// End of file: loop back to the in-point when looping + playing, otherwise
     /// idle (the UI may still seek backwards).
     fn on_eof(&self) {
+        self.shared.eof.store(true, Ordering::Release);
         if self.shared.looping.load(Ordering::Acquire)
             && self.shared.playing.load(Ordering::Acquire)
         {
@@ -832,9 +889,33 @@ impl DecodeSession {
                 )
                 .ok();
             }
+            let pts = frame
+                .pts()
+                .or_else(|| frame.timestamp())
+                .map(|p| p as f64 * self.audio_tb);
             if let Some(res) = self.resampler.as_mut() {
                 let mut out = ff::frame::Audio::empty();
                 if res.run(&frame, &mut out).is_ok() {
+                    let dur = out.samples() as f64 / (self.out_rate.max(1) as f64);
+                    match pts {
+                        Some(p) => {
+                            // Keyframe run-up from before the seek target:
+                            // playing it would land audio ahead of the clock.
+                            if p + dur <= self.audio_fill + 0.01 {
+                                continue;
+                            }
+                            // A leading/internal pts gap (e.g. a recording
+                            // whose audio starts later than its video): fill
+                            // with silence so the sample-counting clock stays
+                            // locked to stream time instead of freezing.
+                            let gap = (p - self.audio_fill).clamp(0.0, 10.0);
+                            if gap > 0.05 {
+                                push_silence(&self.shared, gap, self.out_rate, self.out_ch);
+                            }
+                            self.audio_fill = self.audio_fill.max(p) + dur;
+                        }
+                        None => self.audio_fill += dur,
+                    }
                     push_audio(&self.shared, &out, self.out_ch);
                 }
             }
@@ -1043,6 +1124,14 @@ fn pack_rgba(rgba: &ff::frame::Video, pts: f64) -> VideoFrame {
         rgba: buf,
         pts,
     }
+}
+
+/// Append `secs` of silence to the audio buffer (pts-gap filler: keeps the
+/// sample-counting master clock aligned with stream time across audio holes).
+fn push_silence(shared: &Arc<Shared>, secs: f64, rate: u32, channels: u16) {
+    let n = (secs * rate.max(1) as f64) as usize * channels.max(1) as usize;
+    let mut buf = lock_tolerant(&shared.audio_buf);
+    buf.extend(std::iter::repeat_n(0.0f32, n));
 }
 
 /// Push interleaved F32 samples from a resampled audio frame into the buffer.
