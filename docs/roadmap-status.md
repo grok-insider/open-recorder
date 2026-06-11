@@ -152,6 +152,15 @@ scrubbing, multi-segment cuts). Verified by `cargo fmt` /
   (no focus-stealing after clicking a button). Save ▾ menu shows the buffered
   seconds and what each entry will do; buffer toggle and saves give instant
   status feedback.
+- [x] **Split/cut v2** — cut points are first-class: drag a cut line to slide
+  it (grip handle mid-track, preview follows frame-accurately, marker
+  snapping), Backspace or right-click a cut line joins the pieces back
+  (kept-if-either-kept semantics), "✕ Cut In→Out" removes the selected range
+  in one action and clears the selection, Ctrl+Z / ↶ Undo reverts cut edits
+  (bounded snapshot stack), cut pieces draw a diagonal hatch + "✕ cut" badge,
+  and the piece under the pointer lifts to hint the X/right-click target.
+  Model ops (`move_cut`/`join_at`/`cut_range`) are unit-tested; the whole
+  flow was driven end-to-end in the Xvfb bench.
 
 ## Left to do
 
