@@ -100,6 +100,88 @@ fn recorder_streams_probeable_av() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// First/last packet pts (seconds) for one stream (`"v"` / `"a"`), or `None`
+/// when ffprobe is unavailable.
+fn ffprobe_stream_bounds(path: &std::path::Path, sel: &str) -> Option<(f64, f64)> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            sel,
+            "-show_entries",
+            "packet=pts_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let pts: Vec<f64> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    Some((*pts.first()?, *pts.last()?))
+}
+
+#[test]
+fn recorder_keeps_preroll_audio_and_trims_trailing_audio() {
+    // Mimics the real pump order: NVENC emits video with latency, so the
+    // audio for the recording's first moments arrives BEFORE the keyframe
+    // that carries the matching timestamp. The old recorder dropped all of it
+    // (a ~1 s silent hole at the start) and let audio run past the last video
+    // frame at the end (a frozen tail).
+    let aparams = Some(AudioParams {
+        sample_rate: 48_000,
+        channels: 2,
+        codec: AudioCodec::Opus,
+    });
+    let out = std::env::temp_dir().join(format!("ord-record-align-{}.mkv", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let mut rec = Recorder::start(&out, params(), aparams).expect("start recorder");
+
+    let chunk = 20_000i64; // 20 ms opus chunks (µs)
+    let audio = |t_us: i64| EncodedAudioFrame::new(vec![0xfcu8; 40], 0, t_us);
+
+    // Audio for t = 0..1.5 s arrives first (video still inside the encoder).
+    for i in 0..75 {
+        rec.push_audio(&audio(i * chunk)).expect("preroll audio");
+    }
+    // Video arrives late: keyframe at t = 1 s, deltas at 60 fps until t = 2 s.
+    let step = NANOS_PER_SEC / 60;
+    let t0 = NANOS_PER_SEC; // 1 s in ticks (ns)
+    for i in 0..60i64 {
+        let kf = i == 0;
+        let pts = t0 + i * step;
+        rec.push_video(&EncodedFrame::new(access_unit(kf), kf, pts, pts))
+            .expect("push video");
+    }
+    // The remaining audio, including a tail past the last video frame.
+    for i in 75..150 {
+        rec.push_audio(&audio(i * chunk)).expect("tail audio");
+    }
+    let path = rec.finish().expect("finish");
+
+    if let (Some((v_first, v_last)), Some((a_first, a_last))) = (
+        ffprobe_stream_bounds(&path, "v"),
+        ffprobe_stream_bounds(&path, "a"),
+    ) {
+        // Audio from before the keyframe was dropped, but the preroll that
+        // matches the video start was kept: both tracks start together.
+        assert!(
+            (a_first - v_first).abs() <= 0.05,
+            "audio starts at {a_first}, video at {v_first}"
+        );
+        // No audio outruns the last video frame (one chunk of slack).
+        assert!(
+            a_last <= v_last + 0.021,
+            "audio ends at {a_last}, video at {v_last}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn recorder_drops_until_first_keyframe() {
     let out = std::env::temp_dir().join(format!("ord-record-kf-{}.mkv", std::process::id()));
