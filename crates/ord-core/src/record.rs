@@ -57,9 +57,18 @@ mod stub {
 mod imp {
     use super::*;
 
+    use std::collections::VecDeque;
+
     use ffmpeg_next as ff;
 
     use crate::mux::{bitstream, stream};
+
+    /// How much encoded audio (µs) is held while waiting for the first video
+    /// keyframe. NVENC emits frames with encode latency, so in pump order the
+    /// audio for the recording's first moments arrives BEFORE the keyframe
+    /// carrying the matching timestamp — dropping it left recordings with a
+    /// silent (and player-confusing) audio hole at the start.
+    const AUDIO_PREROLL_US: i64 = 5_000_000;
 
     /// An open recording: a live ffmpeg output context fed encoded packets.
     pub struct Recorder {
@@ -76,6 +85,14 @@ mod imp {
         video_base_us: i64,
         video_dts: stream::MonotonicMs,
         audio_ts: stream::MonotonicMs,
+        /// Audio held until video catches up: before the header it is the
+        /// (bounded) preroll; afterwards it absorbs the encoder's video
+        /// latency so audio is only written up to the newest video pts —
+        /// `finish` then drops whatever trails the last frame, keeping the
+        /// audio track from out-running the video by a second of frozen tail.
+        pending_audio: VecDeque<EncodedAudioFrame>,
+        /// Rebased pts (ms) of the newest written video packet.
+        last_video_ms: i64,
     }
 
     impl Recorder {
@@ -100,6 +117,8 @@ mod imp {
                 video_base_us: 0,
                 video_dts: stream::MonotonicMs::new(),
                 audio_ts: stream::MonotonicMs::new(),
+                pending_audio: VecDeque::new(),
+                last_video_ms: 0,
             })
         }
 
@@ -130,36 +149,69 @@ mod imp {
                 packet.set_flags(ff::codec::packet::Flags::KEY);
             }
             packet.write_interleaved(&mut self.octx)?;
-            Ok(())
+
+            self.last_video_ms = self.last_video_ms.max(pts);
+            self.flush_audio()
         }
 
-        /// Push one encoded audio frame (ignored before the video header is
-        /// written, or if its rebased timestamp would precede the start).
+        /// Push one encoded audio frame. Audio is buffered, not written
+        /// directly: it flushes as video advances (see `pending_audio`).
         pub fn push_audio(&mut self, frame: &EncodedAudioFrame) -> Result<(), MuxError> {
+            if self.audio_params.is_none() || frame.data.is_empty() {
+                return Ok(());
+            }
+            self.pending_audio.push_back(frame.clone());
+            if !self.started {
+                // Bound the preroll: keep only the newest few seconds.
+                while let (Some(front), Some(back)) =
+                    (self.pending_audio.front(), self.pending_audio.back())
+                {
+                    if back.timestamp_micros - front.timestamp_micros > AUDIO_PREROLL_US {
+                        self.pending_audio.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                return Ok(());
+            }
+            self.flush_audio()
+        }
+
+        /// Write buffered audio up to the newest video pts; drop anything from
+        /// before the recording start.
+        fn flush_audio(&mut self) -> Result<(), MuxError> {
             let Some(aidx) = self.audio_index else {
+                self.pending_audio.clear();
                 return Ok(());
             };
-            if !self.started || frame.data.is_empty() {
-                return Ok(());
+            while let Some(front) = self.pending_audio.front() {
+                let ts = (front.timestamp_micros - self.video_base_us) / 1000;
+                if ts > self.last_video_ms {
+                    break; // hold until video catches up
+                }
+                let Some(frame) = self.pending_audio.pop_front() else {
+                    break;
+                };
+                if ts < 0 {
+                    continue; // audio from before the first keyframe
+                }
+                let ts = self.audio_ts.next(ts);
+                let mut packet = ff::codec::packet::Packet::copy(&frame.data);
+                packet.set_pts(Some(ts));
+                packet.set_dts(Some(ts));
+                packet.set_stream(aidx);
+                packet.write_interleaved(&mut self.octx)?;
             }
-            let ts = (frame.timestamp_micros - self.video_base_us) / 1000;
-            if ts < 0 {
-                return Ok(());
-            }
-            let ts = self.audio_ts.next(ts);
-
-            let mut packet = ff::codec::packet::Packet::copy(&frame.data);
-            packet.set_pts(Some(ts));
-            packet.set_dts(Some(ts));
-            packet.set_stream(aidx);
-            packet.write_interleaved(&mut self.octx)?;
             Ok(())
         }
 
-        /// Finalize the file and return its path. A recording that never saw a
-        /// keyframe leaves an (empty) header-less file, which the caller removes.
+        /// Finalize the file and return its path. Buffered audio past the last
+        /// video frame is dropped so both tracks end together. A recording that
+        /// never saw a keyframe leaves an (empty) header-less file, which the
+        /// caller removes.
         pub fn finish(mut self) -> Result<PathBuf, MuxError> {
             if self.started {
+                self.flush_audio()?;
                 self.octx.write_trailer()?;
             }
             Ok(self.path)
