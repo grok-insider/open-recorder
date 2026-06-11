@@ -139,6 +139,11 @@ impl AudioRingBuffer {
         self.frames.is_empty()
     }
 
+    /// Capture timestamp (µs) of the newest buffered frame, if any.
+    pub fn newest_timestamp_micros(&self) -> Option<Ticks> {
+        self.frames.back().map(|f| f.timestamp_micros)
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }
