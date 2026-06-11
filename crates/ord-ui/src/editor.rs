@@ -16,7 +16,7 @@ use eframe::egui;
 use ord_export::{Preset, Trim};
 
 use crate::format::human_duration;
-use crate::player::{Player, PreviewFrame};
+use crate::player::{DecKind, Player, PreviewFrame};
 use crate::timeline::{Segments, Timeline, View};
 
 const FILMSTRIP_TILES: usize = 14;
@@ -587,6 +587,19 @@ impl EditorState {
                     human_duration(pos),
                     human_duration(self.player.duration())
                 ));
+                // NVDEC fell back to CPU decoding: say so, instead of leaving
+                // "the editor is sometimes heavy" undiagnosable (F3 has detail).
+                if self.player.decoder_kind() == DecKind::Software {
+                    ui.label(
+                        egui::RichText::new("sw decode")
+                            .color(ui.visuals().weak_text_color())
+                            .size(11.0),
+                    )
+                    .on_hover_text(
+                        "Hardware (NVDEC) decoding is unavailable for this clip, so the \
+                         preview decodes on the CPU and may use noticeably more of it.",
+                    );
+                }
             });
         });
     }

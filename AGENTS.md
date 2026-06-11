@@ -175,3 +175,22 @@ HEVC/AV1 capture and CBR bitrate control are wired end-to-end: the pinned
 `capture.bitrate_kbps` in `config.toml`, with matching `hvcC`/`av1C` extradata
 from the bitstream module. When bumping the waycap-rs rev, update both
 `crates/ord-core/Cargo.toml` and the `outputHashes` entry in `flake.nix`.
+
+The editor-playback runaway (intermittent >100% CPU + GPU churn, slow-motion
+video, crackling audio) is fixed. The preview player's demux pacing and
+master-clock feed are now pure decisions in `ord-ui/src/pace.rs` (unit-tested,
+no GPU): a dry audio clock over a span the demuxer already read past is fed
+bounded silence — never demux-raced (the old unbounded decode-and-drop) and
+never frozen — and at EOF the clock is fed to the container end so an audio
+track shorter than the video plays the tail out and stops/loops cleanly. Loop
+wrap is solely the UI's seek (the decode-thread wrap that skipped clock
+rebasing is gone). Seeks to/past the final frame re-run the tail GOP at EOF to
+show the last frame, with a debounced `needs_frame` settle so a paused editor
+can't repaint at 60fps forever. The realtime cpal callback bulk-drains under a
+short lock (atomic volume, chunked silence pushes), the resampler targets the
+device's real channel count (5.1/7.1 sinks no longer scramble/over-drain), the
+GL path samples bilinear instead of regenerating mip chains per frame, NVDEC→
+software fallback is logged + badged in the transport bar, and library rescans
+defer while the editor is open. Regression smoke tests in
+`ord-ui/tests/player_smoke.rs` (`--ignored`, devshell) cover the
+audio-shorter-than-video tail and end-of-clip seeks.
