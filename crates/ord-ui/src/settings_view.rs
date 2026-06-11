@@ -187,21 +187,19 @@ impl SettingsView {
                     return;
                 };
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    // One centered column, ~620px: a form wants a measure, not
-                    // the full window width.
-                    let col = 620.0_f32.min(ui.available_width() - 2.0 * theme::SP_4);
-                    let pad = ((ui.available_width() - col) / 2.0).max(theme::SP_4);
-                    ui.horizontal(|ui| {
-                        ui.add_space(pad);
-                        ui.vertical(|ui| {
-                            ui.set_width(col);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        // One centered column, ~620px: a form wants a measure,
+                        // not the full window width.
+                        let col = 620.0_f32.min(ui.available_width() - 2.0 * theme::SP_4);
+                        ui.vertical_centered(|ui| {
+                            ui.set_max_width(col);
                             ui.add_space(theme::SP_3);
                             browse_request = form(ui, model, browsing);
-                            ui.add_space(96.0); // room above the sticky footer
+                            ui.add_space(theme::SP_6); // breathing room at the end
                         });
                     });
-                });
             });
         if let Some(target) = browse_request {
             self.start_browse(target, ctx);
@@ -368,14 +366,18 @@ fn row(
             ui.painter().circle_filled(rect.center(), 2.2, theme::KIN);
             resp.on_hover_text("Overrides the base config");
         }
-        ui.add_sized(
-            [LABEL_W, 20.0],
-            egui::Label::new(
-                egui::RichText::new(label)
-                    .size(theme::TEXT_BODY)
-                    .color(theme::INK_2),
-            )
-            .halign(egui::Align::LEFT),
+        // Fixed-width, left-aligned label column so every control starts on
+        // the same vertical line.
+        ui.allocate_ui_with_layout(
+            egui::vec2(LABEL_W, 22.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(
+                    egui::RichText::new(label)
+                        .size(theme::TEXT_BODY)
+                        .color(theme::INK_2),
+                );
+            },
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), control);
     });
@@ -398,6 +400,9 @@ fn row(
 /// A classic number input: a typed field with ▴/▾ spinner buttons, stepping
 /// with the keyboard arrows while focused. Commits valid values as you type
 /// and clamps into `range` on Enter / focus loss.
+///
+/// Laid out as one tight fixed-size left-to-right group, so it stays
+/// `[ value ][▴▾] suffix` even inside the form's right-to-left control area.
 fn stepper_u32(
     ui: &mut egui::Ui,
     id_salt: &str,
@@ -409,90 +414,130 @@ fn stepper_u32(
     let id = ui.id().with(id_salt);
     let (min, max) = (*range.start(), *range.end());
 
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+    let suffix_w = if suffix.is_empty() {
+        0.0
+    } else {
+        4.0 + ui.fonts(|f| {
+            f.layout_no_wrap(
+                suffix.to_owned(),
+                egui::FontId::proportional(theme::TEXT_LABEL),
+                theme::INK_3,
+            )
+            .size()
+            .x
+        })
+    };
+    let size = egui::vec2(56.0 + 4.0 + 18.0 + suffix_w, 23.0);
 
-        let mut text = ui
-            .data_mut(|d| d.get_temp::<String>(id))
-            .unwrap_or_else(|| value.to_string());
+    ui.allocate_ui_with_layout(
+        size,
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
 
-        let resp = ui.add(
-            egui::TextEdit::singleline(&mut text)
-                .desired_width(48.0)
-                .horizontal_align(egui::Align::RIGHT)
-                .font(egui::TextStyle::Body),
-        );
+            let mut text = ui
+                .data_mut(|d| d.get_temp::<String>(id))
+                .unwrap_or_else(|| value.to_string());
 
-        let mut bump = 0i64;
-        if resp.has_focus() {
-            let (up, down) = ui.input(|i| {
-                (
-                    i.key_pressed(egui::Key::ArrowUp),
-                    i.key_pressed(egui::Key::ArrowDown),
-                )
-            });
-            if up {
-                bump += step as i64;
-            }
-            if down {
-                bump -= step as i64;
-            }
-        }
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .desired_width(56.0)
+                    .horizontal_align(egui::Align::RIGHT)
+                    .font(egui::TextStyle::Body),
+            );
 
-        if resp.changed() {
-            // Commit as-you-type when the text is already a valid in-range
-            // number; otherwise wait for Enter/blur (no clamping mid-keystroke).
-            if let Ok(v) = text.trim().parse::<u32>() {
-                if range.contains(&v) {
-                    *value = v;
+            let mut bump = 0i64;
+            if resp.has_focus() {
+                let (up, down) = ui.input(|i| {
+                    (
+                        i.key_pressed(egui::Key::ArrowUp),
+                        i.key_pressed(egui::Key::ArrowDown),
+                    )
+                });
+                if up {
+                    bump += step as i64;
+                }
+                if down {
+                    bump -= step as i64;
                 }
             }
-        }
-        let commit = resp.lost_focus() || ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if commit {
-            let v = text.trim().parse::<u32>().unwrap_or(*value);
-            *value = v.clamp(min, max);
-            ui.data_mut(|d| d.remove::<String>(id));
-        } else if resp.has_focus() {
-            ui.data_mut(|d| d.insert_temp(id, text));
-        } else {
-            ui.data_mut(|d| d.remove::<String>(id));
-        }
 
-        // ▴/▾ spinner buttons (and the arrow-key steps from above).
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
-            ui.spacing_mut().button_padding = egui::vec2(3.0, 0.0);
-            let up = ui.add_sized(
-                [16.0, 10.0],
-                egui::Button::new(egui::RichText::new("▴").size(7.5)),
-            );
-            let down = ui.add_sized(
-                [16.0, 10.0],
-                egui::Button::new(egui::RichText::new("▾").size(7.5)),
-            );
-            if up.clicked() {
-                bump += step as i64;
+            if resp.changed() {
+                // Commit as-you-type when the text is already a valid in-range
+                // number; otherwise wait for Enter/blur (no mid-keystroke clamp).
+                if let Ok(v) = text.trim().parse::<u32>() {
+                    if range.contains(&v) {
+                        *value = v;
+                    }
+                }
             }
-            if down.clicked() {
-                bump -= step as i64;
+            let commit = resp.lost_focus()
+                || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            if commit {
+                let v = text.trim().parse::<u32>().unwrap_or(*value);
+                *value = v.clamp(min, max);
+                ui.data_mut(|d| d.remove::<String>(id));
+            } else if resp.has_focus() {
+                ui.data_mut(|d| d.insert_temp(id, text));
+            } else {
+                ui.data_mut(|d| d.remove::<String>(id));
             }
-        });
 
-        if bump != 0 {
-            let v = (*value as i64 + bump).clamp(min as i64, max as i64) as u32;
-            *value = v;
-            ui.data_mut(|d| d.remove::<String>(id));
-        }
+            // Spinner buttons (the keyboard arrows above do the same). The
+            // arrows are painted, not glyphs — crisp at this tiny size.
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                // Buttons won't go below `interact_size`; shrink it so the
+                // pair actually fits the field height instead of wrapping.
+                ui.spacing_mut().interact_size = egui::vec2(8.0, 8.0);
+                ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
+                let up = ui.add_sized([18.0, 11.0], egui::Button::new(""));
+                let down = ui.add_sized([18.0, 11.0], egui::Button::new(""));
+                for (resp, point_up) in [(&up, true), (&down, false)] {
+                    let c = resp.rect.center();
+                    let (w, h) = (3.5, 2.5);
+                    let pts = if point_up {
+                        vec![
+                            egui::pos2(c.x - w, c.y + h),
+                            egui::pos2(c.x + w, c.y + h),
+                            egui::pos2(c.x, c.y - h),
+                        ]
+                    } else {
+                        vec![
+                            egui::pos2(c.x - w, c.y - h),
+                            egui::pos2(c.x + w, c.y - h),
+                            egui::pos2(c.x, c.y + h),
+                        ]
+                    };
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        pts,
+                        theme::INK_2,
+                        egui::Stroke::NONE,
+                    ));
+                }
+                if up.clicked() {
+                    bump += step as i64;
+                }
+                if down.clicked() {
+                    bump -= step as i64;
+                }
+            });
 
-        if !suffix.is_empty() {
-            ui.label(
-                egui::RichText::new(suffix)
-                    .size(theme::TEXT_LABEL)
-                    .color(theme::INK_3),
-            );
-        }
-    });
+            if bump != 0 {
+                let v = (*value as i64 + bump).clamp(min as i64, max as i64) as u32;
+                *value = v;
+                ui.data_mut(|d| d.remove::<String>(id));
+            }
+
+            if !suffix.is_empty() {
+                ui.label(
+                    egui::RichText::new(suffix)
+                        .size(theme::TEXT_LABEL)
+                        .color(theme::INK_3),
+                );
+            }
+        },
+    );
 }
 
 /// Checkbox + spinner for an `Option<u32>` field.
