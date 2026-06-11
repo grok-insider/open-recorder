@@ -102,7 +102,23 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
         if self.recorder.is_some() {
             return Ok(());
         }
-        let rec = Recorder::start(&path, self.backend.params(), self.backend.audio_params())?;
+        let mut rec = Recorder::start(&path, self.backend.params(), self.backend.audio_params())?;
+        // Seed the recorder's audio preroll from the replay ring: the audio
+        // matching the upcoming first keyframe was captured (and pumped)
+        // BEFORE this call — NVENC emits that keyframe with encode latency —
+        // so without the backlog the recording would start with a silent hole
+        // of roughly one pump interval plus the encoder delay. Refcounted
+        // clones, no packet copies.
+        let newest = self.audio_ring.newest_timestamp_micros();
+        if let Some(end) = newest {
+            const PREROLL_US: i64 = 5_000_000;
+            for frame in self
+                .audio_ring
+                .select_window(end.saturating_sub(PREROLL_US), end)
+            {
+                rec.push_audio(&frame)?;
+            }
+        }
         self.recorder = Some(rec);
         Ok(())
     }
