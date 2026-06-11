@@ -856,10 +856,28 @@ impl LibraryApp {
 
         if d.buffer_enabled {
             ui.menu_button("Save ▾", |ui| {
+                ui.label(
+                    egui::RichText::new(format!("buffered: {} s", d.buffered_seconds))
+                        .size(theme::TEXT_MICRO)
+                        .color(theme::INK_3),
+                );
+                ui.separator();
                 for secs in [15u32, 30, 60, 120] {
-                    if ui.button(format!("Last {secs} s")).clicked() {
+                    if ui
+                        .button(format!("Save last {secs} s"))
+                        .on_hover_text(if secs > d.buffered_seconds.max(1) {
+                            format!(
+                                "Only ~{} s are buffered right now — the clip will be that long",
+                                d.buffered_seconds
+                            )
+                        } else {
+                            format!("Write the last {secs} s of the buffer to a clip")
+                        })
+                        .clicked()
+                    {
                         if let Some(duration) = ord_common::ClipDuration::new(secs) {
                             self.send_ctl(Command::SaveLast { duration }, ctx);
+                            self.set_status(format!("Saving the last {secs} s…"));
                         }
                         ui.close_menu();
                     }
@@ -874,7 +892,12 @@ impl LibraryApp {
         };
         if ui
             .button(buf_label)
-            .on_hover_text("Enable/disable the always-on replay buffer")
+            .on_hover_text(if d.buffer_enabled {
+                "Replay buffer is armed — click to disable it (stops capturing; \
+                 `ord save` will have nothing to save)"
+            } else {
+                "Replay buffer is off — click to arm it"
+            })
             .clicked()
         {
             self.send_ctl(
@@ -883,6 +906,11 @@ impl LibraryApp {
                 },
                 ctx,
             );
+            self.set_status(if d.buffer_enabled {
+                "Disabling the replay buffer…"
+            } else {
+                "Arming the replay buffer…"
+            });
         }
     }
 

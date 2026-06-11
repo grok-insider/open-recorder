@@ -109,6 +109,16 @@ impl EditorState {
         self.player.seek(t);
     }
 
+    /// Place a marker at the playhead (deduplicated, kept sorted).
+    fn add_marker(&mut self) {
+        let ph = self.timeline.playhead();
+        if !self.markers.iter().any(|m| (m - ph).abs() < 1e-3) {
+            self.markers.push(ph);
+            self.markers
+                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+
     /// Render the editor; returns the action the user took (if any).
     pub fn ui(&mut self, ctx: &egui::Context, wd: &crate::diag::Watchdog) -> EditorAction {
         // Pull in any decoded filmstrip tiles.
@@ -180,6 +190,8 @@ impl EditorState {
             ui.add_space(8.0);
             self.timeline_ui(ui);
             ui.add_space(6.0);
+            self.tools_ui(ui);
+            ui.add_space(6.0);
             self.export_ui(ui, &mut action);
             ui.add_space(8.0);
         });
@@ -202,13 +214,14 @@ impl EditorState {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) -> EditorAction {
-        // Don't steal keys (I/O/M/S/X/arrows…) while a widget has focus.
-        if let Some(focused) = ctx.memory(|m| m.focused()) {
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                ctx.memory_mut(|m| m.surrender_focus(focused));
+        // The editor owns the keyboard — it has no text fields. Drop any
+        // lingering widget focus (a clicked button/slider keeps egui focus)
+        // so Space can never double-trigger the last-clicked control.
+        ctx.memory_mut(|m| {
+            if let Some(focused) = m.focused() {
+                m.surrender_focus(focused);
             }
-            return EditorAction::None;
-        }
+        });
         let (
             space,
             key_i,
@@ -291,10 +304,8 @@ impl EditorState {
         if minus {
             self.zoom = (self.zoom / 1.5).max(1.0);
         }
-        if mkey && !shift && !self.markers.iter().any(|m| (m - ph).abs() < 1e-3) {
-            self.markers.push(ph);
-            self.markers
-                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        if mkey && !shift {
+            self.add_marker();
         }
         if mkey && shift {
             self.remove_nearest_marker(ph);
@@ -538,6 +549,95 @@ impl EditorState {
         });
     }
 
+    /// The editing tools row: every keyboard action has a visible, labeled
+    /// button (split / cut / marker / zoom), so nothing is keyboard-only.
+    fn tools_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let ph = self.timeline.playhead();
+            if ui
+                .button("✂ Split")
+                .on_hover_text("Split the clip into two pieces at the playhead (S)")
+                .clicked()
+            {
+                self.segments.split_at(ph);
+            }
+            let piece_cut = self
+                .segments
+                .index_at(ph)
+                .map(|i| !self.segments.segments()[i].enabled)
+                .unwrap_or(false);
+            let toggle_label = if piece_cut {
+                "↩ Keep piece"
+            } else {
+                "✕ Cut piece"
+            };
+            if ui
+                .button(toggle_label)
+                .on_hover_text(
+                    "Cut or restore the piece under the playhead (X, or right-click a piece). \
+                     Cut pieces are skipped during playback and joined out on export.",
+                )
+                .clicked()
+            {
+                self.segments.toggle_at(ph);
+            }
+            if !self.segments.is_trivial()
+                && ui
+                    .button("Reset cuts")
+                    .on_hover_text("Remove every split and keep the whole clip again")
+                    .clicked()
+            {
+                self.segments.reset();
+            }
+            ui.separator();
+            if ui
+                .button("⚑ Marker")
+                .on_hover_text(
+                    "Drop a marker at the playhead (M). Shift+M removes the nearest; \
+                     [ and ] jump between markers; trim handles snap to them.\n\
+                     Chapters from `ord mark` show up here automatically.",
+                )
+                .clicked()
+            {
+                self.add_marker();
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button("Fit")
+                    .on_hover_text("Show the whole clip (zoom out fully)")
+                    .clicked()
+                {
+                    self.zoom = 1.0;
+                    self.scroll = 0.0;
+                }
+                if ui
+                    .button("+")
+                    .on_hover_text("Zoom in (wheel or =)")
+                    .clicked()
+                {
+                    self.zoom = (self.zoom * 1.5).min(60.0);
+                }
+                if ui
+                    .button("−")
+                    .on_hover_text("Zoom out (wheel or -)")
+                    .clicked()
+                {
+                    self.zoom = (self.zoom / 1.5).max(1.0);
+                }
+                ui.label(
+                    egui::RichText::new(if self.zoom > 1.01 {
+                        format!("zoom {:.1}×", self.zoom)
+                    } else {
+                        "zoom 1×".to_string()
+                    })
+                    .size(11.0)
+                    .color(ui.visuals().weak_text_color()),
+                );
+            });
+        });
+    }
+
     fn timeline_ui(&mut self, ui: &mut egui::Ui) {
         let accent = crate::theme::AI;
         let dur = self.player.duration().max(1e-6);
@@ -712,7 +812,7 @@ impl EditorState {
             }
         }
 
-        // Playhead.
+        // Playhead: a white line with a triangle head in the ruler.
         if track.x_range().contains(ph_x) {
             painter.line_segment(
                 [
@@ -721,6 +821,49 @@ impl EditorState {
                 ],
                 egui::Stroke::new(2.0, egui::Color32::WHITE),
             );
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(ph_x - 5.0, rect.top()),
+                    egui::pos2(ph_x + 5.0, rect.top()),
+                    egui::pos2(ph_x, rect.top() + 7.0),
+                ],
+                egui::Color32::WHITE,
+                egui::Stroke::NONE,
+            ));
+        }
+
+        // Hover feedback: a ghost line + time bubble under the pointer, so you
+        // always know where a click/scrub will land (research: LosslessCut's
+        // hover time, CapCut's scrub feedback).
+        if hovered && self.drag.is_none() {
+            if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+                if track.contains(p) {
+                    painter.line_segment(
+                        [
+                            egui::pos2(p.x, track.top()),
+                            egui::pos2(p.x, track.bottom()),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70)),
+                    );
+                    let t = view
+                        .time_at(((p.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0))
+                        .clamp(0.0, dur);
+                    let text = human_duration(t);
+                    let galley = painter.layout_no_wrap(
+                        text,
+                        egui::FontId::proportional(10.0),
+                        egui::Color32::WHITE,
+                    );
+                    let pad = egui::vec2(5.0, 3.0);
+                    let mut pos = egui::pos2(p.x + 8.0, track.top() + 4.0);
+                    if pos.x + galley.size().x + 2.0 * pad.x > track.right() {
+                        pos.x = p.x - 8.0 - galley.size().x - 2.0 * pad.x;
+                    }
+                    let bubble = egui::Rect::from_min_size(pos, galley.size() + 2.0 * pad);
+                    painter.rect_filled(bubble, 3.0, egui::Color32::from_black_alpha(200));
+                    painter.galley(bubble.min + pad, galley, egui::Color32::WHITE);
+                }
+            }
         }
 
         self.timeline_interactions(ui, track, &view);
@@ -738,14 +881,28 @@ impl EditorState {
         };
         let x_of = move |t: f64| track.left() + view.frac_of(t) * track.width();
 
+        // Cursor affordance: a horizontal-resize cursor near the trim handles
+        // says "this edge drags" before you commit to the drag. The grab
+        // radius is bigger than the visual handle (fat-finger rule).
+        const GRAB: f32 = 10.0;
+        if resp.hovered() {
+            if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
+                let din = (p.x - x_of(self.timeline.in_point())).abs();
+                let dout = (p.x - x_of(self.timeline.out_point())).abs();
+                if din <= GRAB || dout <= GRAB {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                }
+            }
+        }
+
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
                 // Pick the nearest of in/out handle, else scrub the playhead.
                 let din = (p.x - x_of(self.timeline.in_point())).abs();
                 let dout = (p.x - x_of(self.timeline.out_point())).abs();
-                self.drag = Some(if din <= 8.0 && din <= dout {
+                self.drag = Some(if din <= GRAB && din <= dout {
                     Drag::In
-                } else if dout <= 8.0 {
+                } else if dout <= GRAB {
                     Drag::Out
                 } else {
                     Drag::Playhead
@@ -874,19 +1031,21 @@ impl EditorState {
             }));
             if cuts_active {
                 ui.add_space(6.0);
-                let n = self.segments.cuts().count();
+                let removed = self
+                    .segments
+                    .segments()
+                    .iter()
+                    .filter(|s| !s.enabled)
+                    .count();
                 ui.label(
-                    egui::RichText::new(format!("{} cut{}", n, if n == 1 { "" } else { "s" }))
-                        .color(crate::theme::KIN)
-                        .size(12.0),
+                    egui::RichText::new(format!(
+                        "{} piece{} cut out",
+                        removed,
+                        if removed == 1 { "" } else { "s" }
+                    ))
+                    .color(crate::theme::KIN)
+                    .size(12.0),
                 );
-                if ui
-                    .button("Reset cuts")
-                    .on_hover_text("Remove every split and keep the whole clip again")
-                    .clicked()
-                {
-                    self.segments.reset();
-                }
             }
             ui.add_space(12.0);
             ui.checkbox(&mut self.mute_export, "Mute audio");
