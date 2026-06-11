@@ -118,6 +118,41 @@ scrubbing, multi-segment cuts). Verified by `cargo fmt` /
   Stream-copy/GIF/audio presets are greyed out with an explanation while
   cuts are active.
 
+### Stability & editor polish round (user-reported, bench-verified)
+
+- [x] **Daemon deadlock on buffer toggle** — root-caused with a live stack
+  dump: waycap-rs `Capture::close()` early-returned when `finish()` failed
+  (double-drain EOF), skipping the PipeWire `Terminate` sends, so `Drop`
+  joined a never-exiting capture loop while holding the daemon handler lock —
+  every later command hung ("Buffer button does nothing"). Fixed in the fork
+  (close tears down unconditionally; drains are idempotent), rev bumped in
+  `ord-core` + flake `outputHashes`.
+- [x] **Recording head/tail** — the engine pumps audio before video and NVENC
+  emits frames with latency, so the recorder dropped ~1 s of audio after the
+  first keyframe and let audio outrun the final video frame. The recorder now
+  buffers pending audio (bounded preroll) and flushes it only up to the
+  newest written video pts; `finish` drops the trailing remainder. Golden
+  test asserts both tracks start and end together.
+- [x] **"Play does nothing until you scrub"** — the player's sample-counting
+  audio clock ignored pts: a leading audio gap (old recordings) left the
+  buffer empty, freezing the clock while the full video queue deadlocked the
+  demux pacing. The decode session now silence-fills the known leading gap on
+  every seek, drops keyframe-run-up audio, keeps demuxing through starvation,
+  and ends playback at EOF when the audio track is shorter than the file.
+  Verified frame-by-frame on the affected recording in the Xvfb bench.
+- [x] **Settings form layout** — steppers are one tight `[value][▴▾] suffix`
+  group (painted triangle buttons, no glyph fallback), labels left-align in a
+  fixed column, the scroll area explicitly fills the panel
+  (`auto_shrink(false)` + `vertical_centered`), bench-verified scrolling to
+  the last section.
+- [x] **Editor discoverability** — visible tools row (✂ Split, ✕ Cut piece /
+  ↩ Keep piece, ⚑ Marker, zoom −/+/Fit with a zoom readout), hover ghost line
+  + time bubble on the timeline, resize cursor + fatter grab radius on the
+  trim handles, playhead triangle head, and the editor now owns the keyboard
+  (no focus-stealing after clicking a button). Save ▾ menu shows the buffered
+  seconds and what each entry will do; buffer toggle and saves give instant
+  status feedback.
+
 ## Left to do
 
 - [ ] **Visual QA of the revamped UI** — deferred because the desktop session
