@@ -15,7 +15,7 @@ tracing.workspace = true
 bytes = "1"
 ffmpeg-next = { workspace = true, optional = true }
 crossbeam = { version = "0.8", optional = true }
-waycap-rs = { git = "https://github.com/0xfell/waycap-rs.git", rev = "5a23bf4e3e1f034775a0a7988320da8e841227f9", default-features = false, features = ["nvidia", "egl"], optional = true }
+waycap-rs = { git = "https://github.com/0xfell/waycap-rs.git", rev = "2e4e317b893a048be90132adb5eec964acb324fe", default-features = false, features = ["nvidia", "egl"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
