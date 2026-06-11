@@ -42,6 +42,8 @@ enum Drag {
     In,
     Out,
     Playhead,
+    /// Sliding cut boundary `i` (see [`Segments::cut_points`]).
+    Cut(usize),
 }
 
 /// Editor state for a single clip.
@@ -51,6 +53,8 @@ pub struct EditorState {
     player: Player,
     timeline: Timeline,
     segments: Segments,
+    /// Snapshots for Ctrl+Z over cut edits (split/toggle/join/move/reset).
+    undo: Vec<Segments>,
     zoom: f32,
     scroll: f32,
     markers: Vec<f64>,
@@ -59,6 +63,8 @@ pub struct EditorState {
     mute_export: bool,
     volume: f32,
     drag: Option<Drag>,
+    /// Pre-drag snapshot for a cut-line drag (one undo entry per drag).
+    drag_undo: Option<Segments>,
     strip_rx: Receiver<(usize, egui::ColorImage)>,
     strip: Vec<Option<egui::TextureHandle>>,
     debug: bool,
@@ -79,6 +85,7 @@ impl EditorState {
             player,
             timeline,
             segments,
+            undo: Vec::new(),
             zoom: 1.0,
             scroll: 0.0,
             markers: Vec::new(),
@@ -86,6 +93,7 @@ impl EditorState {
             mute_export: false,
             volume: 1.0,
             drag: None,
+            drag_undo: None,
             strip_rx,
             strip: vec![None; FILMSTRIP_TILES],
             debug: crate::tuning::debug_overlay(),
@@ -107,6 +115,30 @@ impl EditorState {
     fn seek_to(&mut self, t: f64) {
         self.timeline.set_playhead(t);
         self.player.seek(t);
+    }
+
+    fn push_undo(&mut self, snapshot: Segments) {
+        const MAX_UNDO: usize = 64;
+        self.undo.push(snapshot);
+        if self.undo.len() > MAX_UNDO {
+            self.undo.remove(0);
+        }
+    }
+
+    /// Run a cut mutation with undo: the previous state is kept only when the
+    /// mutation reports an actual change.
+    fn edit_cuts(&mut self, f: impl FnOnce(&mut Segments) -> bool) {
+        let snapshot = self.segments.clone();
+        if f(&mut self.segments) {
+            self.push_undo(snapshot);
+        }
+    }
+
+    /// Revert the most recent cut edit (Ctrl+Z / the Undo button).
+    fn undo_cut_edit(&mut self) {
+        if let Some(prev) = self.undo.pop() {
+            self.segments = prev;
+        }
     }
 
     /// Place a marker at the playhead (deduplicated, kept sorted).
@@ -167,7 +199,7 @@ impl EditorState {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         egui::RichText::new(
-                            "Space play · I/O in-out · S split · X cut/keep · M marker · [/] jump marker · wheel zoom",
+                            "Space play · I/O in-out · S split · X cut · ⌫ join · Ctrl+Z undo · M marker · wheel zoom",
                         )
                         .color(ui.visuals().weak_text_color())
                         .size(12.0),
@@ -175,8 +207,10 @@ impl EditorState {
                     .on_hover_text(
                         "←/→ seek 1s (Shift: 5s) · ,/. frame-step · Home/End to in/out\n\
                          M places a marker · Shift+M removes the nearest · [/] jump between markers\n\
-                         S splits the clip at the playhead; X (or right-click a piece) toggles it\n\
-                         cut/kept — cut pieces are skipped when playing and joined out on export\n\
+                         S splits at the playhead; drag a cut line to slide it; X (or right-click \
+                         a piece) cuts/keeps it; Backspace (or right-click a cut line) joins the \
+                         pieces; Ctrl+Z undoes cut edits\n\
+                         Cut pieces are skipped when playing and joined out on export\n\
                          Mouse wheel zooms at the pointer; Shift+wheel pans when zoomed",
                     );
                 });
@@ -255,12 +289,14 @@ impl EditorState {
                 i.key_pressed(egui::Key::Escape),
             )
         });
-        let (split, toggle_seg, prev_marker, next_marker) = ctx.input(|i| {
+        let (split, toggle_seg, prev_marker, next_marker, join, undo_key) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::S),
                 i.key_pressed(egui::Key::X),
                 i.key_pressed(egui::Key::OpenBracket),
                 i.key_pressed(egui::Key::CloseBracket),
+                i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete),
+                i.modifiers.command && i.key_pressed(egui::Key::Z),
             )
         });
 
@@ -321,10 +357,16 @@ impl EditorState {
             }
         }
         if split {
-            self.segments.split_at(ph);
+            self.edit_cuts(|s| s.split_at(ph));
         }
         if toggle_seg {
-            self.segments.toggle_at(ph);
+            self.edit_cuts(|s| s.toggle_at(ph));
+        }
+        if join {
+            self.edit_cuts(|s| s.join_at(ph).is_some());
+        }
+        if undo_key {
+            self.undo_cut_edit();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
             self.debug = !self.debug;
@@ -556,10 +598,13 @@ impl EditorState {
             let ph = self.timeline.playhead();
             if ui
                 .button("✂ Split")
-                .on_hover_text("Split the clip into two pieces at the playhead (S)")
+                .on_hover_text(
+                    "Split the clip into two pieces at the playhead (S). \
+                     Drag a cut line to slide it; Backspace joins it again.",
+                )
                 .clicked()
             {
-                self.segments.split_at(ph);
+                self.edit_cuts(|s| s.split_at(ph));
             }
             let piece_cut = self
                 .segments
@@ -579,15 +624,49 @@ impl EditorState {
                 )
                 .clicked()
             {
-                self.segments.toggle_at(ph);
+                self.edit_cuts(|s| s.toggle_at(ph));
             }
+            let has_selection = !self.timeline.is_full();
+            let cut_range = ui.add_enabled(has_selection, egui::Button::new("✕ Cut In→Out"));
+            let cut_range = if has_selection {
+                cut_range.on_hover_text(
+                    "Remove the selected In→Out range in one action: splits at both \
+                     ends, cuts the middle, then clears the selection so playback \
+                     previews the join.",
+                )
+            } else {
+                cut_range.on_disabled_hover_text(
+                    "Select a range first: set In (I) and Out (O) around the part to remove",
+                )
+            };
+            if cut_range.clicked() {
+                let (a, b) = (self.timeline.in_point(), self.timeline.out_point());
+                let dur = self.player.duration();
+                self.edit_cuts(|s| s.cut_range(a, b));
+                self.timeline.set_out(dur);
+                self.timeline.set_in(0.0);
+                self.seek_to(a);
+            }
+            ui.separator();
+            ui.add_enabled_ui(!self.undo.is_empty(), |ui| {
+                if ui
+                    .button("↶ Undo")
+                    .on_hover_text("Undo the last cut change (Ctrl+Z)")
+                    .clicked()
+                {
+                    self.undo_cut_edit();
+                }
+            });
             if !self.segments.is_trivial()
                 && ui
                     .button("Reset cuts")
                     .on_hover_text("Remove every split and keep the whole clip again")
                     .clicked()
             {
-                self.segments.reset();
+                self.edit_cuts(|s| {
+                    s.reset();
+                    true
+                });
             }
             ui.separator();
             if ui
@@ -721,8 +800,8 @@ impl EditorState {
             dim,
         );
 
-        // Cut segments: heavy dim + a vermilion edge strip on pieces toggled
-        // off, and a hairline at every cut point.
+        // Cut segments: heavy dim + diagonal hatch + a vermilion edge strip on
+        // pieces toggled off, and a draggable grip on every cut line.
         if !self.segments.is_trivial() {
             for seg in self.segments.segments() {
                 if seg.enabled {
@@ -738,6 +817,20 @@ impl EditorState {
                     egui::pos2(x1, track.bottom()),
                 );
                 painter.rect_filled(r, 0.0, egui::Color32::from_black_alpha(190));
+                // Sparse diagonal hatch: reads as "removed" at a glance.
+                let hatch = painter.with_clip_rect(r);
+                let stroke = egui::Stroke::new(1.0, crate::theme::SHU.linear_multiply(0.30));
+                let mut x = r.left() - r.height();
+                while x < r.right() {
+                    hatch.line_segment(
+                        [
+                            egui::pos2(x, r.bottom()),
+                            egui::pos2(x + r.height(), r.top()),
+                        ],
+                        stroke,
+                    );
+                    x += 14.0;
+                }
                 painter.rect_filled(
                     egui::Rect::from_min_max(
                         egui::pos2(x0, track.bottom() - 3.0),
@@ -747,8 +840,11 @@ impl EditorState {
                     crate::theme::SHU,
                 );
                 if r.width() > 42.0 {
+                    let c = r.center();
+                    let label = egui::Rect::from_center_size(c, egui::vec2(38.0, 14.0));
+                    painter.rect_filled(label, 3.0, egui::Color32::from_black_alpha(170));
                     painter.text(
-                        r.center(),
+                        c,
                         egui::Align2::CENTER_CENTER,
                         "✕ cut",
                         egui::FontId::proportional(10.0),
@@ -756,12 +852,31 @@ impl EditorState {
                     );
                 }
             }
+            // Cut lines get a grip handle mid-track: they look (and are)
+            // draggable, like the trim handles. Right-click joins the pieces.
             for cut in self.segments.cuts() {
                 let x = x_of(cut);
                 if track.x_range().contains(x) {
                     painter.line_segment(
                         [egui::pos2(x, track.top()), egui::pos2(x, track.bottom())],
                         egui::Stroke::new(1.0, crate::theme::HAIRLINE_HI),
+                    );
+                    let grip = egui::Rect::from_center_size(
+                        egui::pos2(x, track.center().y),
+                        egui::vec2(7.0, 18.0),
+                    );
+                    painter.rect_filled(grip, 2.0, crate::theme::RAISED);
+                    painter.rect_stroke(
+                        grip,
+                        2.0,
+                        egui::Stroke::new(1.0, crate::theme::HAIRLINE_HI),
+                    );
+                    painter.line_segment(
+                        [
+                            egui::pos2(x, grip.top() + 4.0),
+                            egui::pos2(x, grip.bottom() - 4.0),
+                        ],
+                        egui::Stroke::new(1.0, crate::theme::INK_2),
                     );
                 }
             }
@@ -838,6 +953,21 @@ impl EditorState {
         if hovered && self.drag.is_none() {
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                 if track.contains(p) {
+                    let t = view
+                        .time_at(((p.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0))
+                        .clamp(0.0, dur);
+                    // With cuts present, lightly lift the piece under the
+                    // pointer — the target of X / right-click.
+                    if !self.segments.is_trivial() {
+                        if let Some(i) = self.segments.index_at(t) {
+                            let seg = self.segments.segments()[i];
+                            let r = egui::Rect::from_min_max(
+                                egui::pos2(cl(x_of(seg.start)), track.top()),
+                                egui::pos2(cl(x_of(seg.end)), track.bottom()),
+                            );
+                            painter.rect_filled(r, 0.0, egui::Color32::from_white_alpha(5));
+                        }
+                    }
                     painter.line_segment(
                         [
                             egui::pos2(p.x, track.top()),
@@ -845,9 +975,6 @@ impl EditorState {
                         ],
                         egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70)),
                     );
-                    let t = view
-                        .time_at(((p.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0))
-                        .clamp(0.0, dur);
                     let text = human_duration(t);
                     let galley = painter.layout_no_wrap(
                         text,
@@ -882,14 +1009,23 @@ impl EditorState {
         let x_of = move |t: f64| track.left() + view.frac_of(t) * track.width();
 
         // Cursor affordance: a horizontal-resize cursor near the trim handles
-        // says "this edge drags" before you commit to the drag. The grab
-        // radius is bigger than the visual handle (fat-finger rule).
+        // and cut lines says "this edge drags" before you commit to the drag.
+        // The grab radius is bigger than the visual handle (fat-finger rule).
         const GRAB: f32 = 10.0;
+        let cut_pts: Vec<(usize, f64)> = self.segments.cut_points().collect();
+        let nearest_cut = move |px: f32| -> Option<(usize, f64)> {
+            cut_pts
+                .iter()
+                .map(|&(i, t)| (i, t, (x_of(t) - px).abs()))
+                .filter(|(_, _, d)| *d <= GRAB)
+                .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, t, _)| (i, t))
+        };
         if resp.hovered() {
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                 let din = (p.x - x_of(self.timeline.in_point())).abs();
                 let dout = (p.x - x_of(self.timeline.out_point())).abs();
-                if din <= GRAB || dout <= GRAB {
+                if din <= GRAB || dout <= GRAB || nearest_cut(p.x).is_some() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
             }
@@ -897,13 +1033,16 @@ impl EditorState {
 
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
-                // Pick the nearest of in/out handle, else scrub the playhead.
+                // Pick the nearest in/out handle, else a cut line, else scrub.
                 let din = (p.x - x_of(self.timeline.in_point())).abs();
                 let dout = (p.x - x_of(self.timeline.out_point())).abs();
                 self.drag = Some(if din <= GRAB && din <= dout {
                     Drag::In
                 } else if dout <= GRAB {
                     Drag::Out
+                } else if let Some((i, _)) = nearest_cut(p.x) {
+                    self.drag_undo = Some(self.segments.clone());
+                    Drag::Cut(i)
                 } else {
                     Drag::Playhead
                 });
@@ -914,8 +1053,8 @@ impl EditorState {
         }
         if resp.dragged() {
             if let (Some(drag), Some(p)) = (self.drag, resp.interact_pointer_pos()) {
-                // Handles and the playhead snap to nearby markers, so a mark
-                // placed in-game becomes a precise trim point.
+                // Handles, cut lines, and the playhead snap to nearby markers,
+                // so a mark placed in-game becomes a precise edit point.
                 let t = self.snap_to_marker(time_at(p.x), &view, track.width());
                 match drag {
                     Drag::In => {
@@ -927,10 +1066,21 @@ impl EditorState {
                         self.seek_to(self.timeline.out_point());
                     }
                     Drag::Playhead => self.seek_to(t),
+                    Drag::Cut(i) => {
+                        // The preview follows the sliding cut, frame-accurate.
+                        if let Some(applied) = self.segments.move_cut(i, t) {
+                            self.seek_to(applied);
+                        }
+                    }
                 }
             }
         }
         if resp.drag_stopped() {
+            if let Some(snapshot) = self.drag_undo.take() {
+                if snapshot != self.segments {
+                    self.push_undo(snapshot);
+                }
+            }
             self.drag = None;
         }
         if resp.clicked() {
@@ -939,10 +1089,16 @@ impl EditorState {
                 self.seek_to(t);
             }
         }
-        // Right-click a piece to toggle it cut/kept (same as X at the playhead).
+        // Right-click: on a cut line, join the two pieces back together;
+        // anywhere else, toggle that piece cut/kept (same as X).
         if resp.secondary_clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                self.segments.toggle_at(time_at(p.x));
+                if let Some((_, ct)) = nearest_cut(p.x) {
+                    self.edit_cuts(|s| s.join_at(ct).is_some());
+                } else {
+                    let t = time_at(p.x);
+                    self.edit_cuts(|s| s.toggle_at(t));
+                }
             }
         }
     }

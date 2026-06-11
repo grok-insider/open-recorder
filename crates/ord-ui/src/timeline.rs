@@ -131,6 +131,76 @@ impl Segments {
         self.segs.iter().skip(1).map(|s| s.start)
     }
 
+    /// Interior cut boundaries with their index (for dragging). Boundary `i`
+    /// sits between `segments()[i-1]` and `segments()[i]`.
+    pub fn cut_points(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
+        self.segs
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, s)| (i, s.start))
+    }
+
+    /// Slide cut boundary `i` to `t`, clamped so neither neighbor collapses
+    /// below the minimum piece size. Returns the time actually applied.
+    pub fn move_cut(&mut self, i: usize, t: f64) -> Option<f64> {
+        if i == 0 || i >= self.segs.len() {
+            return None;
+        }
+        let lo = self.segs[i - 1].start + MIN_SEG;
+        let hi = self.segs[i].end - MIN_SEG;
+        if hi < lo {
+            return None;
+        }
+        let t = t.clamp(lo, hi);
+        self.segs[i - 1].end = t;
+        self.segs[i].start = t;
+        Some(t)
+    }
+
+    /// Remove the cut boundary nearest to `t`, joining its two pieces. The
+    /// joined piece is kept if either side was kept (deleting a cut reads as
+    /// "undo this cut", never as silently extending one). Returns the joined
+    /// boundary's time.
+    pub fn join_at(&mut self, t: f64) -> Option<f64> {
+        let nearest = self
+            .segs
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, s)| (i, (s.start - t).abs()))
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))?;
+        let i = nearest.0;
+        let boundary = self.segs[i].start;
+        let right = self.segs.remove(i);
+        let left = &mut self.segs[i - 1];
+        left.end = right.end;
+        left.enabled = left.enabled || right.enabled;
+        Some(boundary)
+    }
+
+    /// Cut the range `[a, b]` out in one action: split at both ends and
+    /// disable every piece inside. Splits too close to an existing boundary
+    /// (or the clip edge) fall back to that boundary.
+    pub fn cut_range(&mut self, a: f64, b: f64) -> bool {
+        let (a, b) = if a <= b { (a, b) } else { (b, a) };
+        let a = a.clamp(0.0, self.duration);
+        let b = b.clamp(0.0, self.duration);
+        if b - a < MIN_SEG {
+            return false;
+        }
+        self.split_at(a);
+        self.split_at(b);
+        let mut changed = false;
+        for s in &mut self.segs {
+            if s.start >= a - MIN_SEG && s.end <= b + MIN_SEG && s.enabled {
+                s.enabled = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Index of the segment containing `t`.
     pub fn index_at(&self, t: f64) -> Option<usize> {
         if self.segs.is_empty() || t < 0.0 || t > self.duration {
@@ -366,6 +436,58 @@ mod tests {
         s.toggle_at(8.0);
         assert!(approx(s.skip_target(4.0, 10.0).unwrap(), 10.0));
         assert!(approx(s.skip_target(8.0, 9.0).unwrap(), 9.0));
+    }
+
+    #[test]
+    fn segments_move_cut_clamps_to_neighbors() {
+        let mut s = Segments::new(10.0);
+        s.split_at(4.0);
+        s.split_at(7.0);
+        // Boundary 1 is between [0,4) and [4,7).
+        assert!(approx(s.move_cut(1, 5.0).unwrap(), 5.0));
+        assert!(approx(s.segments()[0].end, 5.0));
+        assert!(approx(s.segments()[1].start, 5.0));
+        // Clamped: cannot collapse a neighbor below the minimum piece.
+        let hi = s.move_cut(1, 9.9).unwrap();
+        assert!(hi <= 7.0 - 0.05 + 1e-9, "got {hi}");
+        let lo = s.move_cut(1, -3.0).unwrap();
+        assert!(lo >= 0.05 - 1e-9, "got {lo}");
+        // Invalid indices are rejected.
+        assert!(s.move_cut(0, 2.0).is_none());
+        assert!(s.move_cut(9, 2.0).is_none());
+    }
+
+    #[test]
+    fn segments_join_merges_and_keeps_if_either_kept() {
+        let mut s = Segments::new(10.0);
+        s.split_at(3.0);
+        s.split_at(7.0);
+        s.toggle_at(5.0); // middle cut out
+                          // Join the boundary nearest 3.2 (the 3.0 cut): kept | cut -> kept.
+        assert!(approx(s.join_at(3.2).unwrap(), 3.0));
+        assert_eq!(s.segments().len(), 2);
+        assert!(s.segments()[0].enabled);
+        assert!(approx(s.segments()[0].end, 7.0));
+        // Joining the last boundary restores a trivial timeline.
+        s.join_at(7.0);
+        assert!(s.is_trivial());
+        assert!(s.join_at(5.0).is_none(), "no boundaries left");
+    }
+
+    #[test]
+    fn segments_cut_range_in_one_action() {
+        let mut s = Segments::new(30.0);
+        assert!(s.cut_range(10.0, 20.0));
+        assert_eq!(s.kept_within(0.0, 30.0), vec![(0.0, 10.0), (20.0, 30.0)]);
+        // A range starting at the clip edge eats the first piece.
+        let mut s = Segments::new(30.0);
+        assert!(s.cut_range(0.0, 5.0));
+        assert_eq!(s.kept_within(0.0, 30.0), vec![(5.0, 30.0)]);
+        // Reversed and degenerate inputs are handled.
+        let mut s = Segments::new(30.0);
+        assert!(s.cut_range(20.0, 10.0));
+        assert_eq!(s.kept_within(0.0, 30.0), vec![(0.0, 10.0), (20.0, 30.0)]);
+        assert!(!s.cut_range(5.0, 5.01));
     }
 
     #[test]
