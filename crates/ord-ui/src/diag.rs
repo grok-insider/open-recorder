@@ -57,16 +57,23 @@ pub struct Watchdog {
     last_beat: Arc<AtomicU64>,
     stage: Arc<Mutex<&'static str>>,
     stalled: Arc<AtomicBool>,
+    /// Whether the UI is expected to be rendering. A reactive UI that is
+    /// intentionally idle (paused editor, hidden/unfocused window) legitimately
+    /// stops painting; without this gate the watchdog reports those normal
+    /// idles as `UI STALL`, spamming the log and masking real hangs.
+    active: Arc<AtomicBool>,
 }
 
 impl Watchdog {
-    /// Start the watchdog thread. A gap larger than `threshold` between beats is
-    /// reported as a stall (logged once per stall, with recovery noted).
+    /// Start the watchdog thread. A gap larger than `threshold` between beats —
+    /// **while active** — is reported as a stall (logged once per stall, with
+    /// recovery noted).
     pub fn start(threshold: Duration) -> Self {
         let wd = Watchdog {
             last_beat: Arc::new(AtomicU64::new(now_ms())),
             stage: Arc::new(Mutex::new("init")),
             stalled: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(true)),
         };
         let mon = wd.clone();
         let threshold_ms = threshold.as_millis() as u64;
@@ -74,6 +81,11 @@ impl Watchdog {
             .name("ord-watchdog".into())
             .spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(500));
+                // Intentionally idle (reactive, not rendering) is not a stall.
+                if !mon.active.load(Ordering::Relaxed) {
+                    mon.stalled.store(false, Ordering::Relaxed);
+                    continue;
+                }
                 let gap = now_ms().saturating_sub(mon.last_beat.load(Ordering::Relaxed));
                 if gap > threshold_ms {
                     if !mon.stalled.swap(true, Ordering::Relaxed) {
@@ -94,5 +106,19 @@ impl Watchdog {
     pub fn beat(&self, stage: &'static str) {
         self.last_beat.store(now_ms(), Ordering::Relaxed);
         *self.stage.lock().unwrap() = stage;
+    }
+
+    /// Set whether the UI is expected to be rendering. When `false` (the window
+    /// is hidden/unfocused, or the editor is parked), stall detection pauses so a
+    /// normal reactive idle isn't misreported as a hang. A fresh beat on the next
+    /// active frame resumes detection cleanly.
+    pub fn set_active(&self, active: bool) {
+        // Refresh the beat as we (re)activate so the idle gap doesn't trip the
+        // stall check on the very first active tick.
+        if active && !self.active.swap(true, Ordering::Relaxed) {
+            self.last_beat.store(now_ms(), Ordering::Relaxed);
+        } else if !active {
+            self.active.store(false, Ordering::Relaxed);
+        }
     }
 }

@@ -9,6 +9,7 @@
 //! | `ORD_DECODE=sw\|nvdec\|gl\|hw` | Force software or hardware decode (default: auto). |
 //! | `ORD_DEBUG` | Enable the editor debug overlay + watchdog logging. |
 //! | `ORD_OPEN=<path>` | Auto-open a clip in the editor on launch (dev aid). |
+//! | `ORD_AUTOPLAY` | Start playback immediately when the editor opens (dev/QA). |
 //! | `ORD_DEBUG_LOG=<path>` | Override the diagnostics log path (see [`crate::diag::log_path`]). |
 
 /// Whether to use the GPU NV12 shader preview path. `ORD_RENDER=cpu` opts out to
@@ -31,4 +32,11 @@ pub fn debug_overlay() -> bool {
 /// A clip path to auto-open in the editor on launch (`ORD_OPEN`), for dev/QA.
 pub fn auto_open() -> Option<String> {
     std::env::var("ORD_OPEN").ok()
+}
+
+/// Whether to start playback as soon as the editor opens (`ORD_AUTOPLAY`). A
+/// dev/QA aid that exercises the full decode/clock/EOF path without driving
+/// input (off by default).
+pub fn autoplay() -> bool {
+    std::env::var("ORD_AUTOPLAY").is_ok()
 }

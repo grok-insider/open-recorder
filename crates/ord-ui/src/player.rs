@@ -53,6 +53,13 @@ const PAUSED_QUEUE_MAX: usize = 4;
 /// final frame, short enough that a truly dead seek idles within ~half a second.
 const EOF_SETTLE_TICKS: u8 = 30;
 
+/// While "playing", if the audio-driven clock fails to advance for this long the
+/// audio output that the clock is slaved to has stalled (device suspend,
+/// underrun, disconnect, or a starved sink). Recover by pausing instead of
+/// spinning at 60 fps on a frozen frame forever. Generous enough that a brief
+/// hiccup or a post-seek restart never trips it.
+const STALL_PAUSE: Duration = Duration::from_secs(2);
+
 /// Which video decoder the decode thread ended up using.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecKind {
@@ -214,6 +221,10 @@ pub struct Player {
     shown_pts: f64,
     duration: f64,
     fps: f64,
+    /// Stall watchdog: the last position observed while playing, and when it
+    /// last changed. If it stops advancing the audio output has stalled.
+    progress_pos: f64,
+    progress_at: Instant,
 }
 
 impl Player {
@@ -287,6 +298,8 @@ impl Player {
             shown_pts: -1.0,
             duration,
             fps,
+            progress_pos: 0.0,
+            progress_at: Instant::now(),
         })
     }
 
@@ -453,6 +466,27 @@ impl Player {
         }
 
         let pos = self.position();
+
+        // Stall recovery: while "playing", the position is driven by the audio
+        // output (samples actually played). If it stops advancing the output has
+        // stalled — pause rather than spin at 60 fps on a frozen frame forever.
+        // Only the clock is trusted (no wall-clock fallback) so the prior
+        // demux-race runaway can't return; the user just re-presses play.
+        if self.is_playing() {
+            if (pos - self.progress_pos).abs() > 1e-4 {
+                self.progress_pos = pos;
+                self.progress_at = Instant::now();
+            } else if self.progress_at.elapsed() >= STALL_PAUSE {
+                crate::diag::log_line(&format!(
+                    "player: clock stalled at {pos:.2}s while playing (audio output not draining); pausing"
+                ));
+                self.pause();
+            }
+        } else {
+            self.progress_pos = pos;
+            self.progress_at = Instant::now();
+        }
+
         // Pick the newest decoded frame at or before the clock.
         let mut chosen: Option<Frame> = None;
         {

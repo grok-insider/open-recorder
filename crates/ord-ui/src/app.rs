@@ -610,6 +610,14 @@ impl eframe::App for LibraryApp {
         // also stops the loader thread from driving repaints while hidden.
         let focused = ctx.input(|i| i.focused);
         self.visible.store(focused, Ordering::Relaxed);
+        // Keep the stall watchdog honest: only expect frames while focused, and
+        // when focused tick at least once a second so a *paused* editor (which
+        // legitimately stops painting) isn't misread as a hang. A true hang
+        // (the update loop blocked past the threshold) still trips it.
+        self.watchdog.set_active(focused);
+        if focused {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         if focused != self.was_focused {
             self.was_focused = focused;
             if !focused {

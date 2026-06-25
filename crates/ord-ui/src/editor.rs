@@ -74,7 +74,10 @@ pub struct EditorState {
 impl EditorState {
     /// Open the editor for `clip`. Returns an error if the media can't be opened.
     pub fn new(clip: PathBuf, label: String, ctx: &egui::Context) -> Result<Self, String> {
-        let player = Player::open(&clip)?;
+        let mut player = Player::open(&clip)?;
+        if crate::tuning::autoplay() {
+            player.play();
+        }
         let timeline = Timeline::new(player.duration());
         let segments = Segments::new(player.duration());
         let strip_rx = spawn_filmstrip(&clip, player.duration(), ctx.clone());
@@ -459,10 +462,12 @@ impl EditorState {
                 "[ord-ui] decoder={} pos={:.2} dur={:.2} audio={} play={} abuf_ms={:.0} vq={} dec={} drop={}\n",
                 s.decoder.label(), s.position, dur, s.has_audio, s.playing, s.audio_buf_ms, s.frames_queued, s.decoded, s.dropped
             );
+            // Use the shared diagnostics path so `ORD_DEBUG_LOG` redirects the
+            // telemetry too (it was hardcoded, diverging from `diag::log_line`).
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/tmp/ord-ui-debug.log")
+                .open(crate::diag::log_path())
             {
                 let _ = f.write_all(line.as_bytes());
             }
