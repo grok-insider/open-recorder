@@ -10,6 +10,7 @@ pub mod frame;
 pub mod ipc;
 pub mod newtypes;
 pub mod sync;
+pub mod version;
 
 pub use client::{connect, Client, ClientError};
 pub use config::{

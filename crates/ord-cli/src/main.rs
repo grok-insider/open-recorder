@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 use ord_common::{socket_path, ClipDuration, Command, Event};
 
+mod doctor;
 mod export_cmd;
 
 fn usage() -> &'static str {
@@ -16,11 +17,13 @@ fn usage() -> &'static str {
      usage:\n  \
        ord save [--last N]   save the last N seconds (default 30)\n  \
        ord mark              bookmark this moment (chapter in the next save)\n  \
+       ord shot              save a screenshot of the latest frame\n  \
        ord record            toggle manual recording\n  \
        ord status            show daemon status\n  \
        ord buffer on|off     enable/disable the replay buffer\n  \
        ord config show       print the effective daemon configuration\n  \
        ord subscribe         stream daemon events (for the HUD)\n  \
+       ord doctor [--fix]    diagnose/fix the NVIDIA P2 downclock\n  \
        ord export <in> ...   transcode/trim a clip (see `ord export --help`)\n"
 }
 
@@ -48,6 +51,7 @@ fn parse() -> Result<Command, String> {
         "status" => Ok(Command::Status),
         "subscribe" => Ok(Command::Subscribe),
         "mark" => Ok(Command::Mark),
+        "shot" => Ok(Command::Screenshot),
         "config" => match args.next().as_deref() {
             Some("show") => Ok(Command::GetConfig),
             _ => Err("config needs a subcommand: show".into()),
@@ -106,6 +110,7 @@ fn render(event: Event) -> String {
             }
         }
         Event::CaptureRestarted => "capture restarted".to_string(),
+        Event::ScreenshotSaved { path } => format!("screenshot -> {path}"),
         Event::Config { effective, base } => {
             let overridden = effective.overridden_fields(&base);
             let toml = effective
@@ -125,8 +130,15 @@ fn run() -> Result<(), String> {
     // handle it before any socket connection.
     let mut top = std::env::args().skip(1);
     if let Some(first) = top.next() {
+        if first == "-V" || first == "--version" || first == "version" {
+            println!("ord {}", ord_common::version::long());
+            return Ok(());
+        }
         if first == "export" {
             return export_cmd::run_export(top);
+        }
+        if first == "doctor" {
+            return doctor::run(top);
         }
     }
 

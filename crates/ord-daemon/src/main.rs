@@ -7,10 +7,35 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use ord_common::config::ReplayStorage;
 use ord_common::{lock_tolerant, Config};
-use ord_core::{Engine, PreparedClip};
+use ord_core::{CaptureBackend, Engine, FrameStore, PreparedClip};
 use ord_daemon::storage::{self, ClipKind};
 use ord_daemon::{serve, server::bind, server::ServerCtx, socket_path, ClipWriter, Handler};
+
+/// Build the replay store the config asks for, sized to the buffer and the
+/// backend's pts time base. Disk falls back to RAM if the spill file can't be
+/// created so capture still starts.
+fn make_store(config: &Config, ticks_per_sec: i64) -> Box<dyn FrameStore> {
+    let secs = config.capture.buffer_seconds.max(1);
+    match config.capture.replay_storage {
+        ReplayStorage::Disk => match ord_core::DiskFrameStore::create(
+            ord_core::disk_store::default_spill_path(),
+            secs,
+            ticks_per_sec,
+        ) {
+            Ok(store) => {
+                tracing::info!("replay buffer: disk-backed spill");
+                Box::new(store)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "disk replay store unavailable; using RAM");
+                Box::new(ord_core::RingBuffer::with_time_base(secs, ticks_per_sec))
+            }
+        },
+        ReplayStorage::Ram => Box::new(ord_core::RingBuffer::with_time_base(secs, ticks_per_sec)),
+    }
+}
 
 /// Initialize `tracing` with an `RUST_LOG` env filter (default `info`), so the
 /// daemon emits levelled, filterable logs to the journal instead of bare prints.
@@ -69,6 +94,17 @@ fn clips_dir(cfg: &Config) -> PathBuf {
     }
 }
 
+/// Resolve the directory for full-length recordings (`~` expanded). Defaults to
+/// the clips directory when `storage.recordings_dir` is unset, so simultaneous
+/// replay + recording (gpu-screen-recorder's `-ro`) can land in their own
+/// folder without colliding with replay clips.
+fn recordings_dir(cfg: &Config) -> PathBuf {
+    match cfg.storage.recordings_dir.as_deref() {
+        Some(dir) => ord_daemon::hook::expand_home(dir),
+        None => clips_dir(cfg),
+    }
+}
+
 /// Install a SIGTERM/SIGINT handler that removes the control socket and exits
 /// cleanly. systemd sends SIGTERM when the user service stops; without this the
 /// process is killed mid-accept and leaves the socket file behind (the next start
@@ -103,15 +139,88 @@ fn epoch_secs() -> u64 {
 }
 
 /// Resolve a new output path from the storage template, creating parent dirs.
+/// Recordings go to the (optionally separate) recordings directory; replay clips
+/// go to the clips directory.
 fn output_path(cfg: &Config, kind: ClipKind) -> PathBuf {
     let game = ord_daemon::detect_foreground();
     let stem = ord_daemon::clip_stem(game.as_deref());
     let name = storage::render_name(&cfg.storage.template, Some(&stem), kind, epoch_secs());
-    let path = clips_dir(cfg).join(name).with_extension("mkv");
+    let dir = match kind {
+        ClipKind::Recording => recordings_dir(cfg),
+        ClipKind::Clip => clips_dir(cfg),
+    };
+    let path = dir.join(name).with_extension("mkv");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     path
+}
+
+/// Resolve a screenshot output path (`.png`) in the clips directory.
+#[cfg(feature = "mux")]
+fn screenshot_path(cfg: &Config) -> PathBuf {
+    let game = ord_daemon::detect_foreground();
+    let stem = ord_daemon::clip_stem(game.as_deref());
+    let name = storage::render_name(
+        &cfg.storage.template,
+        Some(&stem),
+        ClipKind::Clip,
+        epoch_secs(),
+    );
+    let path = clips_dir(cfg).join(name).with_extension("png");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    path
+}
+
+/// Decode the newest GOP to a PNG: mux the GOP to a temp file, then have ffmpeg
+/// extract its last frame. Subprocess ffmpeg (like `ord-export`) keeps this
+/// robust without a hand-rolled decoder.
+#[cfg(feature = "mux")]
+fn write_screenshot(
+    frames: &[ord_core::EncodedFrame],
+    params: ord_core::StreamParams,
+    png: &std::path::Path,
+) -> Result<(), String> {
+    let tmp = png.with_extension("gop.mkv");
+    let clip = PreparedClip {
+        frames: frames.to_vec(),
+        audio: Vec::new(),
+        params,
+        audio_params: None,
+        chapters: Vec::new(),
+    };
+    ord_core::write_clip(&clip, &tmp).map_err(|e| e.to_string())?;
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-sseof", "-0.2", "-i"])
+        .arg(&tmp)
+        .args(["-update", "1", "-frames:v", "1"])
+        .arg(png)
+        .status();
+    let _ = std::fs::remove_file(&tmp);
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("ffmpeg screenshot failed: {s}")),
+        Err(e) => Err(format!("ffmpeg not available: {e}")),
+    }
+}
+
+/// Build the screenshot writer (reads live config). With `mux` it decodes via
+/// ffmpeg; without it, screenshots report a clear error.
+#[cfg(feature = "mux")]
+fn make_shot_writer(config: Arc<Mutex<Config>>) -> ord_daemon::server::ShotWriter {
+    Box::new(move |frames, params| {
+        let cfg = lock_tolerant(&config).clone();
+        let path = screenshot_path(&cfg);
+        write_screenshot(frames, params, &path)?;
+        Ok(path)
+    })
+}
+
+#[cfg(not(feature = "mux"))]
+fn make_shot_writer(_config: Arc<Mutex<Config>>) -> ord_daemon::server::ShotWriter {
+    Box::new(|_frames, _params| Err("screenshots require the `mux` build".into()))
 }
 
 /// Build the recording-path provider for the handler (reads live config).
@@ -206,18 +315,44 @@ fn map_codec(c: ord_common::config::CaptureCodec) -> ord_core::Codec {
 }
 
 #[cfg(feature = "waycap")]
-fn make_engine(config: &Config) -> Engine<ord_core::waycap_backend::WaycapBackend> {
+fn make_engine(
+    config: &Config,
+) -> Engine<ord_core::waycap_backend::WaycapBackend, Box<dyn FrameStore>> {
     use ord_core::waycap_backend::WaycapBackend;
     // desktop and mic are mixed into one Opus track on a shared PipeWire clock.
     // Enabling the mic implies audio; mic capture also includes desktop audio.
-    let audio_any = config.audio.desktop || config.audio.mic;
-    let backend = WaycapBackend::new(map_quality(config.capture.quality), config.capture.fps)
+    // Derive the (single-track) waycap audio flags from the effective track
+    // model. The waycap path still mixes into one Opus track; the multi-track /
+    // per-app subsystem (ord-core PipeWire capture) is the follow-on that
+    // consumes the full `effective_tracks()` plan.
+    let tracks = config.audio.effective_tracks();
+    let audio_any = config.audio.any();
+    let mic = tracks.iter().any(|t| {
+        t.sources
+            .iter()
+            .any(|s| matches!(s, ord_common::config::AudioSource::DefaultInput))
+    });
+    let mut backend = WaycapBackend::new(map_quality(config.capture.quality), config.capture.fps)
         .with_codec(map_codec(config.capture.codec))
         .with_bitrate_kbps(config.capture.bitrate_kbps)
+        .with_keyframe_interval_ms(config.capture.keyframe_interval_ms)
+        .with_framerate_mode(config.capture.framerate_mode)
+        .with_color_range(config.capture.color_range)
+        .with_tune(config.capture.tune)
+        .with_target(config.capture.target.clone())
+        .with_hdr(config.capture.hdr)
         .with_audio(audio_any)
-        .with_mic(config.audio.mic)
+        .with_mic(mic)
         .with_restore_token_path(restore_token_path());
-    Engine::new(backend, config.capture.buffer_seconds)
+    if let Some(res) = config.capture.resolution {
+        backend = backend.with_dimensions(res.width, res.height);
+    }
+    let ticks = backend.params().time_base_den;
+    Engine::with_store(
+        backend,
+        make_store(config, ticks),
+        config.capture.buffer_seconds,
+    )
 }
 
 /// Where the XDG screencast restore token is cached, so the daemon skips the
@@ -234,11 +369,15 @@ fn restore_token_path() -> PathBuf {
 }
 
 #[cfg(not(feature = "waycap"))]
-fn make_engine(config: &Config) -> Engine<ord_core::MockBackend> {
-    // Dev daemon: a long mock capture so the socket/CLI can be exercised.
+fn make_engine(config: &Config) -> Engine<ord_core::MockBackend, Box<dyn FrameStore>> {
+    // Dev daemon: a long mock capture so the socket/CLI can be exercised. Honors
+    // the configured replay storage (RAM or disk) so that path is exercisable
+    // without a GPU.
     let fps = config.capture.fps;
     let buffer = config.capture.buffer_seconds;
-    Engine::new(ord_core::MockBackend::new(fps, fps * buffer, fps), buffer)
+    let backend = ord_core::MockBackend::new(fps, fps * buffer, fps);
+    let ticks = backend.params().time_base_den;
+    Engine::with_store(backend, make_store(config, ticks), buffer)
 }
 
 /// Persist the overrides document atomically-ish; an empty diff removes the
@@ -260,6 +399,16 @@ fn write_overrides_file(contents: &str) -> Result<(), String> {
 }
 
 fn main() {
+    // `ordd --version` (and `-V`) report and exit before any setup, so version
+    // checks work even when a session/socket isn't available.
+    if std::env::args()
+        .nth(1)
+        .is_some_and(|a| a == "--version" || a == "-V")
+    {
+        println!("ordd {}", ord_common::version::long());
+        return;
+    }
+
     init_tracing();
     let path = socket_path();
     let (config, base) = load_config();
@@ -288,6 +437,7 @@ fn main() {
         base,
         engine_factory: Box::new(make_engine),
         write_overrides: Box::new(write_overrides_file),
+        shot_writer: make_shot_writer(Arc::clone(&shared_config)),
         // No frames for 5 s while the buffer is armed -> restart capture
         // (suspend/resume kills NVENC; monitor changes end the portal session).
         watchdog: Some(std::time::Duration::from_secs(5)),

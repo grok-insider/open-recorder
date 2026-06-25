@@ -79,6 +79,48 @@ pub trait FrameStore: Send {
     fn window(&self, start: usize, count: usize) -> Vec<EncodedFrame>;
 }
 
+/// Forwarding impl so an engine can hold a runtime-selected store as a
+/// `Box<dyn FrameStore>` (RAM ring or disk spill) without the daemon, handler,
+/// and server needing to be generic over a concrete store type.
+impl FrameStore for Box<dyn FrameStore> {
+    fn push(&mut self, frame: EncodedFrame) {
+        (**self).push(frame)
+    }
+    fn clear(&mut self) {
+        (**self).clear()
+    }
+    fn set_capacity_seconds(&mut self, capacity_seconds: u32) {
+        (**self).set_capacity_seconds(capacity_seconds)
+    }
+    fn len(&self) -> usize {
+        (**self).len()
+    }
+    fn bytes(&self) -> usize {
+        (**self).bytes()
+    }
+    fn ticks_per_sec(&self) -> i64 {
+        (**self).ticks_per_sec()
+    }
+    fn capacity_seconds(&self) -> u32 {
+        (**self).capacity_seconds()
+    }
+    fn buffered_seconds(&self) -> u32 {
+        (**self).buffered_seconds()
+    }
+    fn newest_pts(&self) -> Option<Ticks> {
+        (**self).newest_pts()
+    }
+    fn oldest_pts(&self) -> Option<Ticks> {
+        (**self).oldest_pts()
+    }
+    fn scan(&self) -> Box<dyn Iterator<Item = FrameMeta> + '_> {
+        (**self).scan()
+    }
+    fn window(&self, start: usize, count: usize) -> Vec<EncodedFrame> {
+        (**self).window(start, count)
+    }
+}
+
 impl FrameStore for RingBuffer {
     fn push(&mut self, frame: EncodedFrame) {
         RingBuffer::push(self, frame)

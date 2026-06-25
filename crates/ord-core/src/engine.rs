@@ -269,6 +269,23 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
         })
     }
 
+    /// Select the newest decodable GOP — the newest keyframe through the newest
+    /// buffered frame — together with the stream params needed to decode it.
+    /// This is the unit a screenshot decodes (a lone delta frame isn't
+    /// decodable). Returns `None` when no keyframe is buffered. Leaves the buffer
+    /// intact, like [`take_clip`](Engine::take_clip).
+    pub fn take_latest_gop(&self) -> Option<(Vec<EncodedFrame>, StreamParams)> {
+        let kf_index = self
+            .ring
+            .scan()
+            .filter(|m| m.is_keyframe)
+            .map(|m| m.index)
+            .last()?;
+        let count = self.ring.len().saturating_sub(kf_index);
+        let frames = self.ring.window(kf_index, count);
+        (!frames.is_empty()).then(|| (frames, self.backend.params()))
+    }
+
     /// Whole seconds currently buffered (for status).
     pub fn buffered_seconds(&self) -> u32 {
         self.ring.buffered_seconds()
@@ -357,6 +374,35 @@ mod tests {
     fn take_clip_on_empty_errors() {
         let eng = Engine::new(MockBackend::new(60, 0, 1), 60);
         assert_eq!(eng.take_clip(cd(3)), Err(ClipError::EmptyBuffer));
+    }
+
+    #[test]
+    fn latest_gop_starts_on_newest_keyframe() {
+        // 60fps, 600 frames = 10s, keyframe every 60 frames (every 1s).
+        let mut eng = Engine::new(MockBackend::new(60, 600, 60), 60);
+        eng.start().unwrap();
+        eng.drain_available();
+        let (frames, params) = eng.take_latest_gop().expect("a gop");
+        assert!(
+            frames.first().unwrap().is_keyframe,
+            "gop starts on keyframe"
+        );
+        assert_eq!(params.fps, 60);
+        // The newest keyframe is the last one (frame 540); the GOP runs from it
+        // to the newest buffered frame — at most one keyframe interval of frames.
+        assert!(
+            !frames.is_empty() && frames.len() <= 60,
+            "got {}",
+            frames.len()
+        );
+        // Exactly one keyframe (the first) in the selected GOP.
+        assert_eq!(frames.iter().filter(|f| f.is_keyframe).count(), 1);
+    }
+
+    #[test]
+    fn latest_gop_none_without_keyframe() {
+        let eng = Engine::new(MockBackend::new(60, 0, 1), 60);
+        assert!(eng.take_latest_gop().is_none());
     }
 
     #[test]

@@ -13,8 +13,10 @@
 //! `CaptureBackend` trait; it feeds [`EncodedFrame`]s into the [`ring::RingBuffer`].
 
 pub mod audio;
+pub mod audio_route;
 pub mod backend;
 pub mod clip;
+pub mod disk_store;
 pub mod engine;
 pub mod mux;
 pub mod record;
@@ -26,6 +28,7 @@ pub mod waycap_backend;
 pub use audio::{AudioCodec, AudioParams, AudioRingBuffer, EncodedAudioFrame};
 pub use backend::{BackendError, CaptureBackend, CaptureStreams, Codec, MockBackend, StreamParams};
 pub use clip::{select_clip, ClipError, ClipSelection};
+pub use disk_store::DiskFrameStore;
 pub use engine::{Engine, PreparedClip};
 pub use mux::{verify_clip, write_clip, ClipCheck, MuxError};
 pub use record::Recorder;

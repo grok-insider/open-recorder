@@ -8,7 +8,10 @@
 use std::path::PathBuf;
 
 use ord_common::{BufferSeconds, ClipDuration, Command, Event};
-use ord_core::{CaptureBackend, ClipError, Engine, PreparedClip};
+use ord_core::{
+    CaptureBackend, ClipError, EncodedFrame, Engine, FrameStore, PreparedClip, RingBuffer,
+    StreamParams,
+};
 
 /// Resolves where a new full-length recording should be written (game-named,
 /// timestamped). Injected so the handler stays free of filename I/O and tests can
@@ -16,21 +19,25 @@ use ord_core::{CaptureBackend, ClipError, Engine, PreparedClip};
 pub type RecordPath = Box<dyn FnMut() -> PathBuf + Send>;
 
 /// Daemon state + capture engine.
-pub struct Handler<B: CaptureBackend> {
-    engine: Engine<B>,
+///
+/// Generic over the replay [`FrameStore`] so the daemon can pick RAM or disk at
+/// runtime; defaults to [`RingBuffer`] so the mock tests (and any caller that
+/// doesn't care) stay unchanged.
+pub struct Handler<B: CaptureBackend, S: FrameStore = RingBuffer> {
+    engine: Engine<B, S>,
     buffer: BufferSeconds,
     buffer_enabled: bool,
     record_path: RecordPath,
 }
 
-impl<B: CaptureBackend> Handler<B> {
+impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
     /// Build a handler over `engine`. The engine should already be started if the
     /// buffer is meant to be live. Clip *writing* is owned by the server layer so
     /// the slow ffmpeg mux runs off the handler lock (see [`prepare_save`]).
     /// `record_path` resolves the output path each time a recording is started.
     ///
     /// [`prepare_save`]: Handler::prepare_save
-    pub fn new(engine: Engine<B>, record_path: RecordPath) -> Self {
+    pub fn new(engine: Engine<B, S>, record_path: RecordPath) -> Self {
         let buffer_enabled = engine.is_running();
         let buffer = BufferSeconds::new(engine.capacity_seconds())
             .unwrap_or_else(|| BufferSeconds::new(1).expect("1 is non-zero"));
@@ -81,7 +88,7 @@ impl<B: CaptureBackend> Handler<B> {
     /// Swap in a freshly built engine (encoder settings changed). The caller
     /// starts the new engine if capture should be live; buffered footage from
     /// the old engine is dropped with it (a capture restart is a clean cut).
-    pub fn replace_engine(&mut self, engine: Engine<B>) {
+    pub fn replace_engine(&mut self, engine: Engine<B, S>) {
         self.buffer = BufferSeconds::new(engine.capacity_seconds())
             .unwrap_or_else(|| BufferSeconds::new(1).expect("1 is non-zero"));
         self.buffer_enabled = engine.is_running();
@@ -110,10 +117,20 @@ impl<B: CaptureBackend> Handler<B> {
             // Config and marker commands are server-dispatched (they touch the
             // config store / run save flows off-lock). Reaching these arms means
             // a dispatch wiring bug, same as SaveLast.
-            Command::GetConfig | Command::SetConfig { .. } | Command::Mark => Event::Error {
+            Command::GetConfig
+            | Command::SetConfig { .. }
+            | Command::Mark
+            | Command::Screenshot => Event::Error {
                 message: "internal: command was not dispatched by the server".into(),
             },
         }
+    }
+
+    /// Drain pending frames and select the newest decodable GOP for a
+    /// screenshot, leaving the buffer intact. `None` when nothing is buffered.
+    pub fn prepare_screenshot(&mut self) -> Option<(Vec<EncodedFrame>, StreamParams)> {
+        self.engine.drain_available();
+        self.engine.take_latest_gop()
     }
 
     /// Drain pending frames and select the last `duration` into a [`PreparedClip`],

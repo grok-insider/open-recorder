@@ -54,6 +54,40 @@ pub fn detect_foreground() -> Option<String> {
     )
 }
 
+/// Heuristic for auto-arm: is the foreground window a game we should start the
+/// replay buffer for? A Steam app (`steam_app_<id>` class) always counts;
+/// otherwise a fullscreen window does (the common case for games on Hyprland).
+/// Pure + tested; the live probe feeds it `class`/`fullscreen` from hyprctl.
+pub fn is_game_window(class: Option<&str>, fullscreen: bool) -> bool {
+    class.is_some_and(is_steam_app_class) || fullscreen
+}
+
+/// Probe the foreground window and decide whether it looks like a game (for
+/// `capture.auto_arm`). Best-effort: any failure returns `false`.
+#[cfg(target_os = "linux")]
+pub fn foreground_is_game() -> bool {
+    let Ok(out) = std::process::Command::new("hyprctl")
+        .args(["activewindow", "-j"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let Ok(text) = String::from_utf8(out.stdout) else {
+        return false;
+    };
+    let class = extract_json_string_field(&text, "class");
+    let fullscreen = extract_json_int_field(&text, "fullscreen").unwrap_or(0) != 0;
+    is_game_window(class.as_deref(), fullscreen)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn foreground_is_game() -> bool {
+    false
+}
+
 /// Whether a window class is a cryptic Steam app id (`steam_app_<digits>`),
 /// whose human name lives in the title instead.
 fn is_steam_app_class(class: &str) -> bool {
@@ -95,6 +129,20 @@ pub fn extract_json_string_field(json: &str, field: &str) -> Option<String> {
     } else {
         Some(val.to_string())
     }
+}
+
+/// Minimal extractor for a numeric `"field": N` from a flat JSON object (e.g.
+/// hyprctl's `fullscreen`). Returns `None` if absent or non-numeric.
+pub fn extract_json_int_field(json: &str, field: &str) -> Option<i64> {
+    let needle = format!("\"{field}\"");
+    let start = json.find(&needle)? + needle.len();
+    let rest = &json[start..];
+    let colon = rest.find(':')? + 1;
+    let rest = rest[colon..].trim_start();
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
 }
 
 #[cfg(test)]
@@ -154,6 +202,27 @@ mod tests {
         let json = r#"{"class":"","title":"X"}"#;
         assert_eq!(extract_json_string_field(json, "class"), None);
         assert_eq!(extract_json_string_field(json, "nope"), None);
+    }
+
+    #[test]
+    fn extract_int_field_reads_fullscreen() {
+        let json = r#"{"class":"steam_app_1","fullscreen":2,"title":"X"}"#;
+        assert_eq!(extract_json_int_field(json, "fullscreen"), Some(2));
+        assert_eq!(extract_json_int_field(json, "missing"), None);
+        let zero = r#"{"fullscreen":0}"#;
+        assert_eq!(extract_json_int_field(zero, "fullscreen"), Some(0));
+    }
+
+    #[test]
+    fn game_window_heuristic() {
+        // Steam app -> game regardless of fullscreen.
+        assert!(is_game_window(Some("steam_app_1145360"), false));
+        // Fullscreen non-steam window -> treated as a game.
+        assert!(is_game_window(Some("gamescope"), true));
+        // Windowed browser -> not a game.
+        assert!(!is_game_window(Some("firefox"), false));
+        // Nothing focused -> not a game.
+        assert!(!is_game_window(None, false));
     }
 
     #[test]

@@ -33,6 +33,9 @@ pub enum Command {
     /// Markers inside a later save's window become MKV chapters. May also
     /// auto-save (see `markers.auto_save_seconds` in the config).
     Mark,
+    /// Grab a still image of the most recent buffered frame (decodes the newest
+    /// GOP and writes a PNG). The replay buffer must be armed.
+    Screenshot,
 }
 
 /// A message sent from the daemon to clients.
@@ -70,6 +73,8 @@ pub enum Event {
     /// The capture session was restarted (watchdog recovery after a stall —
     /// e.g. suspend/resume — or a settings change that requires it).
     CaptureRestarted,
+    /// A screenshot was written to disk.
+    ScreenshotSaved { path: String },
 }
 
 /// Errors encoding/decoding protocol frames.
@@ -105,6 +110,7 @@ impl Event {
                 | Event::RecordState { .. }
                 | Event::Marked { .. }
                 | Event::CaptureRestarted
+                | Event::ScreenshotSaved { .. }
         )
     }
 
@@ -138,6 +144,7 @@ mod tests {
             Command::Subscribe,
             Command::GetConfig,
             Command::Mark,
+            Command::Screenshot,
             Command::SetConfig {
                 config: Box::new(Config::default()),
             },
@@ -174,6 +181,9 @@ mod tests {
             },
             Event::Marked { auto_saving: true },
             Event::CaptureRestarted,
+            Event::ScreenshotSaved {
+                path: "/home/friend/Videos/open-recorder/shot.png".to_string(),
+            },
         ];
         for ev in cases {
             let bytes = ev.encode().unwrap();

@@ -174,6 +174,39 @@ pub struct CaptureConfig {
     /// records in constant-quality mode via `quality`. CBR keeps the replay
     /// buffer's RAM use predictable in high-motion scenes.
     pub bitrate_kbps: Option<u32>,
+    /// Output resolution. `None` (default) captures at the monitor's native
+    /// resolution; when set, capture is scaled to these dimensions (needs a
+    /// waycap-rs build that honors capture scaling — otherwise a container hint).
+    pub resolution: Option<Resolution>,
+    /// Keyframe (GOP) interval in milliseconds. Smaller = finer "save last N"
+    /// reachability and seeking, at a small bitrate cost. Default 2000 (2 s),
+    /// matching gpu-screen-recorder's `-keyint`.
+    pub keyframe_interval_ms: u32,
+    /// Frame-timing mode: `cfr` (constant; safest for editing — the default),
+    /// `vfr` (variable; lower encode load on static scenes), or `content` (sync
+    /// capture to screen updates; smoothest under VRR/G-SYNC, works on portal).
+    pub framerate_mode: FramerateMode,
+    /// Encoded color range: `limited` (default, most compatible) or `full`.
+    pub color_range: ColorRange,
+    /// NVENC encoder tune: `performance` (default, lowest overhead) or `quality`.
+    pub tune: EncoderTune,
+    /// Where the replay buffer lives: `ram` (default, lowest latency) or `disk`
+    /// (spill encoded frames to a file so the window can far exceed RAM, at the
+    /// cost of a disk read per saved frame). gpu-screen-recorder's
+    /// `-replay-storage`.
+    pub replay_storage: ReplayStorage,
+    /// Capture target: `portal` (default — pick via the XDG screencast dialog,
+    /// reusing the saved restore token) or a monitor name like `DP-1`. Named
+    /// monitors need a waycap-rs build with direct output capture; until then a
+    /// name falls back to the portal.
+    pub target: String,
+    /// Auto-arm the replay buffer when a game takes the foreground (a Steam app
+    /// or any fullscreen window). Off by default — the "set and forget" mode.
+    pub auto_arm: bool,
+    /// Capture HDR (10-bit, BT.2020/PQ). Requires an HEVC or AV1 codec and a
+    /// KMS capture path (the XDG portal tonemaps to SDR), so HDR depends on the
+    /// direct-monitor capture spike. Off by default.
+    pub hdr: bool,
     /// Drop the whole buffer after a successful save, so consecutive saves
     /// never overlap (and the pre-save footage is gone — a privacy choice).
     pub clear_on_save: bool,
@@ -187,9 +220,64 @@ impl Default for CaptureConfig {
             quality: Quality::High,
             codec: CaptureCodec::H264,
             bitrate_kbps: None,
+            resolution: None,
+            keyframe_interval_ms: 2000,
+            framerate_mode: FramerateMode::Cfr,
+            color_range: ColorRange::Limited,
+            tune: EncoderTune::Performance,
+            replay_storage: ReplayStorage::Ram,
+            target: "portal".to_string(),
+            auto_arm: false,
+            hdr: false,
             clear_on_save: false,
         }
     }
+}
+
+/// Where the replay buffer's encoded frames are held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplayStorage {
+    /// In RAM (the default): lowest latency, bounded by available memory.
+    Ram,
+    /// Spilled to a file: long windows on low-RAM machines.
+    Disk,
+}
+
+/// An explicit output resolution (pixels). NVENC requires even dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resolution {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// How capture frame timing is produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FramerateMode {
+    /// Constant frame rate — one frame per tick, safest for editors.
+    Cfr,
+    /// Variable frame rate — skip unchanged frames, lower encode load.
+    Vfr,
+    /// Sync capture to on-screen content updates (best under VRR/G-SYNC).
+    Content,
+}
+
+/// Encoded luma/chroma value range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorRange {
+    Limited,
+    Full,
+}
+
+/// NVENC rate-distortion tuning bias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EncoderTune {
+    Performance,
+    Quality,
 }
 
 /// Where and how clips land on disk.
@@ -198,6 +286,11 @@ impl Default for CaptureConfig {
 pub struct StorageConfig {
     /// Clips directory. `~` expands to `$HOME`. `None` = `~/Videos/open-recorder`.
     pub clips_dir: Option<String>,
+    /// Directory for full-length manual recordings (`ord record`), kept separate
+    /// from replay clips so simultaneous replay + recording never collide —
+    /// gpu-screen-recorder's `-ro`. `~` expands to `$HOME`. `None` = same as
+    /// `clips_dir`. Recordings here are never auto-pruned (they are deliberate).
+    pub recordings_dir: Option<String>,
     /// Clip filename template (no extension). Tokens: `{game}` (detected
     /// foreground app or "clip"), `{rec}` (`""` for saved clips, `"-rec"` for
     /// full recordings), `{epoch}` (unix seconds), `{date}` (YYYY-MM-DD),
@@ -215,6 +308,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             clips_dir: None,
+            recordings_dir: None,
             template: "{game}{rec}-{epoch}".to_string(),
             max_gib: None,
             max_age_days: None,
@@ -258,7 +352,13 @@ impl Default for OverlayConfig {
     }
 }
 
-/// Audio capture settings. Both sources are mixed into one track.
+/// Audio capture settings.
+///
+/// The simple model is the `desktop`/`mic` booleans (mixed into one Opus track,
+/// the historical behavior). For separate tracks and per-application audio,
+/// populate `tracks`: each entry becomes its own output track mixing the listed
+/// [`AudioSource`]s. When `tracks` is non-empty it takes precedence over the
+/// booleans (see [`AudioConfig::effective_tracks`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AudioConfig {
@@ -267,6 +367,11 @@ pub struct AudioConfig {
     pub desktop: bool,
     /// Capture the microphone (the default source) — your own voice.
     pub mic: bool,
+    /// Explicit per-track capture (gpu-screen-recorder style). Each track is a
+    /// separate audio stream in the output, mixing its sources. Enables
+    /// separate game/mic tracks and per-application audio. Empty = use the
+    /// `desktop`/`mic` booleans as a single mixed track.
+    pub tracks: Vec<AudioTrack>,
 }
 
 impl Default for AudioConfig {
@@ -274,6 +379,7 @@ impl Default for AudioConfig {
         Self {
             desktop: true,
             mic: true,
+            tracks: Vec::new(),
         }
     }
 }
@@ -281,7 +387,112 @@ impl Default for AudioConfig {
 impl AudioConfig {
     /// Whether any audio capture is enabled.
     pub fn any(&self) -> bool {
-        self.desktop || self.mic
+        if self.tracks.is_empty() {
+            self.desktop || self.mic
+        } else {
+            self.tracks.iter().any(|t| !t.sources.is_empty())
+        }
+    }
+
+    /// The tracks to actually capture: the explicit `tracks` if any, otherwise a
+    /// single track synthesized from the `desktop`/`mic` booleans (the legacy
+    /// one-mixed-track behavior). An all-off legacy config yields no tracks.
+    pub fn effective_tracks(&self) -> Vec<AudioTrack> {
+        if !self.tracks.is_empty() {
+            return self.tracks.clone();
+        }
+        let mut sources = Vec::new();
+        if self.desktop {
+            sources.push(AudioSource::DefaultOutput);
+        }
+        if self.mic {
+            sources.push(AudioSource::DefaultInput);
+        }
+        if sources.is_empty() {
+            Vec::new()
+        } else {
+            vec![AudioTrack {
+                name: None,
+                sources,
+            }]
+        }
+    }
+}
+
+/// One output audio track: a set of sources mixed together.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AudioTrack {
+    /// Optional label, carried into track metadata.
+    pub name: Option<String>,
+    /// Sources mixed into this track.
+    pub sources: Vec<AudioSource>,
+}
+
+/// A selectable audio source, in gpu-screen-recorder's `-a` syntax. Serialized
+/// as a string: `default_output`, `default_input`, `device:NAME`, `app:NAME`,
+/// or `app-inverse:NAME`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum AudioSource {
+    /// The default sink monitor (desktop/game audio).
+    DefaultOutput,
+    /// The default source (microphone).
+    DefaultInput,
+    /// A specific device by name.
+    Device(String),
+    /// A specific application's audio by name (case-insensitive).
+    App(String),
+    /// All applications EXCEPT the named one.
+    AppInverse(String),
+}
+
+impl std::fmt::Display for AudioSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AudioSource::DefaultOutput => f.write_str("default_output"),
+            AudioSource::DefaultInput => f.write_str("default_input"),
+            AudioSource::Device(n) => write!(f, "device:{n}"),
+            AudioSource::App(n) => write!(f, "app:{n}"),
+            AudioSource::AppInverse(n) => write!(f, "app-inverse:{n}"),
+        }
+    }
+}
+
+impl std::str::FromStr for AudioSource {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        match s {
+            "default_output" => Ok(AudioSource::DefaultOutput),
+            "default_input" => Ok(AudioSource::DefaultInput),
+            _ => {
+                if let Some(n) = s.strip_prefix("device:") {
+                    Ok(AudioSource::Device(n.to_string()))
+                } else if let Some(n) = s.strip_prefix("app-inverse:") {
+                    Ok(AudioSource::AppInverse(n.to_string()))
+                } else if let Some(n) = s.strip_prefix("app:") {
+                    Ok(AudioSource::App(n.to_string()))
+                } else {
+                    Err(format!(
+                        "invalid audio source '{s}' (use default_output, default_input, device:NAME, app:NAME, app-inverse:NAME)"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+impl TryFrom<String> for AudioSource {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<AudioSource> for String {
+    fn from(s: AudioSource) -> Self {
+        s.to_string()
     }
 }
 
@@ -398,6 +609,15 @@ mod tests {
         assert_eq!(c.capture.quality, Quality::High);
         assert_eq!(c.capture.codec, CaptureCodec::H264);
         assert_eq!(c.capture.bitrate_kbps, None);
+        assert_eq!(c.capture.resolution, None);
+        assert_eq!(c.capture.keyframe_interval_ms, 2000);
+        assert_eq!(c.capture.framerate_mode, FramerateMode::Cfr);
+        assert_eq!(c.capture.color_range, ColorRange::Limited);
+        assert_eq!(c.capture.tune, EncoderTune::Performance);
+        assert_eq!(c.capture.replay_storage, ReplayStorage::Ram);
+        assert_eq!(c.capture.target, "portal");
+        assert!(!c.capture.auto_arm);
+        assert!(!c.capture.hdr);
         assert!(c.audio.desktop);
         assert!(c.audio.mic);
         assert_eq!(c.export.codec, ExportCodec::Av1);
@@ -514,11 +734,36 @@ mod tests {
                 quality: Quality::Ultra,
                 codec: CaptureCodec::Hevc,
                 bitrate_kbps: Some(20_000),
+                resolution: Some(Resolution {
+                    width: 1920,
+                    height: 1080,
+                }),
+                keyframe_interval_ms: 1000,
+                framerate_mode: FramerateMode::Content,
+                color_range: ColorRange::Full,
+                tune: EncoderTune::Quality,
+                replay_storage: ReplayStorage::Disk,
+                target: "DP-1".to_string(),
+                auto_arm: true,
+                hdr: true,
                 clear_on_save: true,
             },
             audio: AudioConfig {
                 desktop: false,
                 mic: true,
+                tracks: vec![
+                    AudioTrack {
+                        name: Some("game".into()),
+                        sources: vec![AudioSource::DefaultOutput],
+                    },
+                    AudioTrack {
+                        name: Some("voice".into()),
+                        sources: vec![
+                            AudioSource::App("discord".into()),
+                            AudioSource::DefaultInput,
+                        ],
+                    },
+                ],
             },
             export: ExportConfig {
                 codec: ExportCodec::H264,
@@ -529,6 +774,7 @@ mod tests {
             },
             storage: StorageConfig {
                 clips_dir: Some("~/Clips".into()),
+                recordings_dir: Some("~/Recordings".into()),
                 template: "{date}/{game}-{epoch}".into(),
                 max_gib: Some(25),
                 max_age_days: Some(90),
@@ -571,6 +817,120 @@ mod tests {
         assert_eq!(c.capture.codec, CaptureCodec::Av1);
         assert_eq!(c.capture.bitrate_kbps, Some(12_000));
         assert_eq!(c.hooks.on_clip_saved.as_deref(), Some("~/bin/clip-hook"));
+    }
+
+    #[test]
+    fn capture_knobs_parse_and_default() {
+        let c = Config::from_toml_str(
+            r#"
+            [capture]
+            keyframe_interval_ms = 500
+            framerate_mode = "vfr"
+            color_range = "full"
+            tune = "quality"
+
+            [capture.resolution]
+            width = 1920
+            height = 1080
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.capture.keyframe_interval_ms, 500);
+        assert_eq!(c.capture.framerate_mode, FramerateMode::Vfr);
+        assert_eq!(c.capture.color_range, ColorRange::Full);
+        assert_eq!(c.capture.tune, EncoderTune::Quality);
+        assert_eq!(
+            c.capture.resolution,
+            Some(Resolution {
+                width: 1920,
+                height: 1080
+            })
+        );
+        // Unset knobs keep defaults.
+        assert_eq!(Config::default().capture.framerate_mode, FramerateMode::Cfr);
+    }
+
+    #[test]
+    fn audio_source_string_round_trips() {
+        use std::str::FromStr;
+        let cases = [
+            ("default_output", AudioSource::DefaultOutput),
+            ("default_input", AudioSource::DefaultInput),
+            (
+                "device:alsa_output.x",
+                AudioSource::Device("alsa_output.x".into()),
+            ),
+            ("app:Firefox", AudioSource::App("Firefox".into())),
+            ("app-inverse:obs", AudioSource::AppInverse("obs".into())),
+        ];
+        for (s, want) in cases {
+            assert_eq!(AudioSource::from_str(s).unwrap(), want);
+            assert_eq!(want.to_string(), s);
+        }
+        assert!(AudioSource::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn audio_tracks_parse_and_take_precedence() {
+        let c = Config::from_toml_str(
+            r#"
+            [audio]
+            desktop = true
+            mic = true
+
+            [[audio.tracks]]
+            name = "game"
+            sources = ["default_output"]
+
+            [[audio.tracks]]
+            sources = ["app:discord", "default_input"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.audio.tracks.len(), 2);
+        // Explicit tracks win over the desktop/mic booleans.
+        let eff = c.audio.effective_tracks();
+        assert_eq!(eff.len(), 2);
+        assert_eq!(eff[0].name.as_deref(), Some("game"));
+        assert_eq!(eff[1].sources[0], AudioSource::App("discord".into()));
+        assert!(c.audio.any());
+    }
+
+    #[test]
+    fn effective_tracks_falls_back_to_booleans() {
+        // No explicit tracks: synthesize one mixed track from desktop/mic.
+        let mut a = AudioConfig::default();
+        let eff = a.effective_tracks();
+        assert_eq!(eff.len(), 1);
+        assert_eq!(
+            eff[0].sources,
+            vec![AudioSource::DefaultOutput, AudioSource::DefaultInput]
+        );
+        // All off -> no tracks, no audio.
+        a.desktop = false;
+        a.mic = false;
+        assert!(a.effective_tracks().is_empty());
+        assert!(!a.any());
+    }
+
+    #[test]
+    fn replay_storage_parses() {
+        let c = Config::from_toml_str("[capture]\nreplay_storage = \"disk\"").unwrap();
+        assert_eq!(c.capture.replay_storage, ReplayStorage::Disk);
+        assert_eq!(Config::default().capture.replay_storage, ReplayStorage::Ram);
+    }
+
+    #[test]
+    fn recordings_dir_defaults_none_and_overrides() {
+        // Absent by default (recordings fall back to the clips dir).
+        assert_eq!(Config::default().storage.recordings_dir, None);
+        // Parses and is reported as a sparse override against the default.
+        let c = Config::from_toml_str("[storage]\nrecordings_dir = \"~/Recordings\"").unwrap();
+        assert_eq!(c.storage.recordings_dir.as_deref(), Some("~/Recordings"));
+        assert_eq!(
+            c.overridden_fields(&Config::default()),
+            vec!["storage.recordings_dir".to_string()]
+        );
     }
 
     #[test]

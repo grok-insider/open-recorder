@@ -55,6 +55,12 @@ pub struct WaycapBackend {
     bitrate_kbps: Option<u32>,
     width: u32,
     height: u32,
+    keyframe_interval_ms: u32,
+    framerate_mode: ord_common::config::FramerateMode,
+    color_range: ord_common::config::ColorRange,
+    tune: ord_common::config::EncoderTune,
+    target: String,
+    hdr: bool,
     audio_enabled: bool,
     mic_enabled: bool,
     restore_token_path: Option<std::path::PathBuf>,
@@ -78,6 +84,12 @@ impl WaycapBackend {
             bitrate_kbps: None,
             width: 2560,
             height: 1440,
+            keyframe_interval_ms: 2000,
+            framerate_mode: ord_common::config::FramerateMode::Cfr,
+            color_range: ord_common::config::ColorRange::Limited,
+            tune: ord_common::config::EncoderTune::Performance,
+            target: "portal".to_string(),
+            hdr: false,
             audio_enabled: true,
             mic_enabled: false,
             restore_token_path: None,
@@ -105,10 +117,52 @@ impl WaycapBackend {
         self
     }
 
-    /// Set the container dimension hints.
+    /// Set the output dimensions (also the container hint). Once the waycap-rs
+    /// fork exposes capture scaling these drive a downscale; today they report
+    /// the negotiated size to the muxer.
     pub fn with_dimensions(mut self, width: u32, height: u32) -> Self {
         self.width = width;
         self.height = height;
+        self
+    }
+
+    /// Keyframe (GOP) interval in milliseconds (default 2000).
+    pub fn with_keyframe_interval_ms(mut self, ms: u32) -> Self {
+        self.keyframe_interval_ms = ms;
+        self
+    }
+
+    /// Frame-timing mode (CFR/VFR/content-synced).
+    pub fn with_framerate_mode(mut self, mode: ord_common::config::FramerateMode) -> Self {
+        self.framerate_mode = mode;
+        self
+    }
+
+    /// Encoded color range (limited/full).
+    pub fn with_color_range(mut self, range: ord_common::config::ColorRange) -> Self {
+        self.color_range = range;
+        self
+    }
+
+    /// NVENC encoder tune (performance/quality).
+    pub fn with_tune(mut self, tune: ord_common::config::EncoderTune) -> Self {
+        self.tune = tune;
+        self
+    }
+
+    /// Capture target: `"portal"` (interactive picker + restore token) or a
+    /// monitor name. Named monitors await a waycap-rs build with direct output
+    /// capture; until then any non-portal value falls back to the portal.
+    pub fn with_target(mut self, target: impl Into<String>) -> Self {
+        self.target = target.into();
+        self
+    }
+
+    /// Request HDR (10-bit BT.2020/PQ) capture. Needs HEVC/AV1 Main10 in the
+    /// waycap-rs fork and a KMS capture path (the portal tonemaps to SDR); until
+    /// the HDR spike lands this records SDR and the flag is advisory.
+    pub fn with_hdr(mut self, hdr: bool) -> Self {
+        self.hdr = hdr;
         self
     }
 
@@ -185,6 +239,22 @@ impl CaptureBackend for WaycapBackend {
         if let Some(token) = saved_token {
             builder = builder.with_restore_token(token);
         }
+        // fork: the pinned waycap-rs rev exposes fps/quality/rate-control/codec/
+        // audio but not GOP length, framerate mode, color range, or encoder tune.
+        // These knobs are wired through the config + builder now so the surface is
+        // stable; they take effect on the rev bump that adds the matching
+        // CaptureBuilder setters (see docs/spike-results.md fork recipe). Logged so
+        // they are observable (and not dead fields) until then.
+        tracing::debug!(
+            keyframe_interval_ms = self.keyframe_interval_ms,
+            framerate_mode = ?self.framerate_mode,
+            color_range = ?self.color_range,
+            tune = ?self.tune,
+            target = %self.target,
+            hdr = self.hdr,
+            "capture knobs pending waycap-rs builder support (GOP/fps-mode/range/tune/target/hdr)"
+        );
+
         let mut capture = builder
             .build()
             .map_err(|e| BackendError::Init(format!("{e:?}")))?;
