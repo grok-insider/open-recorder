@@ -318,6 +318,13 @@ impl LibraryApp {
                     });
                 }
                 Event::CaptureRestarted => self.set_status("Capture restarted"),
+                Event::ScreenshotSaved { path } => {
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or(path);
+                    self.set_status(format!("Screenshot → {name}"));
+                }
                 // One-shot Config replies drive the settings page; a pushed
                 // Config mid-edit must not clobber the user's draft.
                 Event::Config { .. } | Event::Error { .. } => {}
