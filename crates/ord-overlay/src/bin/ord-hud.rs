@@ -55,6 +55,9 @@ fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {
         Event::CaptureRestarted => {
             hud.toast(ToastKind::Recording, "Capture recovered", now_ms);
         }
+        Event::ScreenshotSaved { .. } => {
+            hud.toast(ToastKind::Saved, "Screenshot saved", now_ms);
+        }
         // Pushed on every settings apply: the overlay section governs us.
         Event::Config { effective, .. } => {
             hud.set_show_status_dot(effective.overlay.show_status_dot);
