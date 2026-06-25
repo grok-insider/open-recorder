@@ -8,7 +8,7 @@ pub mod hook;
 pub mod server;
 pub mod storage;
 
-pub use gamedetect::{clip_stem, detect_foreground};
+pub use gamedetect::{clip_stem, detect_foreground, foreground_is_game};
 pub use handler::{Handler, RecordPath};
 pub use hook::spawn_clip_hook;
 pub use ord_common::socket_path;

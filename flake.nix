@@ -154,7 +154,7 @@
 
           # Bundle all binaries into one output for easy install.
           default = pkgs.symlinkJoin {
-            name = "open-recorder-0.1.0";
+            name = "open-recorder-${version}";
             paths = [ ord-cli ordd ord-hud ord-ui ];
             meta = {
               description = "open-recorder — native NVENC game clipper (all binaries)";
@@ -216,9 +216,11 @@
                 changes persist as a sparse overrides file in
                 `$XDG_STATE_HOME/open-recorder/overrides.toml`, never here.
                 Sections: `capture` (fps, buffer_seconds, quality, codec,
-                bitrate_kbps, clear_on_save), `audio` (desktop, mic), `storage`
-                (clips_dir, template, max_gib, max_age_days), `markers`
-                (auto_save_seconds), `hooks` (on_clip_saved), `overlay`
+                bitrate_kbps, resolution, keyframe_interval_ms, framerate_mode,
+                color_range, tune, replay_storage, target, auto_arm, hdr,
+                clear_on_save), `audio` (desktop, mic, tracks — per-app), `storage`
+                (clips_dir, recordings_dir, template, max_gib, max_age_days),
+                `markers` (auto_save_seconds), `hooks` (on_clip_saved), `overlay`
                 (show_status_dot), `export` (codec, container).
               '';
             };

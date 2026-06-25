@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ord_common::{lock_tolerant, read_frame, write_frame, BufferSeconds, Command, Config, Event};
-use ord_core::{CaptureBackend, Engine, PreparedClip};
+use ord_core::{CaptureBackend, Engine, FrameStore, PreparedClip, RingBuffer};
 
 use crate::handler::Handler;
 
@@ -23,22 +23,31 @@ pub type ClipWriter = Box<dyn FnMut(&PreparedClip) -> Result<PathBuf, String> + 
 
 /// Builds a fresh (not yet started) engine from a configuration — how a
 /// `SetConfig` with changed encoder settings restarts capture. Injected so the
-/// daemon supplies the real backend and tests a mock.
-pub type EngineFactory<B> = Box<dyn Fn(&Config) -> Engine<B> + Send + Sync>;
+/// daemon supplies the real backend and tests a mock. Generic over the replay
+/// [`FrameStore`] (defaults to [`RingBuffer`]).
+pub type EngineFactory<B, S = RingBuffer> = Box<dyn Fn(&Config) -> Engine<B, S> + Send + Sync>;
 
 /// Persists the sparse overrides document (the diff against the base config).
 /// Injected so tests capture writes instead of touching the state dir.
 pub type OverridesWriter = Box<dyn FnMut(&str) -> Result<(), String> + Send>;
 
+/// Decodes the newest buffered GOP into a still image on disk, returning the
+/// path. Injected so the daemon uses ffmpeg and tests use a fake (no decode).
+pub type ShotWriter = Box<
+    dyn FnMut(&[ord_core::EncodedFrame], ord_core::StreamParams) -> Result<PathBuf, String> + Send,
+>;
+
 /// Everything the server needs beyond the handler: the configuration store and
 /// the apply machinery for `SetConfig`, plus the capture watchdog policy.
-pub struct ServerCtx<B: CaptureBackend> {
+pub struct ServerCtx<B: CaptureBackend, S: FrameStore = RingBuffer> {
     /// Effective configuration (base + overrides), shared with the writer.
     pub config: Arc<Mutex<Config>>,
     /// The immutable base layer (user/HM config file at startup).
     pub base: Config,
-    pub engine_factory: EngineFactory<B>,
+    pub engine_factory: EngineFactory<B, S>,
     pub write_overrides: OverridesWriter,
+    /// Decodes the newest GOP to a still image (screenshot). Off the hot path.
+    pub shot_writer: ShotWriter,
     /// Restart capture when the buffer is enabled but no frames arrived for
     /// this long (suspend/resume, output change). `None` disables the watchdog
     /// (tests; the mock emits a finite burst and would otherwise restart
@@ -91,11 +100,11 @@ pub fn bind(path: &PathBuf) -> Result<UnixListener, ServerError> {
 /// mutex so commands serialize naturally. A `Subscribe` connection is moved into
 /// the subscriber registry and receives every event produced by state-changing
 /// commands (e.g. `ClipSaved`, `BufferState`) until it disconnects.
-pub fn serve<B: CaptureBackend + 'static>(
+pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
     listener: UnixListener,
-    handler: Handler<B>,
+    handler: Handler<B, S>,
     writer: ClipWriter,
-    ctx: ServerCtx<B>,
+    ctx: ServerCtx<B, S>,
 ) -> Result<(), ServerError> {
     let handler = Arc::new(Mutex::new(handler));
     let writer = Arc::new(Mutex::new(writer));
@@ -120,10 +129,36 @@ pub fn serve<B: CaptureBackend + 'static>(
     {
         let handler = Arc::clone(&handler);
         let subs = Arc::clone(&subs);
+        let ctx = Arc::clone(&ctx);
         std::thread::spawn(move || {
             let mut last_frames = Instant::now();
+            let mut tick: u64 = 0;
             loop {
                 std::thread::sleep(Duration::from_millis(250));
+                tick = tick.wrapping_add(1);
+
+                // AUTO-ARM (~every 3 s): when configured, start the replay buffer
+                // as soon as a game takes the foreground (Steam app or fullscreen).
+                // The hyprctl probe runs lock-free; we only lock to flip state.
+                if tick.is_multiple_of(12) {
+                    let auto = {
+                        let c = lock_tolerant(&ctx);
+                        let cfg = lock_tolerant(&c.config);
+                        cfg.capture.auto_arm
+                    };
+                    if auto
+                        && !lock_tolerant(&handler).is_buffer_enabled()
+                        && crate::gamedetect::foreground_is_game()
+                    {
+                        let ev =
+                            lock_tolerant(&handler).handle(Command::SetBuffer { enabled: true });
+                        if ev.is_state_change() {
+                            broadcast(&subs, &ev);
+                        }
+                        last_frames = Instant::now();
+                    }
+                }
+
                 let mut h = lock_tolerant(&handler);
                 if h.pump() > 0 {
                     last_frames = Instant::now();
@@ -179,12 +214,12 @@ pub fn serve<B: CaptureBackend + 'static>(
 /// Handle one client: read commands, reply with events, broadcasting state
 /// changes to subscribers. A `Subscribe` command converts the connection into a
 /// pushed event stream.
-fn handle_connection<B: CaptureBackend>(
+fn handle_connection<B: CaptureBackend, S: FrameStore>(
     mut stream: UnixStream,
-    handler: &Arc<Mutex<Handler<B>>>,
+    handler: &Arc<Mutex<Handler<B, S>>>,
     writer: &Arc<Mutex<ClipWriter>>,
     subs: &Subscribers,
-    ctx: &Arc<Mutex<ServerCtx<B>>>,
+    ctx: &Arc<Mutex<ServerCtx<B, S>>>,
 ) -> io::Result<()> {
     loop {
         let bytes = match read_frame(&mut stream) {
@@ -217,6 +252,7 @@ fn handle_connection<B: CaptureBackend>(
                 }
             }
             Command::SetConfig { config } => apply_config(handler, ctx, subs, *config),
+            Command::Screenshot => screenshot_flow(handler, ctx),
             Command::Mark => {
                 let marked = lock_tolerant(handler).mark();
                 if !marked {
@@ -274,10 +310,10 @@ fn handle_connection<B: CaptureBackend>(
 /// (and the hyprctl game probe inside the writer) never block the 250 ms
 /// capture-drain pump, which would otherwise fill the bounded forward channel
 /// and drop freshly-captured frames after a save. Honors `clear_on_save`.
-fn save_flow<B: CaptureBackend>(
-    handler: &Arc<Mutex<Handler<B>>>,
+fn save_flow<B: CaptureBackend, S: FrameStore>(
+    handler: &Arc<Mutex<Handler<B, S>>>,
     writer: &Arc<Mutex<ClipWriter>>,
-    ctx: &Arc<Mutex<ServerCtx<B>>>,
+    ctx: &Arc<Mutex<ServerCtx<B, S>>>,
     duration: ord_common::ClipDuration,
 ) -> Event {
     let prepared = {
@@ -315,14 +351,44 @@ fn save_flow<B: CaptureBackend>(
     }
 }
 
+/// Take a screenshot: select the newest decodable GOP under the handler lock
+/// (cheap), then decode+encode the image off it. The decode runs under the ctx
+/// lock (not the handler lock), so it never starves the capture-drain pump.
+fn screenshot_flow<B: CaptureBackend, S: FrameStore>(
+    handler: &Arc<Mutex<Handler<B, S>>>,
+    ctx: &Arc<Mutex<ServerCtx<B, S>>>,
+) -> Event {
+    let prepared = {
+        let mut h = lock_tolerant(handler);
+        h.prepare_screenshot()
+    };
+    let Some((frames, params)) = prepared else {
+        return Event::Error {
+            message: "nothing buffered yet — is the replay buffer enabled?".into(),
+        };
+    };
+    let written = {
+        let mut c = lock_tolerant(ctx);
+        (c.shot_writer)(&frames, params)
+    };
+    match written {
+        Ok(path) => Event::ScreenshotSaved {
+            path: path.to_string_lossy().into_owned(),
+        },
+        Err(e) => Event::Error {
+            message: format!("failed to write screenshot: {e}"),
+        },
+    }
+}
+
 /// Apply a new configuration: persist the sparse overrides, swap the shared
 /// config, then apply by tier — encoder/audio changes rebuild and restart the
 /// capture engine, a buffer-length change resizes the ring in place, and
 /// everything else (storage, hooks, markers, export) is read live by its
 /// consumer. Replies with the new effective config.
-fn apply_config<B: CaptureBackend>(
-    handler: &Arc<Mutex<Handler<B>>>,
-    ctx: &Arc<Mutex<ServerCtx<B>>>,
+fn apply_config<B: CaptureBackend, S: FrameStore>(
+    handler: &Arc<Mutex<Handler<B, S>>>,
+    ctx: &Arc<Mutex<ServerCtx<B, S>>>,
     subs: &Subscribers,
     new: Config,
 ) -> Event {
@@ -330,6 +396,34 @@ fn apply_config<B: CaptureBackend>(
         return Event::Error {
             message: "capture.fps must be between 1 and 240".into(),
         };
+    }
+    if !(100..=10_000).contains(&new.capture.keyframe_interval_ms) {
+        return Event::Error {
+            message: "capture.keyframe_interval_ms must be between 100 and 10000".into(),
+        };
+    }
+    if new.capture.target.trim().is_empty() {
+        return Event::Error {
+            message: "capture.target must be 'portal' or a monitor name".into(),
+        };
+    }
+    if new.capture.hdr && matches!(new.capture.codec, ord_common::config::CaptureCodec::H264) {
+        return Event::Error {
+            message: "capture.hdr requires an HEVC or AV1 codec".into(),
+        };
+    }
+    if let Some(res) = new.capture.resolution {
+        let bad = res.width < 16
+            || res.height < 16
+            || res.width > 16384
+            || res.height > 16384
+            || res.width % 2 != 0
+            || res.height % 2 != 0;
+        if bad {
+            return Event::Error {
+                message: "capture.resolution must be even and between 16 and 16384".into(),
+            };
+        }
     }
     let Some(buffer) = BufferSeconds::new(new.capture.buffer_seconds) else {
         return Event::Error {
@@ -359,6 +453,14 @@ fn apply_config<B: CaptureBackend>(
         || old.capture.quality != new.capture.quality
         || old.capture.codec != new.capture.codec
         || old.capture.bitrate_kbps != new.capture.bitrate_kbps
+        || old.capture.resolution != new.capture.resolution
+        || old.capture.keyframe_interval_ms != new.capture.keyframe_interval_ms
+        || old.capture.framerate_mode != new.capture.framerate_mode
+        || old.capture.color_range != new.capture.color_range
+        || old.capture.tune != new.capture.tune
+        || old.capture.replay_storage != new.capture.replay_storage
+        || old.capture.target != new.capture.target
+        || old.capture.hdr != new.capture.hdr
         || old.audio != new.audio;
     let resize = old.capture.buffer_seconds != new.capture.buffer_seconds;
 
@@ -443,6 +545,9 @@ mod tests {
                 )
             }),
             write_overrides: Box::new(|_| Ok(())),
+            shot_writer: Box::new(|_frames, _params| {
+                Ok(PathBuf::from("/tmp/open-recorder/shot.png"))
+            }),
             watchdog: None,
         }
     }
@@ -726,6 +831,60 @@ mod tests {
     }
 
     #[test]
+    fn set_config_rejects_bad_capture_knobs() {
+        let path = temp_sock("badknobs");
+        let listener = bind(&path).unwrap();
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), mock_ctx());
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+
+        // Keyframe interval out of range.
+        let mut bad = Config::default();
+        bad.capture.keyframe_interval_ms = 50;
+        assert!(matches!(
+            request(
+                &mut client,
+                &Command::SetConfig {
+                    config: Box::new(bad)
+                }
+            ),
+            Event::Error { .. }
+        ));
+
+        // Odd capture dimensions (NVENC needs even).
+        let mut bad = Config::default();
+        bad.capture.resolution = Some(ord_common::config::Resolution {
+            width: 1921,
+            height: 1080,
+        });
+        assert!(matches!(
+            request(
+                &mut client,
+                &Command::SetConfig {
+                    config: Box::new(bad)
+                }
+            ),
+            Event::Error { .. }
+        ));
+
+        // HDR with H.264 is rejected (needs HEVC/AV1).
+        let mut bad = Config::default();
+        bad.capture.hdr = true;
+        bad.capture.codec = ord_common::config::CaptureCodec::H264;
+        assert!(matches!(
+            request(
+                &mut client,
+                &Command::SetConfig {
+                    config: Box::new(bad)
+                }
+            ),
+            Event::Error { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn set_config_encoder_change_restarts_capture() {
         let path = temp_sock("restartcfg");
         let listener = bind(&path).unwrap();
@@ -789,6 +948,19 @@ mod tests {
         sub.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
         assert!(matches!(pushed, Event::ClipSaved { .. }), "{pushed:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn screenshot_returns_saved_event() {
+        let path = temp_sock("shot");
+        let listener = bind(&path).unwrap();
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), mock_ctx());
+        });
+        let mut client = UnixStream::connect(&path).unwrap();
+        let reply = request(&mut client, &Command::Screenshot);
+        assert!(matches!(reply, Event::ScreenshotSaved { .. }), "{reply:?}");
         let _ = std::fs::remove_file(&path);
     }
 

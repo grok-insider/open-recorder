@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Minimum supported Rust version. 1.87 stabilized `u32::is_multiple_of`, used on
 # the hot path. CI uses stable (>= this); the nix devshell's rustc is canonical.

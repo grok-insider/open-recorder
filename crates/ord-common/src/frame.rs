@@ -11,7 +11,10 @@
 use std::io::{self, Read, Write};
 
 /// Wire protocol version. Bump on any incompatible `Command`/`Event` change.
-pub const PROTOCOL_VERSION: u8 = 3;
+///
+/// v4 (0.2.0): added `Command::Screenshot` + `Event::ScreenshotSaved`, the
+/// per-track audio / capture-knob config fields, and `replay_storage`.
+pub const PROTOCOL_VERSION: u8 = 4;
 
 /// Frame magic identifying an open-recorder control message.
 const MAGIC: [u8; 3] = *b"ORD";
