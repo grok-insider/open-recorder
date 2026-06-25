@@ -807,16 +807,30 @@ impl eframe::App for LibraryApp {
                     });
                     return;
                 }
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-                        for clip in &clips {
-                            self.card(ui, clip, now, ctx);
+                // Card grid. `horizontal_wrapped` inside a vertical ScrollArea
+                // sees unbounded width and never wraps — every clip lands in one
+                // off-screen row. Instead, compute the column count from the
+                // panel width (finite, captured here before the scroll area) and
+                // lay out fixed rows of fixed-width cards: a real grid, no
+                // reliance on egui's wrap inference.
+                let avail = ui.available_width();
+                const CARD_OUTER_W: f32 = CARD_INNER_W + 2.0 * theme::SP_3 + 8.0;
+                let spacing = theme::SP_3;
+                let cols = (((avail + spacing) / (CARD_OUTER_W + spacing)).floor() as usize).max(1);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+                        for row in clips.chunks(cols) {
+                            ui.horizontal(|ui| {
+                                for clip in row {
+                                    self.card(ui, clip, now, ctx);
+                                }
+                            });
                         }
+                        ui.add_space(8.0);
                     });
-                    ui.add_space(8.0);
-                });
             });
     }
 }
