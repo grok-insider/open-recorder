@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 
 use ord_common::ClipDuration;
-use ord_core::audio::{AudioParams, EncodedAudioFrame};
+use ord_core::audio::AudioParams;
 use ord_core::backend::{
     BackendError, CaptureBackend, CaptureStreams, Codec, StreamParams, NANOS_PER_SEC,
 };
@@ -53,7 +53,7 @@ impl CaptureBackend for ValidFrameBackend {
         let (vtx, vrx): (_, Receiver<EncodedFrame>) = mpsc::channel();
         let step = NANOS_PER_SEC / self.fps as i64;
         for i in 0..self.total as i64 {
-            let kf = (i as u32) % self.keyframe_interval == 0;
+            let kf = (i as u32).is_multiple_of(self.keyframe_interval);
             let pts = i * step;
             let _ = vtx.send(EncodedFrame::new(access_unit(kf), kf, pts, pts));
         }
