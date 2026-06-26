@@ -16,9 +16,13 @@ path = "src/main.rs"
 ord-common.workspace = true
 ord-core.workspace = true
 thiserror.workspace = true
-signal-hook = "0.3"
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+# signal-hook is the unix-signal (SIGTERM/SIGINT) socket-cleanup path; off-unix
+# the daemon installs a no-op handler, so the dependency is unix-only.
+[target.'cfg(unix)'.dependencies]
+signal-hook = "0.3"
 
 [features]
 # The shipped daemon records for real; CI builds the default (mock) daemon to

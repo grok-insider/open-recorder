@@ -1,16 +1,18 @@
-//! Unix-socket control server. Accepts connections, reads length-prefixed
-//! [`Command`] frames, dispatches them through the [`Handler`], and writes back
-//! [`Event`] frames.
+//! Control server. Accepts connections, reads length-prefixed [`Command`]
+//! frames, dispatches them through the [`Handler`], and writes back [`Event`]
+//! frames.
 //!
 //! Single-threaded accept loop with a per-connection request/response exchange;
-//! the handler holds the engine, so commands are naturally serialized.
+//! the handler holds the engine, so commands are naturally serialized. The
+//! socket type is the platform [`transport`](ord_common::transport) stream — a
+//! Unix socket on unix, a loopback TCP connection elsewhere.
 
 use std::io;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ord_common::transport::{Listener, Stream};
 use ord_common::{lock_tolerant, read_frame, write_frame, BufferSeconds, Command, Config, Event};
 use ord_core::{CaptureBackend, Engine, FrameStore, PreparedClip, RingBuffer};
 
@@ -56,7 +58,7 @@ pub struct ServerCtx<B: CaptureBackend, S: FrameStore = RingBuffer> {
 }
 
 /// Shared list of subscriber connections that receive pushed events.
-type Subscribers = Arc<Mutex<Vec<UnixStream>>>;
+type Subscribers = Arc<Mutex<Vec<Stream>>>;
 
 // `lock_tolerant` comes from ord-common: a daemon must not die because some
 // other thread panicked while holding a lock — in particular the capture-drain
@@ -82,16 +84,16 @@ pub enum ServerError {
     InUse(String),
 }
 
-/// Bind the listener, removing a stale socket file if present.
-pub fn bind(path: &PathBuf) -> Result<UnixListener, ServerError> {
+/// Bind the listener, removing a stale socket/rendezvous file if present.
+pub fn bind(path: &PathBuf) -> Result<Listener, ServerError> {
     if path.exists() {
-        // If we can connect, another daemon owns it; otherwise it's stale.
-        if UnixStream::connect(path).is_ok() {
+        // If we can reach a live daemon here, another owns it; else it's stale.
+        if ord_common::transport::connect(path).is_ok() {
             return Err(ServerError::InUse(path.display().to_string()));
         }
         let _ = std::fs::remove_file(path);
     }
-    Ok(UnixListener::bind(path)?)
+    Ok(ord_common::transport::bind(path)?)
 }
 
 /// Serve commands on `listener` using `handler` until the listener closes.
@@ -101,7 +103,7 @@ pub fn bind(path: &PathBuf) -> Result<UnixListener, ServerError> {
 /// the subscriber registry and receives every event produced by state-changing
 /// commands (e.g. `ClipSaved`, `BufferState`) until it disconnects.
 pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
-    listener: UnixListener,
+    listener: Listener,
     handler: Handler<B, S>,
     writer: ClipWriter,
     ctx: ServerCtx<B, S>,
@@ -215,7 +217,7 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
 /// changes to subscribers. A `Subscribe` command converts the connection into a
 /// pushed event stream.
 fn handle_connection<B: CaptureBackend, S: FrameStore>(
-    mut stream: UnixStream,
+    mut stream: Stream,
     handler: &Arc<Mutex<Handler<B, S>>>,
     writer: &Arc<Mutex<ClipWriter>>,
     subs: &Subscribers,
@@ -494,19 +496,24 @@ fn apply_config<B: CaptureBackend, S: FrameStore>(
     event
 }
 
-fn write_event(stream: &mut UnixStream, event: &Event) -> io::Result<()> {
+fn write_event(stream: &mut Stream, event: &Event) -> io::Result<()> {
     let payload = event
         .encode()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     write_frame(stream, &payload)
 }
 
-#[cfg(test)]
+// The integration tests drive the server over a real Unix socket, so they are
+// unix-only (host CI runs on Linux). The cross-platform loopback-TCP transport
+// shares the exact same generic server code; only the `Stream`/`Listener`
+// aliases differ, which the `transport` module covers.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::handler::Handler;
     use ord_common::ClipDuration;
     use ord_core::{Engine, MockBackend, PreparedClip};
+    use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
     use std::thread;
 
