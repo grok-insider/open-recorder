@@ -339,14 +339,16 @@ fn pick_path(dir: bool) -> BrowseMsg {
     BrowseMsg::Unavailable
 }
 
-/// Replace a leading `$HOME` with `~` (matches how the config documents paths).
+/// Replace a leading home-directory prefix with `~` (matches how the config
+/// documents paths).
 fn contract_home(path: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
-            format!("~{}", &path[home.len()..])
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        if !home.is_empty() && path.starts_with(home.as_ref()) {
+            return format!("~{}", &path[home.len()..]);
         }
-        _ => path.to_string(),
     }
+    path.to_string()
 }
 
 /// One labeled form row: gold override dot, fixed-width label left, control

@@ -28,15 +28,12 @@ pub fn load_meta(path: &Path) -> Option<ClipMeta> {
     })
 }
 
-/// `$XDG_CACHE_HOME/open-recorder/thumbs`.
+/// Thumbnail cache directory: the platform cache dir + `open-recorder/thumbs`
+/// (`$XDG_CACHE_HOME` or `~/.cache` on Linux).
 pub fn thumb_cache_dir() -> PathBuf {
-    let base = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".cache")
-        });
-    base.join("open-recorder/thumbs")
+    dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder/thumbs")
 }
 
 /// Cached thumbnail path for a clip (not necessarily existing yet).

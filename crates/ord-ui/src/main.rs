@@ -3,8 +3,10 @@
 use std::path::PathBuf;
 
 fn clips_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join("Videos/open-recorder")
+    dirs::video_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Videos")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder")
 }
 
 #[cfg(feature = "gui")]
