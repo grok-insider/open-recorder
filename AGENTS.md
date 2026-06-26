@@ -33,9 +33,9 @@ workspace member entry in the root `Cargo.toml`.
 | Crate | Owns |
 |-------|------|
 | `crates/ord-common` | Shared types + the bincode IPC wire protocol (commands/events). No I/O. |
-| `crates/ord-core`   | The engine: wraps `waycap-rs`, owns the encoded-frame ring buffer, and the keyframe-aware "save last N seconds" muxer (ffmpeg-next, stream-copy, no re-encode). |
+| `crates/ord-core`   | The engine: wraps `waycap-rs`, owns the encoded-frame replay store (RAM `RingBuffer` or `DiskFrameStore` via the `FrameStore` seam), the keyframe-aware "save last N seconds" muxer (ffmpeg-next, stream-copy, no re-encode), and the pure per-app audio routing (`audio_route::plan_track`). |
 | `crates/ord-daemon` | `ordd`: runs `ord-core`, supervises the buffer, exposes the Unix-socket control plane, game detection (`hyprctl`), storage policy (templates + prune), the capture watchdog, post-save verification + hook, and the layered-config apply (`SetConfig`). Hotkeys are compositor keybinds invoking `ord` (no evdev). |
-| `crates/ord-cli`    | `ord`: thin client. Talks to the daemon socket (`save --last N`, `mark`, `record toggle`, `status`, `buffer on/off`, `config show`, `subscribe`). What compositor keybinds call. |
+| `crates/ord-cli`    | `ord`: thin client. Talks to the daemon socket (`save --last N`, `mark`, `shot`, `record toggle`, `status`, `buffer on/off`, `config show`, `subscribe`) + local `doctor` (NVIDIA P2 fix), `export`, and `--version`. What compositor keybinds call. |
 | `crates/ord-overlay`| Platform overlay abstraction: the `Overlay` trait + `wlr-layer-shell` (Wayland) implementation + the `ord-hud` binary. X11/Win32 are future implementations of the same trait. |
 | `crates/ord-ui`     | `egui` clip library/manager window: browse, play, trim, export. |
 | `crates/ord-export` | Pure ffmpeg-arg export planning (`plan.rs`, no I/O) + ffprobe wrapper + ffmpeg runner with NVENC→software fallback. Presets (social/GIF/quality) are data, not code. |
@@ -137,10 +137,31 @@ nix develop                     # devshell with pipewire/ffmpeg/cuda/clang toolc
 
 ## CI / release
 
-`.github/workflows/ci.yml` (added in the build phase) runs `cargo fmt --check`,
-`cargo clippy -D warnings`, and `cargo test --all` (GPU tests excluded) on
-`x86_64-linux`, then `nix flake check`, and pushes store paths to
-`0xfell.cachix.org` so flake consumers pull prebuilt closures.
+Two workflows, both on `x86_64-linux`:
+
+- **`.github/workflows/ci.yml`** — on every push/PR: `cargo fmt --check`,
+  `cargo clippy -D warnings`, `cargo test --all` (GPU tests excluded), the
+  `--all-features` devshell lane, and `nix flake check`. On master/tags it also
+  builds every package with Nix and pushes the closures to `grok-insider.cachix.org`,
+  so flake consumers pull prebuilt instead of compiling.
+- **`.github/workflows/release.yml`** — automated releases via **release-plz**
+  (`release-plz.toml`). Each master push maintains a `chore: release vX.Y.Z` PR
+  that bumps the single `[workspace.package].version` (every crate inherits it),
+  refreshes `Cargo.lock`, and regenerates `CHANGELOG.md` from Conventional
+  Commits; merging it tags `vX.Y.Z` + creates the GitHub Release. `ord-cli` is
+  the release unit; the other six crates fold in via `changelog_include`. Two
+  artifact jobs then attach prebuilt binaries: the static `ord` client (`x86_64`
+  musl, on-PATH for keybinds) and the `ordd`/`ord-hud`/`ord-ui` **AppImages**
+  (`nix bundle` from the flake; the wrapper resolves the host NVIDIA driver on
+  foreign distros). No crates.io publish (`git_only`). Cachix stays in ci.yml by
+  design; release.yml only does the tag/Release + artifacts.
+
+**Commit messages are Conventional Commits** — they drive the version bump and
+the changelog, so prefix every subject (`feat:`/`fix:`/`docs:`/`refactor:`/
+`perf:`/`test:`/`chore:`/`ci:`; use `feat!:` or a `BREAKING CHANGE:` footer for a
+break, and bump `PROTOCOL_VERSION` on any incompatible IPC change). Never
+hand-edit `CHANGELOG.md` — release-plz regenerates it. See `CONTRIBUTING.md` and
+`docs/releasing.md`.
 
 ## Status
 
@@ -194,3 +215,50 @@ software fallback is logged + badged in the transport bar, and library rescans
 defer while the editor is open. Regression smoke tests in
 `ord-ui/tests/player_smoke.rs` (`--ignored`, devshell) cover the
 audio-shorter-than-video tail and end-of-clip seeks.
+
+The release + packaging round shipped: automated versioning/changelog/tags +
+GitHub Releases via **release-plz** (`release-plz.toml` + `release.yml`), the
+static `ord` musl client and the `ordd`/`ord-hud`/`ord-ui` **AppImages** attached
+to each Release (`nix bundle`; the flake `postFixup` resolves the host NVIDIA
+driver on foreign distros, `apps.*` are bundle entrypoints), plus
+`CONTRIBUTING.md` and a rewritten `docs/releasing.md`. cachix for NixOS consumers
+was already live in `ci.yml`. Remaining (tracked in `continue-plan.md`): enable
+the GitHub "allow Actions to create PRs" setting, and validate the AppImages on
+non-NixOS NVIDIA hardware (ordd first; ord-ui's GL path is the known hazard).
+
+The **v0.2.0 ShadowPlay-parity feature drop** shipped (config + validation +
+plumbing + tests; the parts that need the waycap-rs fork to *take effect* are
+tracked in `continue-plan.md`): `ord doctor [--fix]` installs the NVIDIA
+`CudaNoStablePerfLimit` application profile that frees `ordd` from the CUDA/NVENC
+P2 downclock (the real perf delta vs ShadowPlay; verified against a live driver
+610); capture knobs `resolution` / `keyframe_interval_ms` / `framerate_mode`
+(cfr/vfr/content) / `color_range` / `tune` wired through config + the
+`WaycapBackend` builder (applied once the fork exposes the setters; see the
+`// fork:` block in `waycap_backend.rs`); **disk-backed replay**
+(`capture.replay_storage = disk`, `DiskFrameStore` threaded through a
+runtime-selected `Box<dyn FrameStore>` in the engine/handler/server); `ord shot`
+screenshots the newest GOP to a PNG; `capture.target` (portal/monitor) +
+`capture.auto_arm` (arm the buffer when a game/fullscreen window takes focus);
+multi-track + **per-application audio** config (`audio.tracks`, `AudioSource`
+selectors) with the pure routing in `ord-core/src/audio_route.rs` (live
+PipeWire+Opus capture is the gated follow-on); and HDR config (`capture.hdr`,
+validated to HEVC/AV1; the Main10-encode + KMS-capture spikes are in
+`docs/hdr.md`).
+
+**Versioning** landed with it: `ord`/`ordd --version` print
+`X.Y.Z [protocol N]` (git rev on local `cargo` builds, rev-less on Nix), via
+`ord-common::version` + `crates/ord-common/build.rs`; `PROTOCOL_VERSION` bumped
+3→4 (new `Screenshot` command/`ScreenshotSaved` event); `docs/releasing.md`
+documents the SemVer/tag scheme. **v0.2.1** fixed the clip-library grid (it laid
+every clip in one off-screen row inside a vertical scroll area — now a real
+wrapping grid with a panel-width-derived column count). **v0.2.2** is the
+editor/player QA round: an **idle-aware UI watchdog** (a paused/idle editor no
+longer logs false `UI STALL` ANRs — gated on focus + a 1s heartbeat), **audio-
+clock stall recovery** (if the audio output that drives the clock freezes, the
+player pauses instead of spinning at 60fps on a frozen frame forever — clock-only,
+no wall-clock fallback, so the prior runaway can't return), telemetry that honors
+`ORD_DEBUG_LOG`, and the `ORD_AUTOPLAY` dev/QA aid. Full 30s play-through and
+trim+export (`av1_nvenc`) verified clean on the real RTX 5070 Ti; the editor
+runs at v0.2.2 on the dev box. Outstanding work (waycap-rs fork bump, live
+per-app audio capture, HDR spikes, AccessKit, perf measurement) is in
+`continue-plan.md`.

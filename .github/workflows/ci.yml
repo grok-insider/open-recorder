@@ -50,7 +50,7 @@ jobs:
       - name: Set up Cachix (pull)
         uses: cachix/cachix-action@v15
         with:
-          name: 0xfell
+          name: grok-insider
           extraPullNames: nix-community
       - name: Evaluate the flake (no build)
         run: nix flake check --no-build -L
@@ -66,8 +66,14 @@ jobs:
 
   # The nix build + cachix push runs on every master push (plus tags and manual
   # dispatch), so the cache always holds the current master closure and NixOS
-  # consumers pointing at github:0xfell/open-recorder pull instead of compiling.
+  # consumers pointing at github:grok-insider/open-recorder pull instead of compiling.
   # PRs never publish (no secrets on fork PRs anyway).
+  #
+  # Cachix lives HERE, not in release.yml, by design: release-plz cuts the tag +
+  # GitHub Release (and attaches the static `ord` + the AppImages), while this job
+  # — on the same release-PR-merge push — caches `open-recorder-X.Y.Z`. The
+  # AppImage lane in release.yml then substitutes that closure instead of
+  # rebuilding it.
   build:
     name: build + cache (x86_64-linux)
     if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
@@ -82,14 +88,14 @@ jobs:
             experimental-features = nix-command flakes
             accept-flake-config = true
 
-      # Configures the 0xfell cache as a substituter AND pushes every newly
+      # Configures the grok-insider cache as a substituter AND pushes every newly
       # built store path to it (using the CACHIX_AUTH_TOKEN secret). nix-community
       # is pulled so CUDA/ffmpeg build deps come from cache. With this, NixOS
-      # users who add the 0xfell substituter never compile open-recorder.
+      # users who add the grok-insider substituter never compile open-recorder.
       - name: Set up Cachix
         uses: cachix/cachix-action@v15
         with:
-          name: 0xfell
+          name: grok-insider
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           extraPullNames: nix-community
 

@@ -1,0 +1,69 @@
+# release-plz — automated versioning + releases for the open-recorder workspace.
+# Docs: https://release-plz.dev/docs/config
+#
+# Model: every crate shares ONE version via `version.workspace = true`
+# (root Cargo.toml `[workspace.package] version`). We elect `ord-cli` (the `ord`
+# binary) as the single release unit; the other six crates ride the shared
+# workspace version and fold their commits into ord-cli's bump + changelog via
+# `changelog_include`. On each push to master, release-plz opens/updates a
+# "release PR" that bumps that one version field (all crates follow), refreshes
+# Cargo.lock, and regenerates the root CHANGELOG.md from Conventional Commits.
+# Merging the release PR tags `vX.Y.Z` and creates the GitHub Release.
+#
+# Nothing is published to crates.io. Delivery is:
+#   * the GitHub Release — the static `ord` musl binary + the ordd/ord-hud/ord-ui
+#     AppImages, attached by .github/workflows/release.yml; and
+#   * the grok-insider cachix cache — ci.yml's `build` job pushes the closures on the
+#     same master push, and `flake.nix` reads the version from Cargo.toml, so the
+#     cached store paths track it as `open-recorder-X.Y.Z`.
+
+[workspace]
+# Not on crates.io: determine the current version from the `v*` git tag instead
+# of the cargo registry. Implies no `cargo publish`.
+git_only = true
+# Release only when the release PR is merged, not on every master commit.
+release_always = false
+# Internal libraries + binaries, not a published crates.io API surface: skip the
+# cargo-semver-checks step (it only applies to published libraries anyway).
+semver_check = false
+# Opt-in model: don't process any crate by default. `ord-cli` opts in below; the
+# other six crates ride the shared workspace version with no tag/release of their
+# own — there is only one version field, so they all move in lockstep for free.
+release = false
+# Make the release PR easy to spot/filter.
+pr_labels = ["release"]
+
+[[package]]
+name = "ord-cli"
+release = true
+# One workspace-wide tag + release name, e.g. `v0.3.0` (the multi-crate default
+# would be `ord-cli-v0.3.0`).
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+git_release_enable = true
+git_tag_enable = true
+# Keep the single curated changelog at the repo root (path is relative to the
+# root Cargo.toml, i.e. the repo root in CI).
+changelog_path = "CHANGELOG.md"
+# open-recorder ships four binaries across seven crates; a change anywhere in the
+# workspace ships inside one of them. Fold every other member's commits into
+# ord-cli's version bump + changelog, so e.g. an `ord-core` fix or an `ord-ui`
+# feature still cuts a release and shows up in the notes.
+changelog_include = [
+    "ord-common",
+    "ord-core",
+    "ord-export",
+    "ord-daemon",
+    "ord-overlay",
+    "ord-ui",
+]
+
+# Preserve the existing curated changelog header (release-plz would otherwise
+# substitute its generic default). New version sections are inserted below this.
+[changelog]
+header = """# Changelog
+
+All notable changes to open-recorder are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""

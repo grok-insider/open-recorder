@@ -24,16 +24,16 @@ keypress, browse and trim clips. NVIDIA-first, designed cross-platform.
 
 ## Install (NixOS, prebuilt — no compiling)
 
-CI builds every binary and pushes it to the **`0xfell` cachix cache**, so you
+CI builds every binary and pushes it to the **`grok-insider` cachix cache**, so you
 get prebuilt closures instead of compiling CUDA/ffmpeg/waycap-rs locally. Add the
 substituter once:
 
 ```nix
 # configuration.nix (NixOS) or nix.conf
 nix.settings = {
-  substituters = [ "https://0xfell.cachix.org" ];
+  substituters = [ "https://grok-insider.cachix.org" ];
   trusted-public-keys = [
-    "0xfell.cachix.org-1:0VSPKbe/Eilt+WTT/0faSQeQnnhDOH7PxkUvoRtvPPo="
+    "grok-insider.cachix.org-1:ZxLVOxJ1CjdY3vQl1I99qCtwNZwIU4+/QwqSvntB/5w="
   ];
 };
 ```
@@ -41,15 +41,15 @@ nix.settings = {
 Then run or install any binary straight from the flake:
 
 ```sh
-nix run github:0xfell/open-recorder#ordd      # the NVENC daemon
-nix profile install github:0xfell/open-recorder   # all of: ord, ordd, ord-hud, ord-ui
+nix run github:grok-insider/open-recorder#ordd      # the NVENC daemon
+nix profile install github:grok-insider/open-recorder   # all of: ord, ordd, ord-hud, ord-ui
 ```
 
 ### Home Manager
 
 ```nix
 {
-  inputs.open-recorder.url = "github:0xfell/open-recorder";
+  inputs.open-recorder.url = "github:grok-insider/open-recorder";
 
   # in your HM config:
   imports = [ inputs.open-recorder.homeManagerModules.default ];
@@ -69,6 +69,36 @@ screencast portal shows "Select what to share" — pick your monitor and **tick
 `$XDG_STATE_HOME/open-recorder/portal-restore-token` and reuses it on every
 later start, so the picker never appears again. (Without the restore-token tick
 the portal re-prompts each start.)
+
+## Install (other Linux — prebuilt, no compiling)
+
+Not on Nix? Each [GitHub Release](https://github.com/grok-insider/open-recorder/releases)
+ships prebuilt `x86_64` binaries so you never compile CUDA/ffmpeg/waycap-rs:
+
+- **`ord` client** — `ord-<ver>-x86_64-linux-musl.tar.gz`. A static binary; put it
+  on `PATH` (this is what compositor keybinds call):
+
+  ```sh
+  tar -xzf ord-*-x86_64-linux-musl.tar.gz
+  install -Dm755 ord ~/.local/bin/ord
+  ```
+
+- **`ordd`, `ord-hud`, `ord-ui`** — `*-<ver>-x86_64.AppImage`. Self-contained
+  (ffmpeg/Wayland/GL bundled); just mark executable and run:
+
+  ```sh
+  chmod +x ordd-*-x86_64.AppImage
+  ./ordd-*-x86_64.AppImage          # the NVENC daemon
+  ./ord-ui-*-x86_64.AppImage        # the clip library window
+  ```
+
+Requirements: the host **NVIDIA driver** (the AppImage resolves `libcuda.so.1` /
+`libnvidia-encode.so.1` from it), a Wayland session with a working screencast
+portal, and **FUSE2** (or run with `--appimage-extract-and-run` on hosts without
+it). Each asset has a `.sha256` to verify.
+
+> A Flathub **Flatpak of `ord-ui`** (driver-matched GL + PipeWire portal) is the
+> planned next step for the GUI.
 
 ## Build from source
 
@@ -148,4 +178,4 @@ Architecture: [`docs/architecture.md`](./docs/architecture.md).
 
 ## License
 
-MIT © 2026 0xfell. See [`LICENSE`](./LICENSE).
+MIT © 2026 Grok Insider. See [`LICENSE`](./LICENSE).

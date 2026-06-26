@@ -7,11 +7,11 @@
 
   nixConfig = {
     extra-substituters = [
-      "https://0xfell.cachix.org"
+      "https://grok-insider.cachix.org"
       "https://nix-community.cachix.org"
     ];
     extra-trusted-public-keys = [
-      "0xfell.cachix.org-1:0VSPKbe/Eilt+WTT/0faSQeQnnhDOH7PxkUvoRtvPPo="
+      "grok-insider.cachix.org-1:ZxLVOxJ1CjdY3vQl1I99qCtwNZwIU4+/QwqSvntB/5w="
       "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
     ];
   };
@@ -22,7 +22,7 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
-      # Packages — all prebuilt and pushed to the 0xfell cachix cache by CI, so
+      # Packages — all prebuilt and pushed to the grok-insider cachix cache by CI, so
       # NixOS users never compile:
       #   ord-cli  — the `ord` control client (pure Rust).
       #   ordd     — the daemon, real NVENC recorder (`waycap` + `mux` features).
@@ -86,13 +86,21 @@
             '';
             # NVENC/CUDA libs (libcuda.so.1, libnvidia-encode.so.1) are NOT in
             # nixpkgs — they ship with the running NVIDIA driver. Wrap each binary
-            # so /run/opengl-driver/lib (the NixOS driver tree) plus the linked
-            # native libs are on LD_LIBRARY_PATH at runtime.
+            # so the driver tree plus the linked native libs are on
+            # LD_LIBRARY_PATH at runtime:
+            #   --prefix: /run/opengl-driver/lib (the NixOS driver tree) wins, then
+            #             the closure's own native libs.
+            #   --suffix: the FHS driver dirs, consulted only for libs not already
+            #             resolved from the closure — i.e. the driver libs when this
+            #             binary runs inside an AppImage on a foreign distro
+            #             (Debian/Ubuntu multiarch, Fedora/Arch lib64/lib). Harmless
+            #             on NixOS, where those dirs are empty/absent.
             postFixup = ''
               for b in $out/bin/*; do
                 if [ -f "$b" ] && [ -x "$b" ]; then
                   wrapProgram "$b" \
-                    --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${lib.makeLibraryPath nativeLibs}"
+                    --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${lib.makeLibraryPath nativeLibs}" \
+                    --suffix LD_LIBRARY_PATH : "/usr/lib/x86_64-linux-gnu:/usr/lib64:/usr/lib"
                 fi
               done
             '';
@@ -162,6 +170,18 @@
               platforms = systems;
             };
           };
+        });
+
+      # `nix run` / `nix bundle` entrypoints. The AppImage release lane bundles
+      # these (`nix bundle --bundler github:ralismark/nix-appimage .#ordd`, etc.)
+      # so non-Nix Linux users get a runnable ordd/ord-hud/ord-ui without a Nix
+      # store. Each points at the wrapped binary from the matching package.
+      apps = forAllSystems (system:
+        let pkgsFor = self.packages.${system}; in {
+          ord = { type = "app"; program = "${pkgsFor.ord-cli}/bin/ord"; meta.description = "open-recorder control CLI (ord)"; };
+          ordd = { type = "app"; program = "${pkgsFor.ordd}/bin/ordd"; meta.description = "open-recorder capture daemon (NVENC)"; };
+          ord-hud = { type = "app"; program = "${pkgsFor.ord-hud}/bin/ord-hud"; meta.description = "open-recorder wlr-layer-shell HUD"; };
+          ord-ui = { type = "app"; program = "${pkgsFor.ord-ui}/bin/ord-ui"; meta.description = "open-recorder egui clip library"; };
         });
 
       # Home Manager module: installs all open-recorder binaries (prebuilt from

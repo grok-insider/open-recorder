@@ -87,7 +87,7 @@ else uses `MockBackend`.
 
 `x86_64-linux`: `cargo fmt --check`, `cargo clippy --all-targets --all-features
 -D warnings`, `cargo test --all` (GPU tests excluded via `#[ignore]`), then
-`nix flake check`. Store paths are pushed to `0xfell.cachix.org` so flake
+`nix flake check`. Store paths are pushed to `grok-insider.cachix.org` so flake
 consumers pull prebuilt closures.
 
 ## Coverage expectations
