@@ -14,6 +14,14 @@ thiserror.workspace = true
 tracing.workspace = true
 bytes = "1"
 ffmpeg-next = { workspace = true, optional = true }
+
+# The real capture backend (waycap-rs: PipeWire DMA-BUF + NVENC, plus its
+# crossbeam frame channel) is Linux-only. Declaring it under a target gate means
+# the `waycap` feature's `dep:` references resolve to nothing off-Linux, so
+# `--features waycap` on another OS compiles to the mock backend instead of
+# trying (and failing) to build waycap-rs. The module itself is additionally
+# `#[cfg(all(feature = "waycap", target_os = "linux"))]` in lib.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
 crossbeam = { version = "0.8", optional = true }
 waycap-rs = { git = "https://github.com/0xfell/waycap-rs.git", rev = "2e4e317b893a048be90132adb5eec964acb324fe", default-features = false, features = ["nvidia", "egl"], optional = true }
 
