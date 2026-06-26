@@ -16,11 +16,21 @@ Cargo.lock.bak
 
 # Editor / OS
 .DS_Store
+Thumbs.db
 *.swp
+*~
+*.bak
+*.tmp
 .idea/
 .vscode/
 
+# Local env / secrets
+.env
+.env.*
+
 # Runtime / scratch
 *.log
+nohup.out
 /tmp-spike/
+/spike/
 .cuda-shim/
