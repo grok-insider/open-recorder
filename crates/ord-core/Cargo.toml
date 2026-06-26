@@ -13,6 +13,7 @@ ord-common.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes = "1"
+dirs.workspace = true
 ffmpeg-next = { workspace = true, optional = true }
 
 # The real capture backend (waycap-rs: PipeWire DMA-BUF + NVENC, plus its

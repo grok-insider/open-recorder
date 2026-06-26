@@ -29,6 +29,9 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ffmpeg-next = "8"
+# Cross-platform user/runtime directories (XDG on Linux, Known Folders on
+# Windows, Library on macOS) — replaces hand-rolled $XDG_*/$HOME logic.
+dirs = "6"
 ord-common = { path = "crates/ord-common" }
 ord-core = { path = "crates/ord-core" }
 ord-export = { path = "crates/ord-export" }

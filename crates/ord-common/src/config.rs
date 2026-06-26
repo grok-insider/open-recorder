@@ -562,30 +562,25 @@ impl Container {
     }
 }
 
-/// Default config path: `$XDG_CONFIG_HOME/open-recorder/config.toml`, falling
-/// back to `~/.config/...`. Pure path construction — no I/O.
+/// Default config path: the platform config dir + `open-recorder/config.toml`
+/// (`$XDG_CONFIG_HOME` or `~/.config` on Linux, `~/Library/Application Support`
+/// on macOS, `%APPDATA%` on Windows). Pure path construction — no I/O.
 pub fn default_config_path() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".config")
-        });
-    base.join("open-recorder/config.toml")
+    dirs::config_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder/config.toml")
 }
 
-/// Runtime overrides path: `$XDG_STATE_HOME/open-recorder/overrides.toml`,
-/// falling back to `~/.local/state/...`. The daemon is the only writer; the
-/// base config (possibly a read-only Home Manager symlink) is never touched.
-/// Pure path construction — no I/O.
+/// Runtime overrides path: the platform state dir (or data dir where there is no
+/// distinct state dir) + `open-recorder/overrides.toml` (`$XDG_STATE_HOME` or
+/// `~/.local/state` on Linux). The daemon is the only writer; the base config
+/// (possibly a read-only Home Manager symlink) is never touched. Pure path
+/// construction — no I/O.
 pub fn overrides_path() -> PathBuf {
-    let base = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".local/state")
-        });
-    base.join("open-recorder/overrides.toml")
+    dirs::state_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder/overrides.toml")
 }
 
 /// Errors loading configuration.

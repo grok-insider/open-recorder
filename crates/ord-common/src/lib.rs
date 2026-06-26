@@ -26,11 +26,13 @@ pub use sync::lock_tolerant;
 
 use std::path::PathBuf;
 
-/// Path to the daemon control socket: `$XDG_RUNTIME_DIR/open-recorder.sock`,
-/// falling back to `/tmp` when the runtime dir is unset. The single source of
-/// truth shared by the daemon, the CLI, and the HUD so all three agree on the
-/// location (pure path construction — no filesystem access).
+/// Path to the daemon control socket (unix) or loopback rendezvous file
+/// (non-unix): `<runtime dir>/open-recorder.sock`, where the runtime dir is the
+/// XDG runtime dir on Linux and the temp dir as a fallback (and on platforms
+/// without one). The single source of truth shared by the daemon, the CLI, and
+/// the HUD so all agree on the location (pure path construction — no I/O).
 pub fn socket_path() -> PathBuf {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(dir).join("open-recorder.sock")
+    dirs::runtime_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder.sock")
 }

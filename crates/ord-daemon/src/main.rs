@@ -18,7 +18,9 @@ use ord_daemon::{serve, server::bind, server::ServerCtx, socket_path, ClipWriter
 /// created so capture still starts.
 fn make_store(config: &Config, ticks_per_sec: i64) -> Box<dyn FrameStore> {
     let secs = config.capture.buffer_seconds.max(1);
-    let ram = || Box::new(ord_core::RingBuffer::with_time_base(secs, ticks_per_sec)) as Box<dyn FrameStore>;
+    let ram = || {
+        Box::new(ord_core::RingBuffer::with_time_base(secs, ticks_per_sec)) as Box<dyn FrameStore>
+    };
     match config.capture.replay_storage {
         ReplayStorage::Ram => ram(),
         // Disk-backed replay is unix-only (DiskFrameStore uses positioned I/O);
@@ -96,11 +98,18 @@ fn load_config() -> (Config, Config) {
 fn clips_dir(cfg: &Config) -> PathBuf {
     match cfg.storage.clips_dir.as_deref() {
         Some(dir) => ord_daemon::hook::expand_home(dir),
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join("Videos/open-recorder")
-        }
+        None => default_clips_dir(),
     }
+}
+
+/// Default clips directory: the platform Videos dir + `open-recorder`
+/// (`~/Videos` on Linux, `~/Movies` on macOS, the Videos known folder on
+/// Windows), falling back to `<home>/Videos` and finally the temp dir.
+fn default_clips_dir() -> PathBuf {
+    dirs::video_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Videos")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder")
 }
 
 /// Resolve the directory for full-length recordings (`~` expanded). Defaults to
@@ -374,13 +383,10 @@ fn make_engine(
 /// "Select what to share" picker after the first authorized run.
 #[cfg(all(feature = "waycap", target_os = "linux"))]
 fn restore_token_path() -> PathBuf {
-    let base = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".local/state")
-        });
-    base.join("open-recorder/portal-restore-token")
+    dirs::state_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder/portal-restore-token")
 }
 
 #[cfg(not(all(feature = "waycap", target_os = "linux")))]
