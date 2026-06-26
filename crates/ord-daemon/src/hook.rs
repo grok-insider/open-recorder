@@ -7,15 +7,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// Expand a leading `~/` to `$HOME` so config values like
+/// Expand a leading `~/` to the user's home directory so config values like
 /// `on_clip_saved = "~/bin/clip-hook"` work as users expect. Anything else is
 /// returned untouched.
 pub fn expand_home(program: &str) -> PathBuf {
-    match (
-        program.strip_prefix("~/"),
-        std::env::var("HOME").ok().filter(|h| !h.is_empty()),
-    ) {
-        (Some(rest), Some(home)) => Path::new(&home).join(rest),
+    match (program.strip_prefix("~/"), dirs::home_dir()) {
+        (Some(rest), Some(home)) => home.join(rest),
         _ => PathBuf::from(program),
     }
 }
@@ -50,7 +47,10 @@ pub fn spawn_clip_hook(program: &str, clip: &Path) -> Option<std::thread::JoinHa
     }
 }
 
-#[cfg(test)]
+// These tests exercise the unix shell-hook path (an executable `#!/bin/sh`
+// script via PermissionsExt); the host CI runs on Linux. `expand_home` itself
+// is cross-platform via dirs::home_dir.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

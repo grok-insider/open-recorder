@@ -55,8 +55,9 @@ pub fn profile_json(procname: &str) -> String {
 
 /// Directory NVIDIA scans for per-user application profiles.
 pub fn profile_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".nv/nvidia-application-profiles-rc.d")
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".nv/nvidia-application-profiles-rc.d")
 }
 
 /// Full path of the profile file `ord doctor --fix` writes.

@@ -18,7 +18,14 @@ use ord_daemon::{serve, server::bind, server::ServerCtx, socket_path, ClipWriter
 /// created so capture still starts.
 fn make_store(config: &Config, ticks_per_sec: i64) -> Box<dyn FrameStore> {
     let secs = config.capture.buffer_seconds.max(1);
+    let ram = || {
+        Box::new(ord_core::RingBuffer::with_time_base(secs, ticks_per_sec)) as Box<dyn FrameStore>
+    };
     match config.capture.replay_storage {
+        ReplayStorage::Ram => ram(),
+        // Disk-backed replay is unix-only (DiskFrameStore uses positioned I/O);
+        // elsewhere it transparently degrades to the RAM ring.
+        #[cfg(unix)]
         ReplayStorage::Disk => match ord_core::DiskFrameStore::create(
             ord_core::disk_store::default_spill_path(),
             secs,
@@ -30,10 +37,14 @@ fn make_store(config: &Config, ticks_per_sec: i64) -> Box<dyn FrameStore> {
             }
             Err(e) => {
                 tracing::warn!(error = %e, "disk replay store unavailable; using RAM");
-                Box::new(ord_core::RingBuffer::with_time_base(secs, ticks_per_sec))
+                ram()
             }
         },
-        ReplayStorage::Ram => Box::new(ord_core::RingBuffer::with_time_base(secs, ticks_per_sec)),
+        #[cfg(not(unix))]
+        ReplayStorage::Disk => {
+            tracing::warn!("disk replay storage is unix-only; using the RAM ring");
+            ram()
+        }
     }
 }
 
@@ -87,11 +98,18 @@ fn load_config() -> (Config, Config) {
 fn clips_dir(cfg: &Config) -> PathBuf {
     match cfg.storage.clips_dir.as_deref() {
         Some(dir) => ord_daemon::hook::expand_home(dir),
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join("Videos/open-recorder")
-        }
+        None => default_clips_dir(),
     }
+}
+
+/// Default clips directory: the platform Videos dir + `open-recorder`
+/// (`~/Videos` on Linux, `~/Movies` on macOS, the Videos known folder on
+/// Windows), falling back to `<home>/Videos` and finally the temp dir.
+fn default_clips_dir() -> PathBuf {
+    dirs::video_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join("Videos")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder")
 }
 
 /// Resolve the directory for full-length recordings (`~` expanded). Defaults to
@@ -110,6 +128,7 @@ fn recordings_dir(cfg: &Config) -> PathBuf {
 /// process is killed mid-accept and leaves the socket file behind (the next start
 /// recovers via `bind`, but a deterministic shutdown is cleaner). The handler runs
 /// on its own thread — not in async-signal context — so the cleanup is safe.
+#[cfg(unix)]
 fn install_signal_handler(socket: PathBuf) {
     use signal_hook::consts::{SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
@@ -130,6 +149,11 @@ fn install_signal_handler(socket: PathBuf) {
         Err(e) => tracing::warn!(error = %e, "could not install signal handler"),
     }
 }
+
+/// Off-unix there is no signal-hook; a stale rendezvous file is recovered by
+/// `bind` on the next start, so shutdown cleanup is a no-op here.
+#[cfg(not(unix))]
+fn install_signal_handler(_socket: PathBuf) {}
 
 fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
@@ -291,7 +315,7 @@ fn make_writer(config: Arc<Mutex<Config>>) -> ClipWriter {
 }
 
 /// Map the on-disk quality enum onto the waycap backend's preset.
-#[cfg(feature = "waycap")]
+#[cfg(all(feature = "waycap", target_os = "linux"))]
 fn map_quality(q: ord_common::config::Quality) -> ord_core::waycap_backend::Quality {
     use ord_common::config::Quality as C;
     use ord_core::waycap_backend::Quality as W;
@@ -304,7 +328,7 @@ fn map_quality(q: ord_common::config::Quality) -> ord_core::waycap_backend::Qual
 }
 
 /// Map the on-disk capture codec enum onto the engine's [`ord_core::Codec`].
-#[cfg(feature = "waycap")]
+#[cfg(all(feature = "waycap", target_os = "linux"))]
 fn map_codec(c: ord_common::config::CaptureCodec) -> ord_core::Codec {
     use ord_common::config::CaptureCodec as C;
     match c {
@@ -314,7 +338,7 @@ fn map_codec(c: ord_common::config::CaptureCodec) -> ord_core::Codec {
     }
 }
 
-#[cfg(feature = "waycap")]
+#[cfg(all(feature = "waycap", target_os = "linux"))]
 fn make_engine(
     config: &Config,
 ) -> Engine<ord_core::waycap_backend::WaycapBackend, Box<dyn FrameStore>> {
@@ -357,22 +381,19 @@ fn make_engine(
 
 /// Where the XDG screencast restore token is cached, so the daemon skips the
 /// "Select what to share" picker after the first authorized run.
-#[cfg(feature = "waycap")]
+#[cfg(all(feature = "waycap", target_os = "linux"))]
 fn restore_token_path() -> PathBuf {
-    let base = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".local/state")
-        });
-    base.join("open-recorder/portal-restore-token")
+    dirs::state_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder/portal-restore-token")
 }
 
-#[cfg(not(feature = "waycap"))]
+#[cfg(not(all(feature = "waycap", target_os = "linux")))]
 fn make_engine(config: &Config) -> Engine<ord_core::MockBackend, Box<dyn FrameStore>> {
-    // Dev daemon: a long mock capture so the socket/CLI can be exercised. Honors
-    // the configured replay storage (RAM or disk) so that path is exercisable
-    // without a GPU.
+    // Dev daemon (and every non-Linux build): a long mock capture so the
+    // socket/CLI can be exercised. Honors the configured replay storage (RAM or
+    // disk) so that path is exercisable without a GPU.
     let fps = config.capture.fps;
     let buffer = config.capture.buffer_seconds;
     let backend = ord_core::MockBackend::new(fps, fps * buffer, fps);

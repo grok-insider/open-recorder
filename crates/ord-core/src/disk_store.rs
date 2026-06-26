@@ -279,12 +279,12 @@ impl FrameStore for DiskFrameStore {
     }
 }
 
-/// Default spill-file location for the disk replay buffer.
+/// Default spill-file location for the disk replay buffer: the XDG runtime dir
+/// (or the temp dir as a fallback) + `open-recorder/replay-spill.bin`.
 pub fn default_spill_path() -> PathBuf {
-    let base = std::env::var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
-    base.join("open-recorder/replay-spill.bin")
+    dirs::runtime_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("open-recorder/replay-spill.bin")
 }
 
 /// Whether a spill file currently exists at `path` (diagnostic/tests).

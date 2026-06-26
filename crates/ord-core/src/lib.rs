@@ -16,18 +16,27 @@ pub mod audio;
 pub mod audio_route;
 pub mod backend;
 pub mod clip;
+// The disk-backed replay store does positioned I/O via std::os::unix::fs::FileExt,
+// so it is unix-only. Off-unix the engine falls back to the RAM ring (capture is
+// Linux-only in Phase 0 anyway), so nothing is lost.
+#[cfg(unix)]
 pub mod disk_store;
 pub mod engine;
 pub mod mux;
 pub mod record;
 pub mod ring;
 pub mod store;
-#[cfg(feature = "waycap")]
+// Real capture is NVENC via waycap-rs (PipeWire DMA-BUF), which exists only on
+// Linux. Gate it on the OS as well as the feature so `--features waycap` on
+// another OS is a no-op rather than a build error (see Cargo.toml's target-gated
+// waycap-rs dependency).
+#[cfg(all(feature = "waycap", target_os = "linux"))]
 pub mod waycap_backend;
 
 pub use audio::{AudioCodec, AudioParams, AudioRingBuffer, EncodedAudioFrame};
 pub use backend::{BackendError, CaptureBackend, CaptureStreams, Codec, MockBackend, StreamParams};
 pub use clip::{select_clip, ClipError, ClipSelection};
+#[cfg(unix)]
 pub use disk_store::DiskFrameStore;
 pub use engine::{Engine, PreparedClip};
 pub use mux::{verify_clip, write_clip, ClipCheck, MuxError};
