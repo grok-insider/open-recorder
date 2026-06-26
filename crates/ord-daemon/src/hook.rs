@@ -47,7 +47,10 @@ pub fn spawn_clip_hook(program: &str, clip: &Path) -> Option<std::thread::JoinHa
     }
 }
 
-#[cfg(test)]
+// These tests exercise the unix shell-hook path (an executable `#!/bin/sh`
+// script via PermissionsExt); the host CI runs on Linux. `expand_home` itself
+// is cross-platform via dirs::home_dir.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
