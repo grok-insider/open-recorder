@@ -3,14 +3,15 @@
 //!
 //! The framing/encoding itself lives in [`frame`](crate::frame) and
 //! [`ipc`](crate::ipc); this is just the request/response and subscribe-stream
-//! plumbing over a `UnixStream`.
+//! plumbing over the platform [`transport`](crate::transport) stream (a Unix
+//! socket on unix, a loopback TCP connection elsewhere).
 
 use std::io;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use crate::frame::{read_frame, write_frame};
 use crate::ipc::{Command, Event, ProtocolError};
+use crate::transport::{self, Stream};
 
 /// Errors talking to the daemon.
 #[derive(Debug, thiserror::Error)]
@@ -26,7 +27,7 @@ pub enum ClientError {
 /// Connect to the daemon socket at `path`.
 pub fn connect(path: impl AsRef<Path>) -> Result<Client, ClientError> {
     let path = path.as_ref();
-    let stream = UnixStream::connect(path).map_err(|source| ClientError::Connect {
+    let stream = transport::connect(path).map_err(|source| ClientError::Connect {
         path: path.display().to_string(),
         source,
     })?;
@@ -36,7 +37,7 @@ pub fn connect(path: impl AsRef<Path>) -> Result<Client, ClientError> {
 /// One connection to the daemon.
 #[derive(Debug)]
 pub struct Client {
-    stream: UnixStream,
+    stream: Stream,
 }
 
 impl Client {
@@ -71,7 +72,7 @@ impl Client {
 
 /// Iterator over events pushed on a subscribed connection.
 pub struct EventStream {
-    stream: UnixStream,
+    stream: Stream,
 }
 
 impl Iterator for EventStream {
@@ -90,10 +91,27 @@ impl Iterator for EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_error_is_actionable() {
+        let err = connect("/nonexistent/ord.sock").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Is the daemon running?"), "{msg}");
+        assert!(msg.contains("/nonexistent/ord.sock"), "{msg}");
+    }
+
+    // The round-trip tests hand-roll a Unix-socket server, so they are
+    // unix-only; the host CI runs on Linux, so they still execute there. The
+    // non-unix (loopback TCP) transport's only non-type-checked logic is
+    // `parse_port`, covered in the `transport` module's tests.
+    #[cfg(unix)]
     use crate::ipc::Event;
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
+    #[cfg(unix)]
     fn temp_sock(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!(
@@ -105,14 +123,7 @@ mod tests {
         p
     }
 
-    #[test]
-    fn connect_error_is_actionable() {
-        let err = connect("/nonexistent/ord.sock").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("Is the daemon running?"), "{msg}");
-        assert!(msg.contains("/nonexistent/ord.sock"), "{msg}");
-    }
-
+    #[cfg(unix)]
     #[test]
     fn request_round_trips_over_socket() {
         let path = temp_sock("req");
@@ -133,6 +144,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
     #[test]
     fn subscribe_streams_until_close() {
         let path = temp_sock("sub");
