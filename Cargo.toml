@@ -17,8 +17,8 @@ edition = "2021"
 # the hot path. CI uses stable (>= this); the nix devshell's rustc is canonical.
 rust-version = "1.87"
 license = "MIT"
-authors = ["0xfell"]
-repository = "https://github.com/0xfell/open-recorder"
+authors = ["Grok Insider <admin@grokinsider.net>"]
+repository = "https://github.com/grok-insider/open-recorder"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

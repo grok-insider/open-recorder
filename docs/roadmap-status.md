@@ -3,10 +3,15 @@
 Status of the plan derived from competitor research (Medal.tv, ShadowPlay/
 NVIDIA App, Outplayed/Overwolf, Steam Game Recording, OBS Replay Buffer,
 AMD ReLive, gpu-screen-recorder) plus the settings-panel and UI-revamp work,
-and the settings/editor feedback round (steppers + captions, live library
-refresh, hideable HUD dot, useful markers, wheel zoom, frame-accurate
-scrubbing, multi-segment cuts). Verified by `cargo fmt` /
-`clippy -D warnings` / tests on both lanes (0 failures).
+the settings/editor feedback round, and the **v0.2 ShadowPlay-parity feature
+drop + versioning + editor/player QA** (released v0.2.0–v0.2.2; see the section
+below). Verified by `cargo fmt` / `clippy -D warnings` / tests on both lanes
+(0 failures).
+
+**Forward-looking work is tracked in [`continue-plan.md`](../continue-plan.md)**
+(waycap-rs fork bump to activate the capture knobs, live per-app audio capture,
+HDR spikes, AccessKit, perf measurement, packaging validation). This file is the
+record of what has shipped.
 
 ## Implemented
 
@@ -162,22 +167,99 @@ scrubbing, multi-segment cuts). Verified by `cargo fmt` /
   Model ops (`move_cut`/`join_at`/`cut_range`) are unit-tested; the whole
   flow was driven end-to-end in the Xvfb bench.
 
+### Tier P — packaging & releases (install without compiling)
+
+- [x] **Automated releases (release-plz).** `release-plz.toml` +
+  `.github/workflows/release.yml`: every master push maintains a
+  `chore: release vX.Y.Z` PR that bumps the single `[workspace.package].version`
+  (all crates inherit it), refreshes `Cargo.lock`, and regenerates `CHANGELOG.md`
+  from Conventional Commits. Merging it tags `vX.Y.Z` + creates the GitHub
+  Release. `ord-cli` is the release unit; the other six crates fold in via
+  `changelog_include`. No crates.io publish (`git_only`).
+- [x] **Nix install — cachix (already live).** `ci.yml`'s `build` job pushes
+  every closure to `grok-insider.cachix.org` on each master push/tag, so NixOS
+  consumers substitute `open-recorder-X.Y.Z` instead of compiling. Cachix stays
+  in `ci.yml` by design; `release.yml` only cuts the tag/Release + artifacts.
+- [x] **Non-Nix `ord` client — static musl binary.** `upload-ord` builds `ord`
+  (pure Rust: ord-cli→ord-export→ord-common, no ffmpeg/C) for
+  `x86_64-unknown-linux-musl`, verifies it's static, and attaches the tarball —
+  the fast on-PATH binary compositor keybinds invoke.
+- [x] **Non-Nix recorder — AppImages.** `upload-appimages` bundles `ordd`,
+  `ord-hud`, `ord-ui` from the flake via `nix bundle`
+  (`github:ralismark/nix-appimage`), reusing the cached closure. The flake's
+  runtime wrapper resolves the NVIDIA driver libs on foreign distros
+  (`postFixup --suffix` over the FHS driver dirs, alongside the NixOS
+  `/run/opengl-driver/lib` prefix), and `apps.{ord,ordd,ord-hud,ord-ui}` give
+  clean bundle entrypoints.
+- [x] **Contributor docs.** `CONTRIBUTING.md` (Conventional Commits → bump rules
+  + the release flow) and a rewritten `docs/releasing.md` (release-plz +
+  AppImages); `README.md` gained a non-Nix install section.
+
+### v0.2 — ShadowPlay-parity feature drop, versioning & QA (released v0.2.0–v0.2.2)
+
+Config + validation + IPC + pure logic shipped and tested; the parts that need
+the `0xfell/waycap-rs` fork to *take effect*, real-hardware spikes, or a live
+PipeWire capture engine are tracked in `continue-plan.md` (the canonical
+forward plan). Released and live on the dev box at **v0.2.2 (protocol 4)**.
+
+- [x] **`ord doctor [--fix]`** — diagnoses + installs the NVIDIA
+  `CudaNoStablePerfLimit` application profile that frees `ordd` from the
+  CUDA/NVENC **P2 downclock** (the real perf delta vs ShadowPlay). Verified
+  against a live driver 610.
+- [x] **Capture knobs** — `resolution`, `keyframe_interval_ms`, `framerate_mode`
+  (cfr/vfr/content), `color_range`, `tune`: config + validation + restart
+  predicate + builder plumbing. ⛔ *Applied* once the fork exposes the
+  `CaptureBuilder` setters (`// fork:` block in `waycap_backend.rs`).
+- [x] **Disk-backed replay** (`capture.replay_storage = disk`) — `DiskFrameStore`
+  (spill + RAM index + compaction) threaded through a runtime-selected
+  `Box<dyn FrameStore>` in engine/handler/server. e2e-verified.
+  *(Closes the Tier-X "disk-backed replay buffer".)*
+- [x] **`ord shot`** — decodes the newest GOP to a PNG (real-hardware verified).
+- [x] **`capture.target`** (portal/monitor) + **`capture.auto_arm`** (arm the
+  buffer when a Steam app / fullscreen window takes focus; `is_game_window`).
+- [x] **Multi-track + per-application audio config** (`audio.tracks`,
+  `AudioSource` selectors) + pure routing (`audio_route::plan_track`,
+  `config::effective_tracks`). ⛔ Live PipeWire+Opus multi-track capture engine
+  is the gated follow-on. *(Supersedes the Tier-X "separate mic/game tracks".)*
+- [x] **HDR config** (`capture.hdr`, validated to HEVC/AV1). 🔬 Main10-encode +
+  KMS-capture spikes in `docs/hdr.md`.
+- [x] **Versioning** — `ord`/`ordd --version` → `X.Y.Z [protocol N]` (git rev on
+  cargo builds, rev-less on Nix) via `ord-common::version` + `build.rs`;
+  `PROTOCOL_VERSION` 3→4 (`Screenshot`/`ScreenshotSaved`); `docs/releasing.md`.
+- [x] **Clip-library grid fix (v0.2.1)** — `horizontal_wrapped` inside a vertical
+  `ScrollArea` never wrapped (every clip in one off-screen row); replaced with a
+  deterministic grid (column count from the panel width). wisp-verified.
+- [x] **Editor/player QA (v0.2.2)** — idle-aware UI watchdog (a paused editor no
+  longer logs false `UI STALL` ANRs; focus-gated + 1s heartbeat); audio-clock
+  **stall recovery** (pause instead of a 60fps spin if the clock-driving audio
+  output freezes — clock-only, no wall-clock fallback); telemetry honors
+  `ORD_DEBUG_LOG`; `ORD_AUTOPLAY` QA aid. Full 30s play-through + trim/export
+  (`av1_nvenc`) verified clean on the real RTX 5070 Ti.
+
 ## Left to do
 
-- [ ] **Visual QA of the revamped UI** — deferred because the desktop session
-  was in active gameplay (and the nested sandbox has no GL for eframe). Open
-  `ord-ui` after a rebuild and review library, editor, and settings pages;
-  tune spacing/contrast if needed. Now also covers the new settings form
-  (steppers/captions), segment cuts, and marker flags.
-- [ ] **Live hardware verification of the new daemon paths** — watchdog
-  recovery across a real suspend/resume, `SetConfig` capture-restart on the
-  live NVENC session, `ord mark` → chapters visible in a real clip, the HUD
-  dot toggling live via the new overlay setting. (All are mock/integration-
-  tested; the running user daemon was intentionally left untouched. Note:
-  protocol v3 — rebuild/restart `ordd`, `ord`, `ord-hud`, and `ord-ui`
-  together.)
-- [ ] **Commit + push + CI/cachix dispatch** — the whole batch is uncommitted
-  in the working tree by design (commits only on explicit ask).
+> Forward-looking work now lives in **`continue-plan.md`** (waycap-rs fork bump,
+> live per-app audio capture, HDR spikes, AccessKit, perf measurement, packaging
+> validation). The residue from earlier rounds:
+
+- [x] **Visual QA of the revamped UI** — done: clip library, editor (preview +
+  transport + timeline), and settings render correctly (verified via the wisp
+  nested sandbox + grim on the real session; the grid bug found here was fixed
+  in v0.2.1).
+- [~] **Live hardware verification of the new daemon paths** — playback,
+  trim/export, `ord doctor`, and the full capture→NVENC→save path are verified
+  on the real RTX 5070 Ti; watchdog-across-suspend and live `SetConfig`
+  capture-restart remain mock/integration-tested only. The dev box now runs
+  v0.2.2 (protocol 4 — `ordd`/`ord`/`ord-hud`/`ord-ui` all on the same release).
+- [x] **Commit + push + CI/cachix dispatch** — done: master green across all
+  three CI jobs, closures cached, v0.2.0–v0.2.2 tagged.
+- [ ] **Enable "Allow GitHub Actions to create and approve pull requests"**
+  (Settings → Actions → General) so release-plz can open the release PR. One-time;
+  `CACHIX_AUTH_TOKEN` and the baseline `v*` tags already exist.
+- [ ] **On-hardware AppImage validation** — bundle + run the ordd/ord-hud/ord-ui
+  AppImages on a non-NixOS NVIDIA box (ordd first: NVENC + driver-path proof;
+  ord-ui last: GL vendor-match is the known hazard). Full checklist in
+  `continue-plan.md`.
 - [x] **Hyprland keybind for `ord mark`** — added to
   `~/.config/nixos/configs/hyprland.conf` (`bind = ALT, M, exec, ord mark`)
   next to the existing save bind; takes effect on the next Hyprland
@@ -188,12 +270,14 @@ scrubbing, multi-segment cuts). Verified by `cargo fmt` /
 
 ### Tier X — bigger bets (explicitly deferred)
 
-- [ ] **Separate mic/game audio tracks** (waycap-rs fork: second Opus track;
-  editor gains per-track mute) — top OBS power-user wish.
+- [~] **Separate mic/game + per-application audio tracks** — config model
+  (`audio.tracks`, `AudioSource`) + pure routing (`audio_route::plan_track`)
+  shipped in v0.2; the live PipeWire+Opus multi-track capture engine + N-track
+  muxing + editor per-track mute remain (`continue-plan.md` item 2).
 - [ ] **Per-game profiles** (game detection exists; per-game config overlays).
-- [ ] **Disk-backed replay buffer** — `FrameStore` seam is in place
-  (`Engine<B, S: FrameStore = RingBuffer>`); a `DiskStore` impl remains
-  (see `future-features.md`).
+- [x] **Disk-backed replay buffer** — shipped in v0.2: `DiskFrameStore`
+  (`capture.replay_storage = disk`) over the `FrameStore` seam, runtime-selected
+  via `Box<dyn FrameStore>` and e2e-verified.
 - [ ] **Voice "clip that"** — example hook script wiring the local
   speech-stack to `ord save` (docs, not core).
 - [ ] **Diagnostics page** — dropped-frame counters, ring RAM use, encoder in
@@ -202,3 +286,10 @@ scrubbing, multi-segment cuts). Verified by `cargo fmt` /
   (editor cuts + `export_segments_with`).
 - [ ] **Share-link upload / clipboard of rendered exports** — parked in
   `future-features.md`, do not implement without an explicit ask.
+- [ ] **Flathub Flatpak of `ord-ui`** — the OBS-style GUI path (driver-matched
+  GL via the `GL.nvidia` extension + PipeWire portal); daemon/CLI/HUD stay out
+  of the sandbox by design. Pursue if the `ord-ui` AppImage GL story is fragile
+  or for Flathub reach/auto-updates. See `continue-plan.md`.
+- [ ] **Unified single-file AppImage / native `.deb`·`.rpm`·AUR** — optional
+  later distribution formats; the per-binary AppImages + static `ord` ship first
+  (`continue-plan.md`).

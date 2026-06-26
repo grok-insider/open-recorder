@@ -1,0 +1,217 @@
+name: Release
+
+# Automated versioning + GitHub Releases via release-plz (config: release-plz.toml).
+#
+# Flow on every push to master:
+#   * release-plz-pr      — opens/updates the "release PR" (bumps the single
+#                           [workspace.package].version + Cargo.lock, regenerates
+#                           CHANGELOG.md from Conventional Commits).
+#   * release-plz-release — when that PR is merged, creates the `vX.Y.Z` tag +
+#                           GitHub Release from the changelog.
+#   * upload-ord          — builds the portable static `ord` client and attaches it.
+#   * upload-appimages    — bundles ordd/ord-hud/ord-ui as AppImages (via the Nix
+#                           flake) and attaches them, for non-Nix Linux users.
+#
+# Cachix is intentionally NOT handled here: ci.yml's `build` job runs on the same
+# master push and pushes the closures to grok-insider.cachix.org (flake.nix reads the
+# version straight from Cargo.toml). Nothing is published to crates.io — see the
+# `git_only` setting in release-plz.toml.
+
+on:
+  push:
+    branches: [master]
+
+# Least privilege by default; each job elevates only what it needs.
+permissions:
+  contents: read
+
+jobs:
+  # Keep the release PR up to date on every push. Merging that PR is what later
+  # triggers the `release` job (via the resulting push to master).
+  release-plz-pr:
+    name: release-plz PR
+    if: github.repository_owner == 'grok-insider'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz (release-pr)
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # On a release-PR merge: create the `vX.Y.Z` tag + GitHub Release. Exposes
+  # whether a release was cut (and its tag/version) to the artifact jobs below.
+  release-plz-release:
+    name: release-plz release
+    if: github.repository_owner == 'grok-insider'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      releases: ${{ steps.release-plz.outputs.releases }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run release-plz (release)
+        id: release-plz
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Build a portable, statically-linked `ord` (x86_64 musl) and attach it to the
+  # just-created GitHub Release. `ord` is the thin control client compositor
+  # keybinds invoke on every keypress; it must be on PATH and start instantly, so
+  # it ships as a tiny static binary, NOT an AppImage.
+  #
+  # `ord` is pure Rust (ord-cli -> ord-export -> ord-common; serde/bincode/toml,
+  # no ffmpeg/C), so a plain musl target build is fully static — no zig/cmake.
+  # This job is independent: if it fails, the tag/Release/changelog/cachix are
+  # already done and it can be re-run.
+  upload-ord:
+    name: attach ord client (x86_64-musl static)
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - name: Resolve release tag/version
+        id: rel
+        env:
+          RELEASES: ${{ needs.release-plz-release.outputs.releases }}
+        run: |
+          set -euo pipefail
+          echo "tag=$(echo "$RELEASES" | jq -r '.[0].tag')" >> "$GITHUB_OUTPUT"
+          echo "version=$(echo "$RELEASES" | jq -r '.[0].version')" >> "$GITHUB_OUTPUT"
+      - name: Checkout the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.rel.outputs.tag }}
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ env.TARGET }}
+      - name: Build static ord
+        run: cargo build --release -p ord-cli --target "$TARGET"
+      - name: Verify the binary is static
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/ord"
+          file "$bin"
+          # A static binary makes `ldd` print "not a dynamic executable"; any
+          # glibc NEEDED entry means the build silently linked dynamically.
+          if ldd "$bin" 2>&1 | grep -qiE 'libc\.so|GLIBC'; then
+            echo "::error::ord is dynamically linked against glibc"; exit 1
+          fi
+      - name: Package tarball + checksum
+        id: pkg
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="ord-${VERSION}-x86_64-linux-musl.tar.gz"
+          tar -czf "$archive" -C "target/$TARGET/release" ord
+          sha256sum "$archive" > "$archive.sha256"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+      - name: Upload to the GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          ARCHIVE: ${{ steps.pkg.outputs.archive }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+
+  # Bundle the native binaries (ordd, ord-hud, ord-ui) as AppImages straight from
+  # the Nix flake and attach them, so non-NixOS Linux users run the full recorder
+  # without compiling ffmpeg/CUDA/waycap-rs. nix-appimage packages the already
+  # built closure; with Cachix configured it substitutes the build that ci.yml's
+  # `build` job pushes on the SAME master push (no recompile in the common case;
+  # worst case this job realizes the closure itself, which still works).
+  #
+  # The flake's runtime wrapper resolves the NVIDIA driver libs (libcuda.so.1,
+  # libnvidia-encode.so.1) from /run/opengl-driver/lib (NixOS) AND the FHS driver
+  # dirs (foreign distros) — see flake.nix postFixup — so NVENC works inside the
+  # AppImage on any distro with the proprietary driver installed.
+  upload-appimages:
+    name: attach AppImages (ordd, ord-hud, ord-ui)
+    needs: release-plz-release
+    if: needs.release-plz-release.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Resolve release tag/version
+        id: rel
+        env:
+          RELEASES: ${{ needs.release-plz-release.outputs.releases }}
+        run: |
+          set -euo pipefail
+          echo "tag=$(echo "$RELEASES" | jq -r '.[0].tag')" >> "$GITHUB_OUTPUT"
+          echo "version=$(echo "$RELEASES" | jq -r '.[0].version')" >> "$GITHUB_OUTPUT"
+      - name: Checkout the released tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.rel.outputs.tag }}
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+      # Substitute the prebuilt closure from the grok-insider cache (and push any newly
+      # realized paths — e.g. the AppImage runtime — back with the auth token).
+      - name: Set up Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: grok-insider
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          extraPullNames: nix-community
+      - name: Build AppImages
+        run: |
+          set -euo pipefail
+          for pkg in ordd ord-hud ord-ui; do
+            nix bundle --bundler github:ralismark/nix-appimage \
+              ".#${pkg}" --out-link "${pkg}.AppImage"
+          done
+      - name: Package + checksums
+        env:
+          VERSION: ${{ steps.rel.outputs.version }}
+        run: |
+          set -euo pipefail
+          for pkg in ordd ord-hud ord-ui; do
+            asset="${pkg}-${VERSION}-x86_64.AppImage"
+            install -m755 "$(readlink -f "${pkg}.AppImage")" "$asset"
+            sha256sum "$asset" > "$asset.sha256"
+          done
+      - name: Upload to the GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: gh release upload "$TAG" ./*-x86_64.AppImage ./*-x86_64.AppImage.sha256 --clobber

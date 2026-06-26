@@ -189,6 +189,15 @@ promise. We ship Linux-first.
 6. **NixOS wiring (separate, in the nixos config repo).** Flake input + Home
    Manager systemd user service for `ordd` + Hyprland binds/window-rules +
    docs.
+7. **Release automation & distribution.** Automated versioning + changelog +
+   GitHub Releases via **release-plz** (Conventional Commits → one shared
+   workspace version → `vX.Y.Z` tag; nothing on crates.io). Three install
+   paths so nobody has to compile: the **grok-insider cachix cache** for Nix/NixOS
+   (closures pushed by `ci.yml`), a **static `ord` musl binary** for PATH
+   installs, and **`ordd`/`ord-hud`/`ord-ui` AppImages** (`nix bundle`, with the
+   flake wrapper resolving the host NVIDIA driver on foreign distros). A Flathub
+   **Flatpak of `ord-ui`** is the planned next GUI path. See `docs/releasing.md`,
+   `CONTRIBUTING.md`, and `continue-plan.md`.
 
 ---
 
@@ -220,3 +229,7 @@ promise. We ship Linux-first.
 | Hotkeys | evdev (+ compositor binds) | Works under fullscreen keyboard grab; user is in `input` group. |
 | License | MIT | Most permissive; matches `open-usage` and `waycap-rs`. |
 | Platforms | Linux-first, cross-platform by design | Engine is Linux-only today; Windows = future `CaptureBackend`. |
+| Versioning / release | release-plz (Conventional Commits) | One workspace version → `vX.Y.Z` tag + GitHub Release + regenerated changelog, no manual bumps; nothing on crates.io (`git_only`). |
+| Nix distribution | grok-insider cachix cache | NixOS consumers substitute prebuilt closures; pushed by `ci.yml` on every master push/tag. |
+| Non-Nix distribution | static `ord` (musl) + AppImages (`nix bundle`) | `ord` is pure Rust → portable static; the native ordd/ord-hud/ord-ui reuse the working flake build as AppImages. Flatpak (`ord-ui`) planned. |
+| AppImage before Flatpak | AppImage first | Reuses the cached Nix build for ~free and suits our daemon/CLI/layer-shell model; Flatpak (OBS's official path) is deferred to the `ord-ui` GUI only. |
