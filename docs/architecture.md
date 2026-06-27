@@ -29,6 +29,8 @@ clip.
 - `ord-daemon` wires `ord-core` to the outside world.
 - `ord-cli` / `ord-ui` are clients of the daemon socket; `ord-ui` also uses
   `ord-overlay` for the HUD.
+- `ord-export` (pure ffmpeg-arg planner + ffprobe/ffmpeg runner) is used by
+  `ord-cli`'s `ord export` and by `ord-ui`'s in-app editor export.
 
 ## The capture → save dataflow
 
@@ -84,10 +86,12 @@ Key properties:
 ## IPC protocol (`ord-common`)
 
 Bincode-encoded request/response + event stream over the Unix socket at
-`$XDG_RUNTIME_DIR/open-recorder.sock`. Commands: `SaveLast(seconds)`,
-`ToggleRecord`, `Status`, `BufferOn`/`BufferOff`, `SetQuality(...)`. Events:
-`ClipSaved { path, duration }`, `BufferState(...)`, `Error(msg)`. Exact types
-live in `ord-common` and are round-trip unit-tested.
+`$XDG_RUNTIME_DIR/open-recorder.sock`. Commands: `SaveLast { duration }`,
+`ToggleRecord`, `SetBuffer { enabled }`, `Status`, `Subscribe`, `Mark`,
+`Screenshot`, `GetConfig`, `SetConfig`. Events: `ClipSaved { path, duration }`,
+`BufferState`, `RecordState`, `Status { .. }`, `Marked`, `CaptureRestarted`,
+`ScreenshotSaved { path }`, `Config { .. }`, `Error(msg)`. Exact types live in
+`ord-common` and are round-trip unit-tested.
 
 ## Configuration
 

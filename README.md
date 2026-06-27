@@ -1,26 +1,45 @@
 # open-recorder
 
+[![CI](https://github.com/grok-insider/open-recorder/actions/workflows/ci.yml/badge.svg)](https://github.com/grok-insider/open-recorder/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/grok-insider/open-recorder?sort=semver)](https://github.com/grok-insider/open-recorder/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A native, open-source, Medal.tv / ShadowPlay-style game clipper for Linux —
 always-on instant replay with near-zero overhead, save the last N seconds on a
-keypress, browse and trim clips. NVIDIA-first, designed cross-platform.
+keypress, browse, trim, and export clips. **NVIDIA-first (NVENC), Wayland-native.**
 
-> **Status: working.** Full pipeline verified end-to-end on hardware (NVIDIA RTX
-> 5070 Ti, Hyprland): `ordd --features waycap` + `ord save` records real NVENC
-> H.264 clips to `~/Videos/open-recorder/` (ffprobe-validated), the click-through
-> wlr-layer-shell HUD renders over fullscreen content, and `ord-ui` lists the
-> library. This replaces Steam's CPU-x264 macroblocking with hardware NVENC.
-> See [`plan.md`](./plan.md) and [`docs/spike-results.md`](./docs/spike-results.md).
+> **Status: working (v0.3.0).** The full pipeline is verified end-to-end on
+> hardware (RTX 5070 Ti, Hyprland): `ordd` + `ord save` records real NVENC clips,
+> the click-through wlr-layer-shell HUD renders over fullscreen content, and
+> `ord-ui` browses/edits the library. It replaces Steam's CPU-x264 macroblocking
+> with hardware NVENC. The codebase also compiles and runs on macOS/Windows with a
+> **mock** capture backend (no real recording there yet — a Windows DXGI→NVENC
+> backend is future work).
 
 ## Crates
 
 | Crate | Binary | Role |
 |-------|--------|------|
-| `ord-common` | – | Shared newtypes + the bincode IPC protocol + socket framing. |
-| `ord-core` | – | Ring buffer, keyframe-aware clip selection, engine, ffmpeg muxer (`mux`), NVENC capture (`waycap`). |
-| `ord-daemon` | `ordd` | Capture supervision + Unix-socket control + game-named clips. |
-| `ord-cli` | `ord` | Thin control client for compositor keybinds. |
-| `ord-overlay` | `ord-hud` | `Overlay` trait + HUD toast model + real wlr-layer-shell surface (`layershell`); `ord-hud` subscribes to the daemon and shows events. |
-| `ord-ui` | `ord-ui` | egui clip library (`gui`); CLI clip listing otherwise. |
+| `ord-common` | – | Shared newtypes, layered config, and the bincode IPC protocol + socket framing. |
+| `ord-core` | – | Ring buffer, keyframe-aware clip selection, engine, codec-keyed bitstream + clip muxer + streaming recorder (`mux`), NVENC capture (`waycap`). |
+| `ord-export` | – | Pure ffmpeg-arg export planner + ffprobe wrapper + ffmpeg runner with NVENC→software fallback; presets. |
+| `ord-daemon` | `ordd` | Capture supervision, Unix-socket control plane, game detection (`hyprctl`), storage prune, watchdog, post-save verify + hook. |
+| `ord-cli` | `ord` | Thin control client for compositor keybinds + local `doctor`/`export`. |
+| `ord-overlay` | `ord-hud` | `Overlay` trait + click-through `wlr-layer-shell` HUD that subscribes to the daemon. |
+| `ord-ui` | `ord-ui` | egui clip library + inline player/editor/trim/export + settings. |
+
+## Requirements
+
+- **NVIDIA proprietary driver** (provides `libcuda` / `libnvidia-encode`). Driver
+  **≥ 580** is needed for `ord doctor`'s P2-downclock fix.
+- An **NVENC-capable GPU**; **AV1/HEVC** encode needs an RTX 40/50-series card.
+- A **Wayland** session with a working **screencast portal** (`xdg-desktop-portal`)
+  and **wlr-layer-shell** (for the HUD), plus **PipeWire**.
+- **ffmpeg / ffprobe** on `PATH` for `ord export` and `ord shot` (override with
+  `ORD_FFMPEG` / `ORD_FFPROBE`).
+- **FUSE2** for the AppImages (or run with `--appimage-extract-and-run`).
+- **Hyprland** for automatic game-name detection / `auto_arm` (uses `hyprctl`);
+  recording itself works on any wlroots compositor.
 
 ## Install (NixOS, prebuilt — no compiling)
 
@@ -57,23 +76,21 @@ nix profile install github:grok-insider/open-recorder   # all of: ord, ordd, ord
   # ordd + ord-hud run as user services by default; disable with:
   # programs.open-recorder.daemon.enable = false;
   # programs.open-recorder.hud.enable = false;
+  # Optional: manage ~/.config/open-recorder/config.toml declaratively:
+  # programs.open-recorder.settings = { capture = { fps = 60; buffer_seconds = 30; }; };
 }
 ```
-
-Runtime needs the NVIDIA driver (`/run/opengl-driver`, present on any NixOS
-NVIDIA host) and a Wayland session with a working screencast portal.
 
 **Skip the picker after the first run:** the first time `ordd` captures, the
 screencast portal shows "Select what to share" — pick your monitor and **tick
 "Allow a restore token"**, then Share. `ordd` saves the granted token to
-`$XDG_STATE_HOME/open-recorder/portal-restore-token` and reuses it on every
-later start, so the picker never appears again. (Without the restore-token tick
-the portal re-prompts each start.)
+`$XDG_STATE_HOME/open-recorder/portal-restore-token` and reuses it on every later
+start, so the picker never appears again.
 
 ## Install (other Linux — prebuilt, no compiling)
 
 Not on Nix? Each [GitHub Release](https://github.com/grok-insider/open-recorder/releases)
-ships prebuilt `x86_64` binaries so you never compile CUDA/ffmpeg/waycap-rs:
+ships prebuilt `x86_64` binaries (each with a `.sha256`):
 
 - **`ord` client** — `ord-<ver>-x86_64-linux-musl.tar.gz`. A static binary; put it
   on `PATH` (this is what compositor keybinds call):
@@ -84,7 +101,7 @@ ships prebuilt `x86_64` binaries so you never compile CUDA/ffmpeg/waycap-rs:
   ```
 
 - **`ordd`, `ord-hud`, `ord-ui`** — `*-<ver>-x86_64.AppImage`. Self-contained
-  (ffmpeg/Wayland/GL bundled); just mark executable and run:
+  (ffmpeg/Wayland/GL bundled); the wrapper resolves the host NVIDIA driver:
 
   ```sh
   chmod +x ordd-*-x86_64.AppImage
@@ -92,18 +109,13 @@ ships prebuilt `x86_64` binaries so you never compile CUDA/ffmpeg/waycap-rs:
   ./ord-ui-*-x86_64.AppImage        # the clip library window
   ```
 
-Requirements: the host **NVIDIA driver** (the AppImage resolves `libcuda.so.1` /
-`libnvidia-encode.so.1` from it), a Wayland session with a working screencast
-portal, and **FUSE2** (or run with `--appimage-extract-and-run` on hosts without
-it). Each asset has a `.sha256` to verify.
-
 > A Flathub **Flatpak of `ord-ui`** (driver-matched GL + PipeWire portal) is the
 > planned next step for the GUI.
 
 ## Build from source
 
 ```sh
-# Pure logic (no GPU): builds + tests anywhere.
+# Pure logic (no GPU): builds + tests anywhere. Rust >= 1.87.
 cargo test --workspace
 cargo build --release -p ord-cli
 
@@ -117,14 +129,40 @@ cargo build --release -p ord-overlay --features layershell   # ord-hud overlay
 nix build .#ordd .#ord-hud .#ord-ui .#ord-cli
 ```
 
-Run the daemon, then drive it:
+A bare `cargo build` (without `--features waycap`) builds against a **mock**
+capture backend — useful for development and CI, but it won't record real frames.
+
+## Usage
+
+Start the daemon, then drive it with `ord` (what your compositor keybinds call):
 
 ```sh
-ordd &                      # starts the replay buffer
-ord save --last 30          # save the last 30s
-ord status                  # buffer/recording/buffered seconds
-ord buffer off              # pause the buffer
+ordd &                  # start the replay buffer (needs --features waycap / a prebuilt to record)
+ord save --last 30      # save the last N seconds (default 30)
+ord mark                # bookmark now → a chapter in the next saved clip
+ord shot                # screenshot the latest frame to a PNG
+ord record              # toggle manual (continuous) recording
+ord status              # buffer/recording state + buffered seconds
+ord buffer on|off       # arm / pause the replay buffer
+ord config show         # print the effective daemon configuration
+ord subscribe           # stream daemon events (this is what the HUD consumes)
+ord doctor --fix        # install the NVIDIA P2-downclock fix (see below)
+ord export <in> [out]   # transcode/trim a clip — see `ord export --help`
+ord --version           # prints "ord X.Y.Z [protocol N]"
 ```
+
+- **`ord doctor [--fix]`** installs the NVIDIA `CudaNoStablePerfLimit` application
+  profile that frees `ordd` from the CUDA/NVENC **P2 downclock** — the real
+  performance delta vs ShadowPlay. Requires driver ≥ 580; it's the only thing
+  `ord` writes under `~/.nv`, and `--fix` prints exactly what it changes.
+- **`ord export`** is a local HandBrake-style transcoder (does not touch the
+  daemon): `--preset high|discord|source`, `--codec av1|hevc|h264`,
+  `--container mp4|mkv`, `--cq`/`--bitrate`/`--target-size`, `--max-height`/`--scale`,
+  `--start`/`--end` (trim), `--no-hardware`. Needs `ffmpeg`/`ffprobe` on `PATH`.
+
+**Environment variables:** `RUST_LOG` (daemon log level), `ORD_FFMPEG` /
+`ORD_FFPROBE` (override the ffmpeg/ffprobe binaries), `ORD_DEBUG_LOG` and
+`ORD_AUTOPLAY` (UI dev/QA aids).
 
 ## Hyprland integration
 
@@ -137,29 +175,45 @@ so you only need the keybinds:
 bind = ALT, R, exec, ord save --last 30
 bind = ALT SHIFT, R, exec, ord record
 # Clip library in a special workspace (like Discord/Spotify):
-windowrule = workspace special:clips, match:class ^(open-recorder)$
+windowrulev2 = workspace special:clips, class:^(open-recorder)$
 bind = SUPER, C, togglespecialworkspace, clips
 ```
+
+## Configuration
+
+`~/.config/open-recorder/config.toml` (respects `XDG_CONFIG_HOME`); `ordd` writes
+defaults on first run. The config is **layered**: the base file is never modified
+at runtime — in-app/daemon changes persist as a sparse diff in
+`$XDG_STATE_HOME/open-recorder/overrides.toml`.
+
+| Section | Keys (defaults) |
+|---------|-----------------|
+| `[capture]` | `fps` (60), `buffer_seconds` (60), `quality` (high), `codec` (h264; hevc/av1 need RTX 40/50), `bitrate_kbps`, `resolution`, `keyframe_interval_ms` (2000), `framerate_mode` (cfr), `color_range` (limited), `tune` (performance), `replay_storage` (ram\|disk), `target` (portal), `auto_arm` (false), `hdr` (false), `clear_on_save` (false) |
+| `[audio]` | `desktop`, `mic`, `tracks` (per-application audio sources) |
+| `[storage]` | `clips_dir`, `recordings_dir`, `template`, `max_gib`, `max_age_days` |
+| `[markers]` | `auto_save_seconds` |
+| `[hooks]` | `on_clip_saved` (run a command after each save) |
+| `[overlay]` | `show_status_dot` |
+| `[export]` | `codec`, `container` (defaults for `ord export`) |
 
 ## Why
 
 Steam's built-in Game Recording cannot hardware-encode on Linux + NVIDIA — it
 fails to init NVENC inside its container, falls back to CPU `libx264 veryfast`,
-and produces macroblocked clips. open-recorder uses the path that actually
-works on this hardware: **PipeWire DMA-BUF → NVENC, in-process, copy-free**,
-for the highest achievable recording performance.
-
-Full diagnosis and evidence: [`docs/performance.md`](./docs/performance.md).
+and produces macroblocked clips. open-recorder uses the path that actually works
+on this hardware: **PipeWire DMA-BUF → NVENC, in-process, copy-free.** Full
+diagnosis and evidence: [`docs/performance.md`](./docs/performance.md).
 
 ## How
 
 - **Native Rust**, zero-copy capture/encode via the `waycap-rs` crate.
-- An in-RAM ring buffer of **already-encoded** frames; "save last N seconds"
-  seeks the newest keyframe and stream-copies to `.mkv` (no re-encode).
-- A daemon (`ordd`) + thin CLI (`ord`) over a Unix socket; evdev global hotkeys
-  that work under fullscreen keyboard grab.
-- `egui` clip-library window (lives in a Hyprland special workspace) and a
-  click-through `wlr-layer-shell` HUD.
+- An in-RAM ring buffer of **already-encoded** frames; "save last N seconds" seeks
+  the newest keyframe and stream-copies to `.mkv` (no re-encode).
+- A daemon (`ordd`) + thin CLI (`ord`) over a Unix socket; a capture watchdog and
+  in-process post-save verification catch the "silently stopped recording" /
+  "empty file" failure modes that plague ShadowPlay/ReLive.
+- An `egui` clip-library window (with an inline trim/multi-cut editor + export) and
+  a click-through `wlr-layer-shell` HUD.
 
 Architecture: [`docs/architecture.md`](./docs/architecture.md).
 
@@ -167,14 +221,16 @@ Architecture: [`docs/architecture.md`](./docs/architecture.md).
 
 | Doc | Contents |
 |-----|----------|
-| [`plan.md`](./plan.md) | The full plan: whys, hows, decisions, phases, risks. |
 | [`AGENTS.md`](./AGENTS.md) | How agents/contributors work here: clean-code + testing standards. |
+| [`CONTRIBUTING.md`](./CONTRIBUTING.md) | Local setup, the commit/PR workflow, and gates. |
+| [`CHANGELOG.md`](./CHANGELOG.md) | Release history (generated by release-plz). |
 | [`docs/architecture.md`](./docs/architecture.md) | Crate graph, capture→encode→ring-buffer→save dataflow. |
 | [`docs/performance.md`](./docs/performance.md) | Why native zero-copy; the Steam-on-NVIDIA diagnosis + evidence. |
-| [`docs/overlay.md`](./docs/overlay.md) | Special-workspace vs layer-shell HUD; cross-platform overlay strategy. |
+| [`docs/overlay.md`](./docs/overlay.md) | Special-workspace vs layer-shell HUD; overlay strategy. |
 | [`docs/backends.md`](./docs/backends.md) | The `CaptureBackend` and `Overlay` traits and their implementations. |
+| [`docs/hdr.md`](./docs/hdr.md) | HDR capture (Main10 encode + KMS capture) notes. |
 | [`docs/testing.md`](./docs/testing.md) | Test strategy: unit / integration / golden / bench / GPU lanes. |
-| [`docs/spike-results.md`](./docs/spike-results.md) | Phase-1 spike outcome: native NVENC stack builds + initializes on the 610 driver. |
+| [`docs/releasing.md`](./docs/releasing.md) | SemVer/tag scheme + the release-plz flow. |
 
 ## License
 
