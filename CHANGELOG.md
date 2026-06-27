@@ -4,6 +4,13 @@ All notable changes to open-recorder are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+- Added cross-platform support: ordd now builds and runs on macOS and Windows (with a mock capture engine on non-Linux).
+- Changed project identity and repository URLs from 0xfell to grok-insider.
+- Improved path resolution to use the dirs crate, ensuring correct config, cache, state, and video directories on Linux, macOS, and Windows.
+- Fixed build failures on non-Unix platforms by introducing a cross-platform IPC transport layer (TCP loopback on Windows, Unix sockets on Unix).
+
 ## [0.2.2] - 2026-06-25
 
 ### Features
