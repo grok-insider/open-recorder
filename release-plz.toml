@@ -21,8 +21,9 @@
 # Not on crates.io: determine the current version from the `v*` git tag instead
 # of the cargo registry. Implies no `cargo publish`.
 git_only = true
-# Release only when the release PR is merged, not on every master commit.
-release_always = false
+# Release the current workspace version whenever it isn't tagged yet (more robust
+# than the PR-merge-only model, and lets a direct version bump cut a release).
+release_always = true
 # Internal libraries + binaries, not a published crates.io API surface: skip the
 # cargo-semver-checks step (it only applies to published libraries anyway).
 semver_check = false
