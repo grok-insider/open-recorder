@@ -24,7 +24,7 @@ ffmpeg-next = { workspace = true, optional = true }
 # `#[cfg(all(feature = "waycap", target_os = "linux"))]` in lib.rs.
 [target.'cfg(target_os = "linux")'.dependencies]
 crossbeam = { version = "0.8", optional = true }
-waycap-rs = { git = "https://github.com/0xfell/waycap-rs.git", rev = "2e4e317b893a048be90132adb5eec964acb324fe", default-features = false, features = ["nvidia", "egl"], optional = true }
+waycap-rs = { git = "https://github.com/0xfell/waycap-rs.git", rev = "2e4e317b893a048be90132adb5eec964acb324fe", version = "3.0.0", default-features = false, features = ["nvidia", "egl"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
