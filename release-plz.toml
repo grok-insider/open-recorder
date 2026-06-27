@@ -21,6 +21,9 @@
 # Not on crates.io: determine the current version from the `v*` git tag instead
 # of the cargo registry. Implies no `cargo publish`.
 git_only = true
+# Never run `cargo publish` (git_only alone doesn't always disable it). Delivery
+# is the GitHub Release + cachix, never crates.io.
+publish = false
 # Release the current workspace version whenever it isn't tagged yet (more robust
 # than the PR-merge-only model, and lets a direct version bump cut a release).
 release_always = true
@@ -37,6 +40,7 @@ pr_labels = ["release"]
 [[package]]
 name = "ord-cli"
 release = true
+publish = false
 # One workspace-wide tag + release name, e.g. `v0.3.0` (the multi-crate default
 # would be `ord-cli-v0.3.0`).
 git_tag_name = "v{{ version }}"
