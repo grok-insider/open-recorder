@@ -86,8 +86,9 @@ mod imp {
         audio_index: Option<usize>,
         /// Whether the header has been written (waits for the first keyframe).
         started: bool,
-        /// Timestamp (ticks) of the first frame, rebased to 0.
-        base: i64,
+        /// Tick→ms conversion anchored at the first keyframe (set by
+        /// `write_header`; identity until then).
+        rebase: stream::Rebaser,
         video_base_us: i64,
         video_dts: stream::MonotonicMs,
         audio_ts: stream::MonotonicMs,
@@ -119,7 +120,7 @@ mod imp {
                 video_index: 0,
                 audio_index: None,
                 started: false,
-                base: 0,
+                rebase: stream::Rebaser::new(0, params.time_base_den),
                 video_base_us: 0,
                 video_dts: stream::MonotonicMs::new(),
                 audio_ts: stream::MonotonicMs::new(),
@@ -139,13 +140,12 @@ mod imp {
                 self.write_header(frame)?;
             }
 
-            let den = self.params.time_base_den.max(1);
             let payload = bitstream::packet_payload(self.params.codec, &frame.data);
             if payload.is_empty() {
                 return Ok(());
             }
-            let dts = self.video_dts.next((frame.dts - self.base) * 1000 / den);
-            let pts = ((frame.pts - self.base) * 1000 / den).max(dts);
+            let dts = self.video_dts.next(self.rebase.ms(frame.dts));
+            let pts = self.rebase.ms(frame.pts).max(dts);
 
             let mut packet = ff::codec::packet::Packet::copy(&payload);
             packet.set_pts(Some(pts));
@@ -253,9 +253,9 @@ mod imp {
                 self.audio_index = Some(stream::add_audio_stream(&mut self.octx, ap)?);
             }
             self.octx.write_header()?;
-            self.base = first_keyframe.dts.min(first_keyframe.pts);
-            self.video_base_us =
-                crate::ticks_to_micros(self.base, self.params.time_base_den.max(1));
+            let base = first_keyframe.dts.min(first_keyframe.pts);
+            self.rebase = stream::Rebaser::new(base, self.params.time_base_den);
+            self.video_base_us = crate::ticks_to_micros(base, self.params.time_base_den.max(1));
             self.started = true;
             Ok(())
         }

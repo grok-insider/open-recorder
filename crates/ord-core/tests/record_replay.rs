@@ -16,24 +16,8 @@ use ord_core::backend::{
 use ord_core::ring::EncodedFrame;
 use ord_core::Engine;
 
-/// One valid H.264 access unit (Annex-B). Keyframes carry SPS+PPS+IDR so the
-/// muxer can build avcC; deltas are a single non-IDR slice.
-fn access_unit(keyframe: bool) -> Vec<u8> {
-    let sc = [0u8, 0, 0, 1];
-    let mut d = Vec::new();
-    if keyframe {
-        d.extend_from_slice(&sc);
-        d.extend_from_slice(&[0x67, 0x42, 0x00, 0x1f, 0x96, 0x54, 0x05, 0x01]);
-        d.extend_from_slice(&sc);
-        d.extend_from_slice(&[0x68, 0xce, 0x3c, 0x80]);
-        d.extend_from_slice(&sc);
-        d.extend_from_slice(&[0x65, 0x88, 0x84, 0x00, 0x33, 0x44, 0x55]);
-    } else {
-        d.extend_from_slice(&sc);
-        d.extend_from_slice(&[0x41, 0x9a, 0x00, 0x10, 0x20]);
-    }
-    d
-}
+mod common;
+use common::access_unit;
 
 /// A GPU-free backend that emits real, ffmpeg-decodable H.264 access units (the
 /// stock `MockBackend` emits opaque bytes the muxer would reject). Frames are

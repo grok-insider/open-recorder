@@ -65,7 +65,7 @@ pub enum AudioCodec {
     Opus,
 }
 
-const MICROS_PER_SEC: i64 = 1_000_000;
+use crate::MICROS_PER_SEC;
 
 /// A bounded, time-windowed buffer of encoded audio frames, keyed by capture
 /// timestamp (microseconds). Mirrors the video [`RingBuffer`](crate::ring) but
@@ -95,22 +95,11 @@ impl AudioRingBuffer {
     pub fn push(&mut self, frame: EncodedAudioFrame) {
         self.max_ts = self.max_ts.max(frame.timestamp_micros);
         self.bytes += frame.len();
-        if self
-            .frames
-            .back()
-            .map(|b| frame.timestamp_micros >= b.timestamp_micros)
-            .unwrap_or(true)
-        {
-            self.frames.push_back(frame);
-        } else {
-            let pos = self
-                .frames
-                .iter()
-                .position(|f| f.timestamp_micros > frame.timestamp_micros)
-                .unwrap_or(self.frames.len());
-            self.frames.insert(pos, frame);
-        }
-        let cutoff = self.max_ts - self.capacity_micros;
+        crate::order::insert_ts_ordered(&mut self.frames, frame, |f| f.timestamp_micros);
+        self.evict_before(self.max_ts - self.capacity_micros);
+    }
+
+    fn evict_before(&mut self, cutoff: Ticks) {
         while let Some(front) = self.frames.front() {
             if front.timestamp_micros >= cutoff {
                 break;
@@ -148,11 +137,15 @@ impl AudioRingBuffer {
         self.bytes
     }
 
-    /// Change the capacity window to `capacity_seconds`. Takes effect on the
-    /// next push (audio eviction is timestamp-window based, like video).
+    /// Change the capacity window to `capacity_seconds`, evicting immediately
+    /// when shrinking — matching the video ring, so `Engine::set_capacity_seconds`
+    /// keeps its "evicts immediately" promise for both tracks.
     pub fn set_capacity_seconds(&mut self, capacity_seconds: u32) {
         debug_assert!(capacity_seconds >= 1);
         self.capacity_micros = capacity_seconds.max(1) as i64 * MICROS_PER_SEC;
+        if self.max_ts != i64::MIN {
+            self.evict_before(self.max_ts - self.capacity_micros);
+        }
     }
 
     pub fn clear(&mut self) {

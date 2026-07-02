@@ -27,9 +27,10 @@ pub struct EncodedFrame {
     pub data: Bytes,
     /// Whether this frame is a keyframe (IDR). Required for clip selection.
     pub is_keyframe: bool,
-    /// Presentation timestamp, microseconds.
+    /// Presentation timestamp in backend ticks (see [`Ticks`]; the time base
+    /// is whatever the backend declares, e.g. nanoseconds for waycap-rs).
     pub pts: Ticks,
-    /// Decode timestamp, microseconds.
+    /// Decode timestamp, same tick base as `pts`.
     pub dts: Ticks,
 }
 
@@ -99,23 +100,7 @@ impl RingBuffer {
     pub fn push(&mut self, frame: EncodedFrame) {
         self.max_pts = self.max_pts.max(frame.pts);
         self.bytes += frame.len();
-        // Insert keeping the deque ordered by pts (frames usually arrive in
-        // order; this corrects the occasional reorder without dropping frames).
-        if self
-            .frames
-            .back()
-            .map(|b| frame.pts >= b.pts)
-            .unwrap_or(true)
-        {
-            self.frames.push_back(frame);
-        } else {
-            let pos = self
-                .frames
-                .iter()
-                .position(|f| f.pts > frame.pts)
-                .unwrap_or(self.frames.len());
-            self.frames.insert(pos, frame);
-        }
+        crate::order::insert_ts_ordered(&mut self.frames, frame, |f| f.pts);
         self.evict_before(self.max_pts - self.capacity_ticks);
     }
 

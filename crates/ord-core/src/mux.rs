@@ -168,8 +168,7 @@ fn collect_packets(clip: &PreparedClip, with_audio: bool) -> Vec<Pkt> {
     let mut ordered: Vec<&crate::ring::EncodedFrame> = clip.frames.iter().collect();
     ordered.sort_by_key(|f| f.dts);
     let base = ordered.iter().map(|f| f.dts.min(f.pts)).min().unwrap_or(0);
-    let den = clip.params.time_base_den.max(1);
-    let to_ms = |t: i64| -> i64 { (t - base) * 1000 / den };
+    let rebase = stream::Rebaser::new(base, clip.params.time_base_den);
 
     let mut packets: Vec<Pkt> = Vec::with_capacity(ordered.len() + clip.audio.len());
 
@@ -179,8 +178,8 @@ fn collect_packets(clip: &PreparedClip, with_audio: bool) -> Vec<Pkt> {
         if payload.is_empty() {
             continue;
         }
-        let dts = video_dts.next(to_ms(frame.dts));
-        let pts = to_ms(frame.pts).max(dts);
+        let dts = video_dts.next(rebase.ms(frame.dts));
+        let pts = rebase.ms(frame.pts).max(dts);
         packets.push(Pkt::Video {
             dts,
             pts,
@@ -193,7 +192,7 @@ fn collect_packets(clip: &PreparedClip, with_audio: bool) -> Vec<Pkt> {
         // Audio frames carry a microsecond capture timestamp. Rebase by the
         // clip's first video frame (converted to microseconds, 128-bit-safe) so
         // audio and video share t=0, then express in milliseconds.
-        let video_base_us = crate::ticks_to_micros(base, den);
+        let video_base_us = crate::ticks_to_micros(base, clip.params.time_base_den);
         let mut audio: Vec<&crate::audio::EncodedAudioFrame> = clip.audio.iter().collect();
         audio.sort_by_key(|f| f.timestamp_micros);
         let mut audio_ts = stream::MonotonicMs::new();

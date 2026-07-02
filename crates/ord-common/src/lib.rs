@@ -21,7 +21,7 @@ pub use config::{
 };
 pub use frame::{read_frame, write_frame, MAX_FRAME, PROTOCOL_VERSION};
 pub use ipc::{Command, Event, ProtocolError};
-pub use newtypes::{BufferSeconds, ClipDuration, MonitorId};
+pub use newtypes::{BufferSeconds, ClipDuration};
 pub use sync::lock_tolerant;
 
 use std::path::PathBuf;

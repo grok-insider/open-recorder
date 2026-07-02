@@ -28,7 +28,7 @@ pub struct ClipSelection {
 }
 
 impl ClipSelection {
-    /// The covered span in microseconds.
+    /// The covered span in pts ticks (the backend's time base, not a fixed unit).
     pub fn span_ticks(&self) -> Ticks {
         self.end_pts - self.start_pts
     }

@@ -137,21 +137,7 @@ impl DiskFrameStore {
     /// Insert `entry` into the pts-ordered index (append-fast-path, else sorted
     /// insert for the occasional reorder), like the RAM ring.
     fn insert_ordered(&mut self, entry: Entry) {
-        if self
-            .index
-            .back()
-            .map(|b| entry.pts >= b.pts)
-            .unwrap_or(true)
-        {
-            self.index.push_back(entry);
-        } else {
-            let pos = self
-                .index
-                .iter()
-                .position(|e| e.pts > entry.pts)
-                .unwrap_or(self.index.len());
-            self.index.insert(pos, entry);
-        }
+        crate::order::insert_ts_ordered(&mut self.index, entry, |e| e.pts);
     }
 
     fn evict_before(&mut self, cutoff: Ticks) {

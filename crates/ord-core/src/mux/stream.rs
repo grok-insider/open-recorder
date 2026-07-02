@@ -148,6 +148,31 @@ pub(crate) fn set_chapters(
     Ok(())
 }
 
+/// Rebases capture-clock timestamps (ticks at `den`/sec, anchored at `base`)
+/// onto the shared millisecond stream timeline. Both muxers must use this —
+/// hand-rolled `(t - base) * 1000 / den` arithmetic in one of them is exactly
+/// the codec/stream-setup drift AGENTS.md forbids.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Rebaser {
+    base: i64,
+    den: i64,
+}
+
+impl Rebaser {
+    /// Anchor the timeline at `base` ticks with `den` ticks per second.
+    pub(crate) fn new(base: i64, den: i64) -> Self {
+        Self {
+            base,
+            den: den.max(1),
+        }
+    }
+
+    /// Convert `t` ticks to milliseconds on the rebased timeline.
+    pub(crate) fn ms(&self, t: i64) -> i64 {
+        (t - self.base) * 1000 / self.den
+    }
+}
+
 /// Keeps a millisecond timestamp sequence strictly increasing (the muxer
 /// requires monotonic DTS): equal-or-earlier values are bumped 1 ms past the
 /// previous one.
@@ -169,7 +194,7 @@ impl MonotonicMs {
 
 #[cfg(test)]
 mod tests {
-    use super::MonotonicMs;
+    use super::{MonotonicMs, Rebaser};
 
     #[test]
     fn monotonic_bumps_ties_and_regressions() {
@@ -179,5 +204,15 @@ mod tests {
         assert_eq!(m.next(1), 2);
         assert_eq!(m.next(10), 10);
         assert_eq!(m.next(5), 11);
+    }
+
+    #[test]
+    fn rebaser_anchors_and_converts_to_ms() {
+        // Nanosecond base (waycap): 1 s past the anchor is 1000 ms.
+        let r = Rebaser::new(5_000_000_000, 1_000_000_000);
+        assert_eq!(r.ms(5_000_000_000), 0);
+        assert_eq!(r.ms(6_000_000_000), 1000);
+        // A zero den is clamped, never a divide-by-zero.
+        assert_eq!(Rebaser::new(0, 0).ms(7), 7000);
     }
 }

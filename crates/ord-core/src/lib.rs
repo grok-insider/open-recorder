@@ -23,6 +23,7 @@ pub mod clip;
 pub mod disk_store;
 pub mod engine;
 pub mod mux;
+mod order;
 pub mod record;
 pub mod ring;
 pub mod store;
