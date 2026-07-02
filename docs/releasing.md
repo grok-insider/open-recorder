@@ -46,6 +46,14 @@ You do **not** bump the version, edit `CHANGELOG.md`, or tag by hand — a clear
    consumers substitute `open-recorder-X.Y.Z` instead of compiling. Cachix is
    deliberately handled in `ci.yml`, not `release.yml`.
 
+   **Cache lag:** the GitHub Release appears within seconds of the merge, but
+   the `build` job needs ~10–12 minutes to compile and upload the closures. A
+   `nix flake update` + rebuild inside that window compiles the `ord-*`
+   packages locally (harmless, just slow). If you want the substitutes, wait
+   for the master push's `build + cache` job to finish first. The master merge
+   commit and the `vX.Y.Z` tag have identical trees, so either ref hits the
+   same store paths.
+
 The `release-pr` job also has a `workflow_dispatch` handle with a `force` input
 that bypasses the feat/fix filter — useful to kick a release PR on demand.
 

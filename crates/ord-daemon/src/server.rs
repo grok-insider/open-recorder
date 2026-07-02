@@ -597,6 +597,10 @@ fn write_event(stream: &mut Stream, event: &Event) -> io::Result<()> {
 // unix-only (host CI runs on Linux). The cross-platform loopback-TCP transport
 // shares the exact same generic server code; only the `Stream`/`Listener`
 // aliases differ, which the `transport` module covers.
+//
+// Read timeouts in these tests exist to FAIL FAST instead of hanging, not to
+// assert latency — so they are generous (15 s): a loaded CI runner has tripped
+// a 3 s subscriber read (`WouldBlock`) on an otherwise-green run.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -798,12 +802,12 @@ mod tests {
         };
         write_frame(&mut a, &save.encode().unwrap()).unwrap();
         started_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(15))
             .expect("writer should start (clip prepared off-lock)");
 
         // Client B asks for Status while A's write is still blocked. Must return.
         let mut b = UnixStream::connect(&path).unwrap();
-        b.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        b.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
         write_frame(&mut b, &Command::Status.encode().unwrap()).unwrap();
         let resp = read_frame(&mut b).expect("Status must return while a save is writing");
         assert!(matches!(
@@ -813,7 +817,7 @@ mod tests {
 
         // Release the writer; A now gets its ClipSaved.
         let _ = release_tx.send(());
-        a.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
         let saved = Event::decode(&read_frame(&mut a).unwrap()).unwrap();
         assert!(matches!(saved, Event::ClipSaved { .. }));
 
@@ -899,7 +903,7 @@ mod tests {
         );
         assert!(matches!(reply, Event::Config { .. }), "{reply:?}");
 
-        sub.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sub.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
         let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
         let Event::Config { effective, .. } = pushed else {
             panic!("expected pushed Config, got {pushed:?}");
@@ -1006,7 +1010,7 @@ mod tests {
         );
         assert!(matches!(reply, Event::Config { .. }), "{reply:?}");
 
-        sub.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sub.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
         let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
         assert_eq!(pushed, Event::CaptureRestarted);
 
@@ -1043,7 +1047,7 @@ mod tests {
         let reply = request(&mut client, &Command::Mark);
         assert_eq!(reply, Event::Marked { auto_saving: true });
 
-        sub.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sub.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
         let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
         assert!(matches!(pushed, Event::ClipSaved { .. }), "{pushed:?}");
         let _ = std::fs::remove_file(&path);
@@ -1121,7 +1125,7 @@ mod tests {
         let off = request(&mut client, &Command::SetBuffer { enabled: false });
         assert_eq!(off, Event::BufferState { enabled: false });
 
-        sub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sub.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
         loop {
             let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
             if pushed == (Event::BufferState { enabled: true }) {
@@ -1172,7 +1176,7 @@ mod tests {
         write_frame(&mut sub, &Command::Subscribe.encode().unwrap()).unwrap();
         let _snapshot = read_frame(&mut sub).unwrap();
 
-        sub.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        sub.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
         let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
         assert_eq!(pushed, Event::CaptureRestarted);
         let _ = std::fs::remove_file(&path);
