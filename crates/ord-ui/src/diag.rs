@@ -8,6 +8,7 @@
 //!   `UI STALL` with the elapsed time and the last stage — localizing where the
 //!   main thread is stuck even though we can't unwind the hung thread remotely.
 
+use ord_common::lock_tolerant;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -89,7 +90,7 @@ impl Watchdog {
                 let gap = now_ms().saturating_sub(mon.last_beat.load(Ordering::Relaxed));
                 if gap > threshold_ms {
                     if !mon.stalled.swap(true, Ordering::Relaxed) {
-                        let stage = *mon.stage.lock().unwrap();
+                        let stage = *lock_tolerant(&mon.stage);
                         log_line(&format!(
                             "UI STALL: {gap}ms with no frame, last stage='{stage}'"
                         ));
@@ -105,7 +106,7 @@ impl Watchdog {
     /// Record liveness at a named stage. Call frequently from the UI thread.
     pub fn beat(&self, stage: &'static str) {
         self.last_beat.store(now_ms(), Ordering::Relaxed);
-        *self.stage.lock().unwrap() = stage;
+        *lock_tolerant(&self.stage) = stage;
     }
 
     /// Set whether the UI is expected to be rendering. When `false` (the window
