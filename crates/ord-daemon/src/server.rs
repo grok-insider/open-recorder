@@ -48,31 +48,65 @@ pub struct ServerCtx<B: CaptureBackend, S: FrameStore = RingBuffer> {
     pub base: Config,
     pub engine_factory: EngineFactory<B, S>,
     pub write_overrides: OverridesWriter,
-    /// Decodes the newest GOP to a still image (screenshot). Off the hot path.
-    pub shot_writer: ShotWriter,
+    /// Decodes the newest GOP to a still image (screenshot). Off the hot path,
+    /// and behind its own lock so the ~second-long decode never blocks config
+    /// reads (GetConfig, the save flow's clear_on_save) waiting on ctx.
+    pub shot_writer: Arc<Mutex<ShotWriter>>,
     /// Restart capture when the buffer is enabled but no frames arrived for
     /// this long (suspend/resume, output change). `None` disables the watchdog
     /// (tests; the mock emits a finite burst and would otherwise restart
     /// forever).
     pub watchdog: Option<Duration>,
+    /// Probes whether the foreground window looks like a game (auto-arm).
+    /// Injected so the daemon supplies the hyprctl probe and tests a constant —
+    /// the pump thread calls it lock-free, so it may block briefly (the real
+    /// probe has its own hard timeout) without stalling command handling.
+    pub game_probe: Box<dyn Fn() -> bool + Send>,
+}
+
+/// A subscriber: a bounded queue feeding a dedicated writer thread. Broadcasts
+/// only ever `try_send`, so a slow or frozen subscriber (a SIGSTOP'd HUD, a
+/// full pipe) can never block the broadcaster — in particular the capture-drain
+/// pump thread, whose stall re-creates the unbounded-channel OOM this daemon
+/// already fixed once.
+struct Subscriber {
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
 
 /// Shared list of subscriber connections that receive pushed events.
-type Subscribers = Arc<Mutex<Vec<Stream>>>;
+type Subscribers = Arc<Mutex<Vec<Subscriber>>>;
+
+/// Events are tiny (tens of bytes); 64 queued events of headroom means only a
+/// subscriber that has genuinely stopped reading gets dropped.
+const SUBSCRIBER_QUEUE: usize = 64;
 
 // `lock_tolerant` comes from ord-common: a daemon must not die because some
 // other thread panicked while holding a lock — in particular the capture-drain
 // pump must keep running, or memory grows unbounded (the OOM this project
 // already fixed once).
 
-/// Broadcast an event to all live subscribers, dropping any that have closed.
+/// Register a subscriber stream: spawn its writer thread and add its queue.
+fn add_subscriber(subs: &Subscribers, mut stream: Stream) {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(SUBSCRIBER_QUEUE);
+    std::thread::spawn(move || {
+        while let Ok(payload) = rx.recv() {
+            if write_frame(&mut stream, &payload).is_err() {
+                return;
+            }
+        }
+    });
+    lock_tolerant(subs).push(Subscriber { tx });
+}
+
+/// Broadcast an event to all live subscribers, dropping any that have closed
+/// or stopped reading (queue full). Never blocks.
 fn broadcast(subs: &Subscribers, event: &Event) {
     let payload = match event.encode() {
         Ok(p) => p,
         Err(_) => return,
     };
     let mut guard = lock_tolerant(subs);
-    guard.retain_mut(|s| write_frame(s, &payload).is_ok());
+    guard.retain(|s| s.tx.try_send(payload.clone()).is_ok());
 }
 
 /// Server errors.
@@ -106,12 +140,15 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
     listener: Listener,
     handler: Handler<B, S>,
     writer: ClipWriter,
-    ctx: ServerCtx<B, S>,
+    mut ctx: ServerCtx<B, S>,
 ) -> Result<(), ServerError> {
     let handler = Arc::new(Mutex::new(handler));
     let writer = Arc::new(Mutex::new(writer));
     let subs: Subscribers = Arc::new(Mutex::new(Vec::new()));
     let watchdog = ctx.watchdog;
+    // The probe moves onto the pump thread so it never runs under the ctx lock
+    // (the real hyprctl probe can take up to its timeout).
+    let game_probe = std::mem::replace(&mut ctx.game_probe, Box::new(|| false));
     let ctx = Arc::new(Mutex::new(ctx));
 
     // Continuously drain captured frames into the (evicting) ring buffer,
@@ -133,31 +170,61 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
         let subs = Arc::clone(&subs);
         let ctx = Arc::clone(&ctx);
         std::thread::spawn(move || {
+            /// Consecutive not-a-game probes (~3 s apart) before an auto-armed
+            /// buffer is turned back off — about a minute, so alt-tabs and
+            /// loading screens never disarm mid-session.
+            const AUTO_DISARM_PROBES: u32 = 20;
+
             let mut last_frames = Instant::now();
             let mut tick: u64 = 0;
+            // Only arms *we* made are auto-disarmed; a manual arm stays on.
+            let mut auto_armed = false;
+            let mut not_game_probes: u32 = 0;
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 tick = tick.wrapping_add(1);
 
                 // AUTO-ARM (~every 3 s): when configured, start the replay buffer
-                // as soon as a game takes the foreground (Steam app or fullscreen).
-                // The hyprctl probe runs lock-free; we only lock to flip state.
+                // as soon as a game takes the foreground (Steam app or fullscreen),
+                // and stop it again once the game has been gone for a while.
+                // The probe runs lock-free; we only lock to flip state.
                 if tick.is_multiple_of(12) {
                     let auto = {
                         let c = lock_tolerant(&ctx);
                         let cfg = lock_tolerant(&c.config);
                         cfg.capture.auto_arm
                     };
-                    if auto
-                        && !lock_tolerant(&handler).is_buffer_enabled()
-                        && crate::gamedetect::foreground_is_game()
-                    {
-                        let ev =
-                            lock_tolerant(&handler).handle(Command::SetBuffer { enabled: true });
-                        if ev.is_state_change() {
-                            broadcast(&subs, &ev);
+                    if auto {
+                        let enabled = lock_tolerant(&handler).is_buffer_enabled();
+                        let game = game_probe();
+                        if game {
+                            not_game_probes = 0;
+                            if !enabled {
+                                let ev = lock_tolerant(&handler)
+                                    .handle(Command::SetBuffer { enabled: true });
+                                if ev.is_state_change() {
+                                    broadcast(&subs, &ev);
+                                }
+                                auto_armed = true;
+                                last_frames = Instant::now();
+                            }
+                        } else if enabled && auto_armed {
+                            not_game_probes += 1;
+                            if not_game_probes >= AUTO_DISARM_PROBES {
+                                let ev = lock_tolerant(&handler)
+                                    .handle(Command::SetBuffer { enabled: false });
+                                if ev.is_state_change() {
+                                    broadcast(&subs, &ev);
+                                }
+                                auto_armed = false;
+                                not_game_probes = 0;
+                            }
+                        } else {
+                            not_game_probes = 0;
+                            if !enabled {
+                                auto_armed = false;
+                            }
                         }
-                        last_frames = Instant::now();
                     }
                 }
 
@@ -168,6 +235,18 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
                 }
                 let Some(timeout) = watchdog else { continue };
                 if !h.is_buffer_enabled() || last_frames.elapsed() < timeout {
+                    continue;
+                }
+                // Under content-rate capture (VFR) a static screen legitimately
+                // produces no frames, so frame arrival is not a liveness signal:
+                // the watchdog stands down instead of restarting forever.
+                let vfr = {
+                    let c = lock_tolerant(&ctx);
+                    let cfg = lock_tolerant(&c.config);
+                    cfg.capture.framerate_mode == ord_common::config::FramerateMode::Content
+                };
+                if vfr {
+                    last_frames = Instant::now();
                     continue;
                 }
                 tracing::warn!(
@@ -293,10 +372,7 @@ fn handle_connection<B: CaptureBackend, S: FrameStore>(
         if is_subscribe {
             // Register this connection for future pushes and stop reading it
             // for commands (the client now only listens).
-            match stream.try_clone() {
-                Ok(clone) => lock_tolerant(subs).push(clone),
-                Err(e) => return Err(e),
-            }
+            add_subscriber(subs, stream);
             return Ok(());
         }
 
@@ -354,8 +430,8 @@ fn save_flow<B: CaptureBackend, S: FrameStore>(
 }
 
 /// Take a screenshot: select the newest decodable GOP under the handler lock
-/// (cheap), then decode+encode the image off it. The decode runs under the ctx
-/// lock (not the handler lock), so it never starves the capture-drain pump.
+/// (cheap), then decode+encode the image off it, under the shot writer's own
+/// lock — so it starves neither the capture-drain pump nor config readers.
 fn screenshot_flow<B: CaptureBackend, S: FrameStore>(
     handler: &Arc<Mutex<Handler<B, S>>>,
     ctx: &Arc<Mutex<ServerCtx<B, S>>>,
@@ -369,9 +445,13 @@ fn screenshot_flow<B: CaptureBackend, S: FrameStore>(
             message: "nothing buffered yet — is the replay buffer enabled?".into(),
         };
     };
+    let shot = {
+        let c = lock_tolerant(ctx);
+        Arc::clone(&c.shot_writer)
+    };
     let written = {
-        let mut c = lock_tolerant(ctx);
-        (c.shot_writer)(&frames, params)
+        let mut w = lock_tolerant(&shot);
+        w(&frames, params)
     };
     match written {
         Ok(path) => Event::ScreenshotSaved {
@@ -433,43 +513,54 @@ fn apply_config<B: CaptureBackend, S: FrameStore>(
         };
     };
 
-    let mut c = lock_tolerant(ctx);
-    let overrides = match Config::diff_overrides(&c.base, &new) {
-        Ok(o) => o,
-        Err(e) => {
-            return Event::Error {
-                message: format!("could not compute settings overrides: {e}"),
+    // Persist + swap under the ctx lock, and *build* (never start) the
+    // replacement engine there too — construction is cheap. The lock drops
+    // before `engine.start()`: on the real backend a start can block on the
+    // portal picker for seconds, and holding ctx would freeze GetConfig, the
+    // save flow's clear_on_save read, and screenshots for the duration.
+    let (engine, base, resize) = {
+        let mut c = lock_tolerant(ctx);
+        let overrides = match Config::diff_overrides(&c.base, &new) {
+            Ok(o) => o,
+            Err(e) => {
+                return Event::Error {
+                    message: format!("could not compute settings overrides: {e}"),
+                }
             }
-        }
-    };
-    if let Err(e) = (c.write_overrides)(&overrides) {
-        return Event::Error {
-            message: format!("could not persist settings: {e}"),
         };
-    }
+        if let Err(e) = (c.write_overrides)(&overrides) {
+            return Event::Error {
+                message: format!("could not persist settings: {e}"),
+            };
+        }
 
-    let old = lock_tolerant(&c.config).clone();
-    *lock_tolerant(&c.config) = new.clone();
+        let old = lock_tolerant(&c.config).clone();
+        *lock_tolerant(&c.config) = new.clone();
 
-    let capture_restart = old.capture.fps != new.capture.fps
-        || old.capture.quality != new.capture.quality
-        || old.capture.codec != new.capture.codec
-        || old.capture.bitrate_kbps != new.capture.bitrate_kbps
-        || old.capture.resolution != new.capture.resolution
-        || old.capture.keyframe_interval_ms != new.capture.keyframe_interval_ms
-        || old.capture.framerate_mode != new.capture.framerate_mode
-        || old.capture.color_range != new.capture.color_range
-        || old.capture.tune != new.capture.tune
-        || old.capture.replay_storage != new.capture.replay_storage
-        || old.capture.target != new.capture.target
-        || old.capture.hdr != new.capture.hdr
-        || old.audio != new.audio;
-    let resize = old.capture.buffer_seconds != new.capture.buffer_seconds;
+        let capture_restart = old.capture.fps != new.capture.fps
+            || old.capture.quality != new.capture.quality
+            || old.capture.codec != new.capture.codec
+            || old.capture.bitrate_kbps != new.capture.bitrate_kbps
+            || old.capture.resolution != new.capture.resolution
+            || old.capture.keyframe_interval_ms != new.capture.keyframe_interval_ms
+            || old.capture.framerate_mode != new.capture.framerate_mode
+            || old.capture.color_range != new.capture.color_range
+            || old.capture.tune != new.capture.tune
+            || old.capture.replay_storage != new.capture.replay_storage
+            || old.capture.target != new.capture.target
+            || old.capture.hdr != new.capture.hdr
+            || old.audio != new.audio;
+        let resize = old.capture.buffer_seconds != new.capture.buffer_seconds;
+        let engine = capture_restart.then(|| (c.engine_factory)(&new));
+        (engine, c.base.clone(), resize)
+    };
 
-    if capture_restart {
-        let mut engine = (c.engine_factory)(&new);
-        let mut h = lock_tolerant(handler);
-        if h.is_buffer_enabled() {
+    if let Some(mut engine) = engine {
+        // Read the arm state briefly, start the new engine off every lock,
+        // then take the handler lock only for the swap. A SetBuffer racing
+        // this window is reconciled by `replace_engine`, which re-derives
+        // buffer_enabled from the engine it installs.
+        if lock_tolerant(handler).is_buffer_enabled() {
             if let Err(e) = engine.start() {
                 // The old engine keeps running; the persisted overrides will
                 // be retried on the next daemon start.
@@ -478,8 +569,7 @@ fn apply_config<B: CaptureBackend, S: FrameStore>(
                 };
             }
         }
-        h.replace_engine(engine);
-        drop(h);
+        lock_tolerant(handler).replace_engine(engine);
         broadcast(subs, &Event::CaptureRestarted);
     } else if resize {
         lock_tolerant(handler).set_capacity(buffer);
@@ -487,7 +577,7 @@ fn apply_config<B: CaptureBackend, S: FrameStore>(
 
     let event = Event::Config {
         effective: Box::new(new),
-        base: Box::new(c.base.clone()),
+        base: Box::new(base),
     };
     // Config replies are point-to-point, but subscribers (the HUD, an open
     // settings UI) still need to learn that the effective config changed —
@@ -552,10 +642,11 @@ mod tests {
                 )
             }),
             write_overrides: Box::new(|_| Ok(())),
-            shot_writer: Box::new(|_frames, _params| {
+            shot_writer: Arc::new(Mutex::new(Box::new(|_frames, _params| {
                 Ok(PathBuf::from("/tmp/open-recorder/shot.png"))
-            }),
+            }))),
             watchdog: None,
+            game_probe: Box::new(|| false),
         }
     }
 
@@ -1002,6 +1093,67 @@ mod tests {
         );
         assert!(matches!(again, Event::Error { .. }), "{again:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Auto-arm end-to-end: with `capture.auto_arm` on and the (injected) game
+    /// probe reporting a game, a disabled buffer is re-armed by the pump thread
+    /// and the state change reaches subscribers.
+    #[test]
+    fn auto_arm_enables_buffer_when_game_detected() {
+        let path = temp_sock("autoarm");
+        let listener = bind(&path).unwrap();
+        let mut ctx = mock_ctx();
+        {
+            let mut cfg = lock_tolerant(&ctx.config);
+            cfg.capture.auto_arm = true;
+        }
+        ctx.game_probe = Box::new(|| true);
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, mock_handler(), mock_writer(), ctx);
+        });
+
+        let mut sub = UnixStream::connect(&path).unwrap();
+        write_frame(&mut sub, &Command::Subscribe.encode().unwrap()).unwrap();
+        let _snapshot = read_frame(&mut sub).unwrap();
+
+        // Disarm; the probe (every ~3 s of pump ticks) should re-arm.
+        let mut client = UnixStream::connect(&path).unwrap();
+        let off = request(&mut client, &Command::SetBuffer { enabled: false });
+        assert_eq!(off, Event::BufferState { enabled: false });
+
+        sub.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        loop {
+            let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
+            if pushed == (Event::BufferState { enabled: true }) {
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression: a subscriber that stops reading (SIGSTOP'd HUD, frozen pipe)
+    /// must never block `broadcast` — the pump/watchdog thread calls it, and a
+    /// blocked pump re-creates the unbounded-channel OOM. A full queue drops
+    /// the subscriber instead.
+    #[test]
+    fn broadcast_never_blocks_on_a_stuck_subscriber() {
+        let subs: Subscribers = Arc::new(Mutex::new(Vec::new()));
+        // A queue nobody drains simulates a wedged writer thread.
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        lock_tolerant(&subs).push(Subscriber { tx });
+
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            broadcast(&subs, &Event::CaptureRestarted);
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "broadcast must not block on a full subscriber queue"
+        );
+        assert!(
+            lock_tolerant(&subs).is_empty(),
+            "a subscriber that stopped reading must be dropped"
+        );
     }
 
     #[test]

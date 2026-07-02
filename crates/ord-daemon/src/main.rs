@@ -162,40 +162,56 @@ fn epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Make `path` collision-free: the default template has 1-second granularity,
+/// so a mark auto-save racing a manual save in the same second would silently
+/// overwrite. Appends `-1`, `-2`, … to the stem until the name is unused.
+fn unique_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+    let stem = path.file_stem().unwrap_or_default().to_os_string();
+    let ext = path.extension().map(|e| e.to_os_string());
+    for n in 1u32.. {
+        let mut name = stem.clone();
+        name.push(format!("-{n}"));
+        let mut candidate = path.with_file_name(name);
+        if let Some(ext) = &ext {
+            candidate.set_extension(ext);
+        }
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path
+}
+
 /// Resolve a new output path from the storage template, creating parent dirs.
 /// Recordings go to the (optionally separate) recordings directory; replay clips
 /// go to the clips directory.
 fn output_path(cfg: &Config, kind: ClipKind) -> PathBuf {
-    let game = ord_daemon::detect_foreground();
-    let stem = ord_daemon::clip_stem(game.as_deref());
-    let name = storage::render_name(&cfg.storage.template, Some(&stem), kind, epoch_secs());
     let dir = match kind {
         ClipKind::Recording => recordings_dir(cfg),
         ClipKind::Clip => clips_dir(cfg),
     };
-    let path = dir.join(name).with_extension("mkv");
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    path
+    templated_path(cfg, kind, dir, "mkv")
 }
 
 /// Resolve a screenshot output path (`.png`) in the clips directory.
 #[cfg(feature = "mux")]
 fn screenshot_path(cfg: &Config) -> PathBuf {
+    templated_path(cfg, ClipKind::Clip, clips_dir(cfg), "png")
+}
+
+/// Shared stem/render/mkdir logic behind [`output_path`] / [`screenshot_path`].
+fn templated_path(cfg: &Config, kind: ClipKind, dir: PathBuf, ext: &str) -> PathBuf {
     let game = ord_daemon::detect_foreground();
     let stem = ord_daemon::clip_stem(game.as_deref());
-    let name = storage::render_name(
-        &cfg.storage.template,
-        Some(&stem),
-        ClipKind::Clip,
-        epoch_secs(),
-    );
-    let path = clips_dir(cfg).join(name).with_extension("png");
+    let name = storage::render_name(&cfg.storage.template, Some(&stem), kind, epoch_secs());
+    let path = dir.join(name).with_extension(ext);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    path
+    unique_path(path)
 }
 
 /// Decode the newest GOP to a PNG: mux the GOP to a temp file, then have ffmpeg
@@ -255,18 +271,32 @@ fn make_record_path(config: Arc<Mutex<Config>>) -> ord_daemon::RecordPath {
     })
 }
 
+/// Files younger than this are never pruned: a full-length recording that is
+/// still being written has a fresh mtime, and deleting it out from under the
+/// muxer corrupts it.
+const PRUNE_GRACE_SECS: u64 = 300;
+
 /// Apply the storage prune policy after a save (off the handler lock; deleting
-/// a few files is cheap but still doesn't belong on the capture path).
+/// a few files is cheap but still doesn't belong on the capture path). Covers
+/// both the clips and the (optionally separate) recordings directory under one
+/// size budget.
 fn prune_library(cfg: &Config) {
     if cfg.storage.max_gib.is_none() && cfg.storage.max_age_days.is_none() {
         return;
     }
-    let dir = clips_dir(cfg);
+    let clips = clips_dir(cfg);
+    let recs = recordings_dir(cfg);
+    let mut candidates = storage::prune_candidates(&clips);
+    if recs != clips {
+        candidates.extend(storage::prune_candidates(&recs));
+    }
+    let now = epoch_secs();
+    candidates.retain(|e| e.mtime_epoch.saturating_add(PRUNE_GRACE_SECS) < now);
     let doomed = storage::plan_prune(
-        storage::prune_candidates(&dir),
+        candidates,
         cfg.storage.max_gib,
         cfg.storage.max_age_days,
-        epoch_secs(),
+        now,
     );
     for path in doomed {
         match std::fs::remove_file(&path) {
@@ -401,8 +431,9 @@ fn make_engine(config: &Config) -> Engine<ord_core::MockBackend, Box<dyn FrameSt
     Engine::with_store(backend, make_store(config, ticks), buffer)
 }
 
-/// Persist the overrides document atomically-ish; an empty diff removes the
-/// file so the base config is authoritative again.
+/// Persist the overrides document atomically (write a sibling temp file, then
+/// rename over the target — a crash mid-write can never leave truncated TOML);
+/// an empty diff removes the file so the base config is authoritative again.
 fn write_overrides_file(contents: &str) -> Result<(), String> {
     let path = ord_common::overrides_path();
     if contents.is_empty() {
@@ -415,7 +446,9 @@ fn write_overrides_file(contents: &str) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&path, contents).map_err(|e| e.to_string())
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, contents).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())
     }
 }
 
@@ -458,10 +491,11 @@ fn main() {
         base,
         engine_factory: Box::new(make_engine),
         write_overrides: Box::new(write_overrides_file),
-        shot_writer: make_shot_writer(Arc::clone(&shared_config)),
+        shot_writer: Arc::new(Mutex::new(make_shot_writer(Arc::clone(&shared_config)))),
         // No frames for 5 s while the buffer is armed -> restart capture
         // (suspend/resume kills NVENC; monitor changes end the portal session).
         watchdog: Some(std::time::Duration::from_secs(5)),
+        game_probe: Box::new(ord_daemon::foreground_is_game),
     };
 
     tracing::info!(socket = %path.display(), "ordd listening");

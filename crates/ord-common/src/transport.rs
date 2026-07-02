@@ -40,8 +40,12 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
 
 /// Bind the daemon [`Listener`] for the control-socket `path`.
 ///
-/// On non-unix targets this also publishes the chosen loopback port in a
-/// rendezvous file at `path`, so [`connect`] can find the running daemon.
+/// Stale-file recovery is the *caller's* job (the daemon's `bind` probes the
+/// path with [`connect`] and unlinks it if nothing answers) — this seam only
+/// binds. On non-unix targets this also publishes the chosen loopback port in
+/// a rendezvous file at `path` (written atomically via a sibling temp file +
+/// rename, so a crash mid-write can never leave a half-written port for a
+/// client to dial).
 #[cfg(unix)]
 pub fn bind(path: &Path) -> io::Result<Listener> {
     Listener::bind(path)
@@ -51,7 +55,9 @@ pub fn bind(path: &Path) -> io::Result<Listener> {
 pub fn bind(path: &Path) -> io::Result<Listener> {
     let listener = Listener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
-    std::fs::write(path, port.to_string())?;
+    let tmp = path.with_extension("port.tmp");
+    std::fs::write(&tmp, port.to_string())?;
+    std::fs::rename(&tmp, path)?;
     Ok(listener)
 }
 

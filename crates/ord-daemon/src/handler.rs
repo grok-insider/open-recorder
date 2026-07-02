@@ -135,11 +135,11 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
 
     /// Drain pending frames and select the last `duration` into a [`PreparedClip`],
     /// ready for the server to write off-lock. The request is clamped to the
-    /// configured buffer length (you can never save more than is buffered); the
-    /// clamped duration is returned so the caller can report it accurately. On
-    /// failure returns the user-facing [`Event::Error`] to send back. Runs under
-    /// the handler lock, but only does the cheap selection + refcount-clone (no
-    /// ffmpeg, no disk, no subprocess).
+    /// configured buffer length *and* to what is actually buffered, so a save
+    /// right after arming reports the real clip length instead of the capacity.
+    /// On failure returns the user-facing [`Event::Error`] to send back. Runs
+    /// under the handler lock, but only does the cheap selection +
+    /// refcount-clone (no ffmpeg, no disk, no subprocess).
     pub fn prepare_save(
         &mut self,
         duration: ClipDuration,
@@ -154,7 +154,9 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
                 message: "no keyframe available to start a decodable clip".into(),
             },
         })?;
-        Ok((clip, clamped))
+        let buffered = self.engine.buffered_seconds().max(1);
+        let reported = ClipDuration::new(clamped.get().min(buffered)).unwrap_or(clamped);
+        Ok((clip, reported))
     }
 
     fn handle_toggle_record(&mut self) -> Event {
@@ -237,11 +239,12 @@ mod tests {
     }
 
     #[test]
-    fn prepare_save_clamps_to_buffer() {
-        // Buffer holds 60s; requesting 120s must clamp the reported duration to 60.
+    fn prepare_save_clamps_to_what_is_buffered() {
+        // Capacity is 60 s but only ~10 s were captured; requesting 120 s must
+        // report the *actual* clip length, not the configured capacity.
         let mut h = handler_with(60, 600, 60, 60);
         let (_clip, dur) = h.prepare_save(cd(120)).expect("clip prepared");
-        assert_eq!(dur.get(), 60);
+        assert!((9..=10).contains(&dur.get()), "reported {}", dur.get());
     }
 
     #[test]

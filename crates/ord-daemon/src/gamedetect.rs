@@ -35,18 +35,59 @@ pub fn clip_stem(game: Option<&str>) -> String {
     game.and_then(slugify).unwrap_or_else(|| "clip".to_string())
 }
 
+/// How long a `hyprctl` probe may run before it is killed. The probe is called
+/// from the daemon's pump thread; a compositor that stops responding (plausible
+/// mid-game-crash) must never suspend frame draining indefinitely.
+#[cfg(target_os = "linux")]
+const HYPRCTL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run `hyprctl activewindow -j` with a hard timeout, killing the child if it
+/// hangs. Returns the JSON text on success, `None` on any failure or timeout.
+#[cfg(target_os = "linux")]
+fn hyprctl_activewindow_json() -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let mut child = Command::new("hyprctl")
+        .args(["activewindow", "-j"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    let deadline = Instant::now() + HYPRCTL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let text = rx
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .ok()?;
+                return status.success().then_some(text);
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Detect the current foreground app name on Hyprland via `hyprctl activewindow`.
 /// Returns `None` on any failure (this is best-effort cosmetics, never fatal).
 #[cfg(target_os = "linux")]
 pub fn detect_foreground() -> Option<String> {
-    let out = std::process::Command::new("hyprctl")
-        .args(["activewindow", "-j"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
+    let text = hyprctl_activewindow_json()?;
     // Avoid a JSON dep: pull the fields with a tiny scan.
     pick_name(
         extract_json_string_field(&text, "class"),
@@ -66,16 +107,7 @@ pub fn is_game_window(class: Option<&str>, fullscreen: bool) -> bool {
 /// `capture.auto_arm`). Best-effort: any failure returns `false`.
 #[cfg(target_os = "linux")]
 pub fn foreground_is_game() -> bool {
-    let Ok(out) = std::process::Command::new("hyprctl")
-        .args(["activewindow", "-j"])
-        .output()
-    else {
-        return false;
-    };
-    if !out.status.success() {
-        return false;
-    }
-    let Ok(text) = String::from_utf8(out.stdout) else {
+    let Some(text) = hyprctl_activewindow_json() else {
         return false;
     };
     let class = extract_json_string_field(&text, "class");
