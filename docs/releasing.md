@@ -39,19 +39,43 @@ Commit](https://www.conventionalcommits.org) drives all three.
    consumers substitute `open-recorder-X.Y.Z` instead of compiling. Cachix is
    deliberately handled in `ci.yml`, not `release.yml`.
 
-Nothing is published to crates.io (`git_only = true`).
+Nothing is published to crates.io (`git_only = true`, and every manifest
+carries `publish = false` via `[workspace.package]`).
 
 The pipeline is live: the repo's *"Allow GitHub Actions to create and approve
 pull requests"* setting is enabled, and release-plz cut **v0.3.0** through it
-(release PRs #2/#3). The `CACHIX_AUTH_TOKEN` secret and the `v*` tags exist,
-so each next bump is computed automatically.
+(release PRs #2/#3). The `CACHIX_AUTH_TOKEN` secret and the `v*` tags exist.
 
 **AI-changelog enrichment.** After release-plz opens/updates the release PR,
 `release.yml` runs `grok-insider/release-changelog-action`, which rewrites that
 PR's `CHANGELOG.md` entry with user-facing, AI-written notes (overwriting the
-git-cliff baseline) and commits it back to the PR branch. Humans still never
-hand-edit `CHANGELOG.md` — the raw Conventional Commits and this action produce
-it together.
+git-cliff baseline) and commits it back to the PR branch.
+
+## Manual release PR (current procedure)
+
+`release-plz release-pr` is **broken upstream for this workspace**
+(release-plz/release-plz#2651-adjacent): in git-only mode it reconstructs the
+last tag's worktree and runs `cargo package` on it, which tries to resolve the
+git-pinned `waycap-rs` fork against crates.io (`^3.0.0` does not exist there)
+and fails. The `release-plz-pr` job in `release.yml` is therefore
+`continue-on-error`, and release PRs are opened by hand until the upstream
+source-diff fallback lands. The **release step is unaffected**:
+`release-plz release` only checks the current workspace version against the
+`v*` tags and cuts the tag + GitHub Release (proven by v0.3.0 and v0.4.0).
+
+To cut a release:
+
+1. Branch from master, bump `[workspace.package].version` in the root
+   `Cargo.toml` (Conventional-Commits semantics: `feat!`/`BREAKING CHANGE` →
+   minor while 0.x, `feat` → minor, `fix` → patch).
+2. `cargo update --workspace` to refresh `Cargo.lock`.
+3. Add the `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md` (Keep a
+   Changelog form, summarized from the Conventional Commits since the last
+   tag). This is the one sanctioned hand-edit of the changelog.
+4. Open the PR titled `chore: release vX.Y.Z`, let CI pass, merge.
+5. The master push runs `release-plz release`: tag + GitHub Release; the
+   `upload-ord`/`upload-appimages` jobs attach the binaries and ci.yml's
+   `build` job pushes the closures to cachix.
 
 ## How a consumer updates
 

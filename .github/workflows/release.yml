@@ -28,9 +28,19 @@ permissions:
 jobs:
   # Keep the release PR up to date on every push. Merging that PR is what later
   # triggers the `release` job (via the resulting push to master).
+  #
+  # KNOWN-BROKEN upstream (release-plz/release-plz#2651 + the git-only
+  # packaging flow): `release-plz release-pr` reconstructs the last tag's
+  # worktree and runs `cargo package` on it, which cannot resolve the
+  # git-pinned waycap-rs fork against crates.io. Until upstream lands the
+  # source-diff fallback, this job is continue-on-error and release PRs are
+  # opened MANUALLY (see docs/releasing.md "Manual release PR"). The
+  # `release-plz-release` job below is unaffected — it only tags + creates the
+  # GitHub Release, which is why manual release PRs still cut releases.
   release-plz-pr:
     name: release-plz PR
     if: github.repository_owner == 'grok-insider'
+    continue-on-error: true
     runs-on: ubuntu-latest
     permissions:
       contents: write

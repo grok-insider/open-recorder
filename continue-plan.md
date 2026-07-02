@@ -118,6 +118,13 @@ lane runs on every master push. Outstanding:
 - [ ] Validate the **AppImages** (`ordd`/`ord-hud`/`ord-ui`) on **non-NixOS
       NVIDIA** hardware — ordd first; `ord-ui`'s GL path is the known hazard
       (foreign-distro driver resolution via the flake `postFixup`).
+- [ ] Re-automate release PRs once release-plz's git-only mode stops running
+      `cargo package` against the previous tag's worktree (upstream
+      release-plz/release-plz#2651 + the source-diff-fallback discussion) —
+      the git-pinned waycap-rs fork can never resolve on crates.io, so the
+      `release-plz-pr` job is `continue-on-error` and release PRs are manual
+      (procedure in `docs/releasing.md`). Watch upstream; when fixed, drop
+      `continue-on-error` and the manual procedure.
 
 ## 8. Cross-platform Phase 1 🟡
 
