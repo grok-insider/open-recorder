@@ -4,6 +4,10 @@ All notable changes to open-recorder are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-07-02
+
+- Internal improvements and maintenance
+
 ## [0.4.0] - 2026-07-02
 
 The full-codebase audit round. **Breaking:** the IPC protocol bumped 4 → 5
