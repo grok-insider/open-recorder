@@ -369,6 +369,17 @@ pub fn build_plan(
 
     let hardware = profile.hardware && use_hardware;
 
+    // Explicit stream selection: first video track, and (unless muted) the
+    // first audio track if one exists — deterministic instead of ffmpeg's
+    // "best stream" default, which would silently pick a different track on
+    // multi-track sources.
+    args.push("-map".into());
+    args.push("0:v:0".into());
+    if !profile.mute {
+        args.push("-map".into());
+        args.push("0:a:0?".into());
+    }
+
     if !profile.reencodes() {
         // Stream copy: instant, lossless remux.
         if profile.mute {
@@ -378,6 +389,15 @@ pub fn build_plan(
         } else {
             args.push("-c".into());
             args.push("copy".into());
+            if profile.container == Container::Mp4
+                && src.audio_codec.as_deref() == Some("opus")
+                && src.has_audio
+            {
+                // MP4 treats Opus as experimental; without this the muxer
+                // rejects the copied track outright.
+                args.push("-strict".into());
+                args.push("-2".into());
+            }
         }
         if profile.container == Container::Mp4 {
             args.push("-movflags".into());
@@ -437,6 +457,12 @@ pub fn build_plan(
 ///
 /// Segments must be ascending and non-overlapping. Only video outputs are
 /// supported; pick a re-encoding preset (stream copy cannot join cuts).
+///
+/// Single-audio-track assumption: the filter graph hardwires `[0:a]` (the
+/// first audio stream), so on a multi-track source (daemon roadmap:
+/// `audio.tracks`) only track 0 survives the concat. Extending this to
+/// per-track `atrim`/`concat` chains is required before multi-track clips
+/// export losslessly.
 pub fn build_segments_plan(
     input: &str,
     output: &str,
@@ -949,6 +975,56 @@ mod tests {
         let plan = build_segments_plan("in.mkv", "o.mp4", &p, &src(), &segs(), false).unwrap();
         assert_eq!(plan.encoder, "libsvtav1");
         assert!(!plan.uses_hardware);
+    }
+
+    #[test]
+    fn plan_maps_first_video_and_audio_streams_explicitly() {
+        let plan = build_plan(
+            "in.mkv",
+            "o.mp4",
+            &ExportProfile::high_quality(),
+            &src(),
+            None,
+            true,
+        )
+        .unwrap();
+        let s = joined(&plan);
+        assert!(s.contains("-map 0:v:0"), "{s}");
+        assert!(s.contains("-map 0:a:0?"), "{s}");
+
+        let mut muted = ExportProfile::high_quality();
+        muted.mute = true;
+        let plan = build_plan("in.mkv", "o.mp4", &muted, &src(), None, true).unwrap();
+        let s = joined(&plan);
+        assert!(s.contains("-map 0:v:0"), "{s}");
+        assert!(!s.contains("0:a:0"), "{s}");
+    }
+
+    #[test]
+    fn opus_copy_into_mp4_relaxes_strictness() {
+        let p = ExportProfile::source(Container::Mp4);
+        let plan = build_plan("in.mkv", "o.mp4", &p, &src(), None, true).unwrap();
+        let s = joined(&plan);
+        assert!(s.contains("-c copy"), "{s}");
+        assert!(s.contains("-strict -2"), "{s}");
+    }
+
+    #[test]
+    fn non_opus_or_non_mp4_copy_needs_no_strict() {
+        let mut aac_src = src();
+        aac_src.audio_codec = Some("aac".into());
+        let mp4 = ExportProfile::source(Container::Mp4);
+        let plan = build_plan("in.mkv", "o.mp4", &mp4, &aac_src, None, true).unwrap();
+        assert!(!joined(&plan).contains("-strict"));
+
+        let mkv = ExportProfile::source(Container::Mkv);
+        let plan = build_plan("in.mkv", "o.mkv", &mkv, &src(), None, true).unwrap();
+        assert!(!joined(&plan).contains("-strict"));
+
+        let mut muted = ExportProfile::source(Container::Mp4);
+        muted.mute = true;
+        let plan = build_plan("in.mkv", "o.mp4", &muted, &src(), None, true).unwrap();
+        assert!(!joined(&plan).contains("-strict"));
     }
 
     #[test]

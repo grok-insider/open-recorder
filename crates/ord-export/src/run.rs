@@ -9,7 +9,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::plan::{build_plan, build_segments_plan, FfmpegPlan, Trim};
 use crate::probe::probe;
@@ -125,9 +126,14 @@ fn execute(
             Err(ExportError::Cancelled) => return Err(ExportError::Cancelled),
             Err(e) => {
                 // Retry in software only if the failed attempt actually used the
-                // GPU for a re-encode; a copy or already-software run has nothing
-                // to gain.
-                if plan.uses_hardware && profile.reencodes() {
+                // GPU for a re-encode AND the failure looks like a hardware-encoder
+                // problem; a disk-full or bad-path error would fail identically in
+                // software, so re-encoding the whole clip first just wastes time.
+                let hw_failure = matches!(
+                    &e,
+                    ExportError::Ffmpeg { stderr_tail, .. } if is_hw_encoder_failure(stderr_tail)
+                );
+                if plan.uses_hardware && profile.reencodes() && hw_failure {
                     let sw = build(false)?;
                     run_ffmpeg(&sw.args, duration, on_progress, cancel)?;
                     (sw.encoder, sw.uses_hardware)
@@ -159,12 +165,36 @@ fn execute(
     })
 }
 
+/// Whether an ffmpeg stderr tail points at a hardware-encoder (NVENC/CUDA)
+/// failure worth retrying in software. Signatures cover the real NVENC failure
+/// modes: missing driver libraries, no capable GPU, exhausted encode sessions,
+/// driver/API version mismatches, CUDA device/context errors, and unsupported
+/// encoder features (e.g. `b_ref_mode` on older GPUs). Anything else — disk
+/// full, bad paths, corrupt input — fails identically in software.
+fn is_hw_encoder_failure(stderr_tail: &str) -> bool {
+    const SIGNATURES: &[&str] = &[
+        "nvenc",
+        "cuda",
+        "cannot load libnvidia-encode",
+        "no capable devices",
+        "device creation failed",
+        "hwaccel",
+        "b_ref_mode",
+        "openencodesessionex",
+        "nvml",
+        "no nvidia devices",
+    ];
+    let lower = stderr_tail.to_ascii_lowercase();
+    SIGNATURES.iter().any(|s| lower.contains(s))
+}
+
 /// Run ffmpeg with `args`, streaming progress and honoring cancellation.
 ///
-/// Prepends `-progress pipe:1 -nostats`, reads the progress stream from stdout
-/// (computing a fraction from `out_time_us` / `duration`), drains stderr on a
-/// side thread to avoid a pipe-full deadlock, and kills the child if `cancel`
-/// trips.
+/// Prepends `-progress pipe:1 -nostats` and parses the progress stream from
+/// stdout on a dedicated thread (fraction = `out_time_us` / `duration`), so the
+/// wait loop can poll `cancel` every ~100ms and kill a wedged child even when
+/// no progress lines flow. Stderr is drained on its own thread to avoid a
+/// pipe-full deadlock.
 fn run_ffmpeg(
     args: &[String],
     duration: f64,
@@ -190,20 +220,48 @@ fn run_ffmpeg(
         s
     });
 
+    // Parse progress on its own thread; the channel disconnects when the pipe
+    // closes. Never joined: the pipe can outlive a killed child (inherited by
+    // an orphaned grandchild), and a blocked read must not wedge the export.
+    let (progress_tx, progress_rx) = mpsc::channel::<i64>();
+    let _progress_thread = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if let Some(us) = line.strip_prefix("out_time_us=") {
+                if let Ok(us) = us.trim().parse::<i64>() {
+                    if progress_tx.send(us).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
     let mut cancelled = false;
-    for line in BufReader::new(stdout).lines() {
-        let Ok(line) = line else { break };
-        if cancel.load(Ordering::Relaxed) {
+    let mut exit_seen: Option<Instant> = None;
+    loop {
+        if cancel.load(Ordering::Relaxed) && !cancelled {
             let _ = child.kill();
             cancelled = true;
-            break;
         }
-        if let Some(us) = line.strip_prefix("out_time_us=") {
-            if duration > 0.0 {
-                if let Ok(us) = us.trim().parse::<i64>() {
+        match progress_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(us) => {
+                if !cancelled && duration > 0.0 {
                     on_progress((us as f64 / 1_000_000.0 / duration).clamp(0.0, 1.0));
                 }
             }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Disconnection alone can't end the loop: the stdout pipe may
+                // stay open past the child's death. Child exit ends it too,
+                // after a short grace so in-flight progress still lands.
+                if exit_seen.is_none() && matches!(child.try_wait(), Ok(Some(_))) {
+                    exit_seen = Some(Instant::now());
+                }
+                if exit_seen.is_some_and(|t| t.elapsed() > Duration::from_millis(300)) {
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -219,11 +277,13 @@ fn run_ffmpeg(
             Err(e) => return Err(ExportError::Spawn(e.to_string())),
         }
     };
-    let stderr = stderr_thread.join().unwrap_or_default();
 
     if cancelled {
+        // Skip the stderr join: an orphan holding the pipe would block it, and
+        // a cancellation needs no diagnostics.
         return Err(ExportError::Cancelled);
     }
+    let stderr = stderr_thread.join().unwrap_or_default();
     if status.success() {
         on_progress(1.0);
         return Ok(());
@@ -273,5 +333,36 @@ mod tests {
     #[test]
     fn stderr_tail_trims_and_keeps_short_input() {
         assert_eq!(stderr_tail("  boom\n\n"), "  boom");
+    }
+
+    #[test]
+    fn hw_encoder_failures_match() {
+        for tail in [
+            "[av1_nvenc @ 0x5602] OpenEncodeSessionEx failed: out of memory (10): (no details)",
+            "Cannot load libnvidia-encode.so.1",
+            "[h264_nvenc @ 0x55aa] No capable devices found",
+            "Device creation failed: -542398533.",
+            "[AVHWDeviceContext @ 0x56] Could not initialize the CUDA driver API",
+            "Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height. hwaccel initialisation returned error.",
+            "[hevc_nvenc @ 0x55] B frames as references are not supported. b_ref_mode 2 is not supported.",
+            "The minimum required Nvidia driver for nvenc is 570.0 or newer",
+            "driver does not support the required nvenc API version. Required: 13.0 Found: 12.2",
+        ] {
+            assert!(is_hw_encoder_failure(tail), "should match: {tail}");
+        }
+    }
+
+    #[test]
+    fn non_encoder_failures_do_not_match() {
+        for tail in [
+            "av_interleaved_write_frame(): No space left on device",
+            "out/clip.mp4: Permission denied",
+            "in.mkv: No such file or directory",
+            "Invalid data found when processing input",
+            "Error writing trailer of out.mp4: I/O error",
+            "",
+        ] {
+            assert!(!is_hw_encoder_failure(tail), "should not match: {tail}");
+        }
     }
 }

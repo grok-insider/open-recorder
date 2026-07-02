@@ -140,9 +140,6 @@ impl ExportProfile {
         }
     }
 
-    /// X (Twitter)-friendly: H.264 High in MP4, capped 1080p, source fps, at a
-    /// quality that keeps clips comfortably uploadable. H.264 because X re-encodes
-    /// and AV1/HEVC uploads play back unreliably there.
     /// Vertical 9:16 for TikTok / Shorts / Reels: center-crop + 1080×1920,
     /// H.264 (every mobile platform ingests it) at a quality good enough for
     /// the re-encode those platforms apply anyway.
@@ -161,6 +158,9 @@ impl ExportProfile {
         }
     }
 
+    /// X (Twitter)-friendly: H.264 High in MP4, capped 1080p, source fps, at a
+    /// quality that keeps clips comfortably uploadable. H.264 because X re-encodes
+    /// and AV1/HEVC uploads play back unreliably there.
     pub fn x_twitter() -> Self {
         Self {
             codec: ExportCodec::H264,
