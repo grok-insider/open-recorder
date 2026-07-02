@@ -159,77 +159,94 @@ explicit ask.
 ## Code-audit backlog (2026-07-02)
 
 From a full-workspace audit. Grouped by concern; file:line refs are as of the
-audit.
+audit. **Same-day working session (2026-07-02) closed most of this backlog** —
+checked items landed on `docs/readme-refresh` (see `git log` for the
+`fix(daemon)`/`fix(core)`/`fix(export)`/`feat(cli)!`/`feat(ui)`/`refactor(core)`
+commits); only the unchecked items remain open.
 
 ### Reliability
 
-- [ ] Non-blocking subscriber broadcast (`server.rs:69`) — the pump thread must
-      never block on a slow subscriber.
-- [ ] Bound `Recorder::pending_audio` post-start (`record.rs:159`).
-- [ ] Async/timeboxed disk compaction + injectable threshold
-      (`disk_store.rs:139`; contract in `store.rs:34`).
-- [ ] Drop-until-next-keyframe on forwarder overflow (`waycap_backend.rs:314`).
-- [ ] `apply_config` engine start outside the handler/ctx locks (`server.rs:436`).
-- [ ] `hyprctl` timeout + injectable game probe (`server.rs:153`).
-- [ ] VFR watchdog gate (`framerate_mode = content` must not trip the no-frames
-      watchdog on a static screen).
-- [ ] Atomic overrides write (ordd `main.rs:406`).
-- [ ] Collision-proof `output_path` (same-second saves must not overwrite).
-- [ ] Prune the recordings dir (recordings are exempt today by policy — decide
-      and enforce deliberately).
-- [ ] Transport stale-socket/port-file hygiene (`transport.rs:46`).
-- [ ] Surface disk write-failure counters into `Status`.
+- [x] Non-blocking subscriber broadcast (`server.rs:69`) — bounded per-subscriber
+      queue + writer thread; a stuck subscriber is dropped, never blocks the pump.
+- [x] Bound `Recorder::pending_audio` post-start (`record.rs:159`) + stall test.
+- [x] Incremental disk compaction (bounded per-push budget) + injectable
+      threshold + tests (`disk_store.rs`).
+- [x] Drop-until-next-keyframe on forwarder overflow (`waycap_backend.rs:314`);
+      audio drops now counted/logged too.
+- [x] `apply_config` engine start outside the handler/ctx locks; screenshots
+      decode under their own lock.
+- [x] `hyprctl` hard timeout (kill after 2 s) + injectable `game_probe` in
+      `ServerCtx`; auto-arm gained auto-disarm (~1 min after the game exits).
+- [x] VFR watchdog gate (`framerate_mode = content` stands the watchdog down).
+- [x] Atomic overrides write (temp + rename).
+- [x] Collision-proof `output_path` (`-1`/`-2` suffixes).
+- [x] Prune covers the recordings dir (shared budget, 5 min fresh-file grace).
+- [x] Transport hygiene: atomic port-file write; stale-socket ownership
+      documented on the seam.
+- [ ] Surface disk write-failure counters into `Status` — the counter exists
+      (`DiskFrameStore::write_errors()`), the `Status` event field does not yet
+      (fold into the next protocol bump; v5 just shipped).
 
 ### Performance
 
-- [ ] Coalesced `DiskFrameStore::window` reads (one positioned read per span,
-      not per frame).
-- [ ] Back-scan out-of-order inserts (ring/disk/audio) instead of front scans.
-- [ ] `Packet::borrow` instead of `Packet::copy` on the save path.
+- [x] Coalesced `DiskFrameStore::window` reads (adjacent payloads read once,
+      zero-copy `Bytes` slices out).
+- [x] Back-scan out-of-order inserts — one shared `order::insert_ts_ordered`
+      for ring/disk/audio.
+- [ ] `Packet::borrow` instead of `Packet::copy` on the save path (needs an
+      ffmpeg-next lifetime investigation).
 - [ ] µs stream time base instead of ms (precision on long buffers).
-- [ ] Incremental library refresh (`app.rs:378`).
-- [ ] `filter_sort` cache (`app.rs:806`).
-- [ ] Frame-buffer pool in the decode path (`player.rs:1255`).
-- [ ] Hoist the settings `overridden()` computation out of the per-frame path.
+- [x] Incremental library refresh (diff by path+mtime, textures kept).
+- [x] `filter_sort` cache keyed on (query, sort, generation).
+- [x] Frame-buffer pool in the decode path (cap 8, `lock_tolerant`).
+- [x] Settings `overridden()` hoisted to once per frame.
 
 ### UX
 
-- [ ] Sub-second editor time display.
-- [ ] Exports surfaced in the library.
-- [ ] Tab-nav restoration (`editor.rs:257`) + AccessKit on stepper/timeline
-      (pairs with item 4).
-- [ ] Library keyboard navigation.
-- [ ] Persist editor volume/loop.
-- [ ] `ord config set`.
-- [ ] `--json` status output.
-- [ ] `RecordState` stop-path reporting (protocol v5).
-- [ ] Subscribe reconnect (client-side backoff instead of a dead stream).
-- [ ] HiDPI HUD (`layershell.rs:603`).
+- [x] Sub-second editor time display (`m:ss.mmm` transport + hover).
+- [x] Exports surfaced in the library (own section; open/copy/reveal/delete).
+- [ ] Tab-nav restoration (`editor.rs` surrenders focus every frame) + AccessKit
+      on stepper/timeline (pairs with item 4).
+- [x] Library keyboard navigation (arrows/Enter/Delete/Ctrl+F + focus ring).
+- [x] Persist editor volume/loop (ui-prefs state file).
+- [x] `ord config set section.key value`.
+- [x] `ord status --json`.
+- [x] `RecordState` carries the recording path (protocol v5).
+- [x] Subscribe reconnect (`ord subscribe --reconnect`; closed connections
+      report and exit nonzero without it).
+- [x] HiDPI HUD (buffer-scale-aware raster).
 
 ### Testing
 
-- [ ] Offline `execute()` fallback tests (fake ffmpeg via `ORD_FFMPEG`).
-- [ ] Disk compaction tests.
-- [ ] Editor math extraction into `timeline.rs` + tests.
-- [ ] CLI `parse()` tests.
-- [ ] `ord-hud` `apply()` tests.
-- [ ] Auto-arm integration test via an injected probe.
-- [ ] HEVC sub-layer PTL fixture.
+- [x] Offline `execute()` fallback tests (fake ffmpeg via `ORD_FFMPEG`).
+- [x] Disk compaction tests (injectable threshold).
+- [x] Editor math extraction into `timeline.rs` + boundary tests.
+- [x] CLI `parse()` tests (pure over an args iterator).
+- [x] `ord-hud` `apply()` tests (moved into `ord_overlay::apply`).
+- [x] Auto-arm integration test via the injected probe.
+- [ ] HEVC sub-layer PTL fixture (`bitstream.rs` sub-layer skip path).
 
 ### Hygiene
 
-- [ ] Shared `Rebaser` for `mux.rs`/`record.rs`.
-- [ ] Dedupe the `access_unit()` fixture (duplicated x4).
-- [ ] `MonitorId` adoption or deletion.
-- [ ] `av1C` 10-bit loud failure (no silent 8-bit assumption).
-- [ ] Tick-vs-µs comment drift (`ring.rs:30`, `clip.rs:31`).
-- [ ] Theme-token cleanup (`app.rs:1035`, raw `Color32`s in `editor.rs`).
+- [x] Shared `Rebaser` for `mux.rs`/`record.rs` (in `mux/stream.rs`).
+- [x] Dedupe the `access_unit()` fixture (`tests/common/mod.rs`; the bench keeps
+      its own copy — benches can't reach `tests/`).
+- [x] `MonitorId` deleted (adoption into `capture.target` considered and
+      rejected: the string is the compositor-facing representation everywhere).
+- [ ] `av1C` 10-bit loud failure (no silent 8-bit assumption) — do together with
+      the HDR/Main10 work (item 3), where the real color_config parsing lands.
+- [x] Tick-vs-µs comment drift fixed; audio ring now also evicts immediately on
+      shrink (matching the engine doc).
+- [x] Theme-token cleanup (all view colors come from `theme.rs`).
 
-**In flight as of 2026-07-02:** a working session (Stages 2–7) is fixing a
-first slice of this backlog — starting with the Testing group's offline
-`execute()` fallback tests (fake ffmpeg via `ORD_FFMPEG`, in `ord-export`) and
-continuing through the Reliability/Performance items above. Check `git log`
-before picking an item up; some may already be done.
+Also closed in the same session (not in the original backlog): export
+cancellation is wedge-proof (progress-reader thread + 100 ms cancel polls), the
+NVENC→software fallback only triggers on hardware-encoder stderr signatures,
+deterministic `-map` stream selection + Opus-in-MP4 `-strict -2`, one-sided
+`ord export --start/--end` trims, `--help` to stdout/exit 0 everywhere,
+`ClipSaved` reports the actually-buffered duration, and CI gained the
+cross-target `cargo check` lane (windows-gnu + apple-darwin) plus a
+release-race concurrency group and a Keep-a-Changelog heading normalizer.
 
 ---
 

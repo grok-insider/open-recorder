@@ -27,6 +27,25 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # Protect the v0.3.0 cross-platform guarantee: the workspace must keep
+  # *compiling* off-Linux with the mock backend (transport seam, dirs paths,
+  # cfg-gating). `cargo check` doesn't link, so no mingw/apple toolchain is
+  # needed — this catches unix-only API usage leaking into shared code, which
+  # the Linux-only jobs can never see.
+  cross-check:
+    name: cargo check (windows + macos targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu, aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cross-check
+      - run: cargo check --workspace --target x86_64-pc-windows-gnu
+      - run: cargo check --workspace --target aarch64-apple-darwin
+
   # The product's real code is feature-gated (waycap/mux/layershell/gui) and the
   # default Rust job never compiles it. This nix lane builds + lints + tests ALL
   # features in the devshell (ffmpeg/wayland/cuda toolchain), so the muxer +
@@ -102,6 +121,9 @@ jobs:
       # Build every published binary so all closures land in the cache:
       #   ord (CLI), ordd (NVENC daemon), ord-hud (layer-shell HUD),
       #   ord-ui (egui library), and the bundled default.
+      # No `nix flake check` here: the nix-checks job already evaluated the
+      # flake on this same push, and the package builds above are the real
+      # signal — re-running the full check only duplicated work.
       - name: Build all packages
         run: |
           nix build .#ord-cli -L
@@ -109,6 +131,3 @@ jobs:
           nix build .#ord-hud -L
           nix build .#ord-ui -L
           nix build .#default -L
-
-      - name: Flake check
-        run: nix flake check -L

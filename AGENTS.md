@@ -37,7 +37,7 @@ workspace member entry in the root `Cargo.toml`.
 | `crates/ord-common` | Shared types + the bincode IPC wire protocol (commands/events) + the cross-platform IPC transport seam (`transport.rs`: Unix socket on unix, loopback TCP + port rendezvous file elsewhere). No other I/O. |
 | `crates/ord-core`   | The engine: wraps `waycap-rs`, owns the encoded-frame replay store (RAM `RingBuffer` or `DiskFrameStore` via the `FrameStore` seam), the keyframe-aware "save last N seconds" muxer (ffmpeg-next, stream-copy, no re-encode), and the pure per-app audio routing (`audio_route::plan_track`). |
 | `crates/ord-daemon` | `ordd`: runs `ord-core`, supervises the buffer, exposes the control plane over the `ord-common` transport seam (Unix socket on unix; loopback TCP + rendezvous file elsewhere), game detection (`hyprctl`), storage policy (templates + prune), the capture watchdog, post-save verification + hook, and the layered-config apply (`SetConfig`). Hotkeys are compositor keybinds invoking `ord` (no evdev). |
-| `crates/ord-cli`    | `ord`: thin client. Talks to the daemon socket (`save --last N`, `mark`, `shot`, `record toggle`, `status`, `buffer on/off`, `config show`, `subscribe`) + local `doctor` (NVIDIA P2 fix), `export`, and `--version`. What compositor keybinds call. |
+| `crates/ord-cli`    | `ord`: thin client. Talks to the daemon socket (`save --last N`, `mark`, `shot`, `record toggle`, `status [--json]`, `buffer on/off`, `config show`/`config set`, `subscribe [--reconnect]`) + local `doctor` (NVIDIA P2 fix), `export`, and `--version`. What compositor keybinds call. |
 | `crates/ord-overlay`| Platform overlay abstraction: the `Overlay` trait + `wlr-layer-shell` (Wayland) implementation + the `ord-hud` binary. X11/Win32 are future implementations of the same trait. |
 | `crates/ord-ui`     | `egui` clip library/manager window: browse, play, trim, export. |
 | `crates/ord-export` | Pure ffmpeg-arg export planning (`plan.rs`, no I/O) + ffprobe wrapper + ffmpeg runner with NVENC→software fallback. Presets (social/GIF/quality) are data, not code. |
@@ -208,6 +208,15 @@ waycap NVENC backend gated on `feature = "waycap"` + `target_os = "linux"`
 (target-gated dependency). Project identity migrated to **grok-insider**; the
 waycap-rs fork intentionally remains at `github.com/0xfell/waycap-rs`.
 release-plz is live and cut this release (PRs #2/#3).
+
+**Unreleased (2026-07-02 audit round)** — the full-codebase audit fixes:
+non-blocking subscriber broadcast + off-lock engine starts in the daemon,
+bounded recorder audio, drop-until-keyframe forwarding, incremental disk
+compaction, scoped/cancellable export fallback, CLI `config set` /
+`status --json` / `subscribe --reconnect`, editor sub-second time + library
+keyboard nav + exports section, HiDPI HUD, and **`PROTOCOL_VERSION` 4→5**
+(`RecordState` gained the recording's path). CI gained a cross-target
+`cargo check` lane (windows-gnu + apple-darwin).
 
 Forward work is tracked in `continue-plan.md` (the single roadmap); the shipped
 record is `docs/roadmap-status.md`.

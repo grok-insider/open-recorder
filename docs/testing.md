@@ -86,17 +86,20 @@ else uses `MockBackend`.
 
 ## What CI runs
 
-Three jobs on `x86_64-linux` (`.github/workflows/ci.yml`):
+Four jobs (`.github/workflows/ci.yml`):
 
 - **`rust`** (every push/PR, fast): `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -- -D warnings` (default features
   only), `cargo test --workspace` (GPU tests excluded via `#[ignore]`).
+- **`cross-check`** (every push/PR): `cargo check --workspace` for
+  `x86_64-pc-windows-gnu` and `aarch64-apple-darwin` — protects the Phase 0
+  "compiles everywhere with the mock backend" guarantee without linking.
 - **`nix-checks`** (every push/PR, devshell): `nix flake check --no-build`,
   `cargo clippy --all-features -- -D warnings`, and tests for every feature
   **except `waycap`** (the waycap/cust binaries dlopen `libcuda.so.1` and
   cannot load on a driverless runner; that lane runs on the dev box).
-- **`build`** (master/tags/dispatch only): `nix build` of every package +
-  `nix flake check`, pushing closures to `grok-insider.cachix.org` so flake
+- **`build`** (master/tags/dispatch only): `nix build` of every package,
+  pushing closures to `grok-insider.cachix.org` so flake
   consumers pull prebuilt instead of compiling.
 
 ## Coverage expectations

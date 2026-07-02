@@ -78,6 +78,13 @@ jobs:
           version: ${{ env.RP_VER }}
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           project-description: "Linux screen/game recorder with NVENC, overlay HUD and daemon (ord + ordd + ord-hud + ord-ui)"
+      # The AI action has overwritten release-plz's heading before (v0.3.0
+      # shipped as a bare `## 0.3.0`); force the Keep-a-Changelog form.
+      - name: Normalize the changelog heading (Keep a Changelog)
+        if: ${{ env.RP_PR != '' }}
+        run: |
+          set -euo pipefail
+          sed -i -E "0,/^##[[:space:]]+\[?${RP_VER}\]?([[:space:]].*)?$/s//## [${RP_VER}] - $(date -u +%F)/" CHANGELOG.md
       - name: Commit AI changelog to the Release PR
         if: ${{ env.RP_PR != '' }}
         run: |
@@ -98,6 +105,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Two rapid master pushes must not race the tag/Release creation.
+    concurrency:
+      group: release-plz-release
+      cancel-in-progress: false
     outputs:
       releases_created: ${{ steps.release-plz.outputs.releases_created }}
       releases: ${{ steps.release-plz.outputs.releases }}

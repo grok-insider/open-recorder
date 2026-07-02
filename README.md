@@ -142,10 +142,11 @@ ord save --last 30      # save the last N seconds (default 30)
 ord mark                # bookmark now → a chapter in the next saved clip
 ord shot                # screenshot the latest frame to a PNG
 ord record              # toggle manual (continuous) recording
-ord status              # buffer/recording state + buffered seconds
+ord status [--json]     # buffer/recording state + buffered seconds (JSON for waybar)
 ord buffer on|off       # arm / pause the replay buffer
 ord config show         # print the effective daemon configuration
-ord subscribe           # stream daemon events (this is what the HUD consumes)
+ord config set <k> <v>  # change one setting, e.g. `ord config set capture.fps 30`
+ord subscribe           # stream daemon events (--reconnect to survive restarts)
 ord doctor --fix        # install the NVIDIA P2-downclock fix (see below)
 ord export <in> [out]   # transcode/trim a clip — see `ord export --help`
 ord --version           # prints "ord X.Y.Z [protocol N]"
