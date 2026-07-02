@@ -86,7 +86,14 @@ const SUBSCRIBER_QUEUE: usize = 64;
 // already fixed once).
 
 /// Register a subscriber stream: spawn its writer thread and add its queue.
-fn add_subscriber(subs: &Subscribers, mut stream: Stream) {
+///
+/// The `snapshot` reply is enqueued and the subscriber registered under ONE
+/// subs-lock critical section, so the two are atomic w.r.t. `broadcast`. This
+/// closes a real race: writing the snapshot directly to the stream and only
+/// then registering left a window where a state change broadcast from another
+/// connection was lost — once a client has *read* its snapshot, it is now
+/// guaranteed to be registered and can never miss a subsequent event.
+fn add_subscriber(subs: &Subscribers, mut stream: Stream, snapshot: &Event) {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(SUBSCRIBER_QUEUE);
     std::thread::spawn(move || {
         while let Ok(payload) = rx.recv() {
@@ -95,7 +102,12 @@ fn add_subscriber(subs: &Subscribers, mut stream: Stream) {
             }
         }
     });
-    lock_tolerant(subs).push(Subscriber { tx });
+    let mut guard = lock_tolerant(subs);
+    if let Ok(payload) = snapshot.encode() {
+        // A fresh queue always has room for the snapshot.
+        let _ = tx.try_send(payload);
+    }
+    guard.push(Subscriber { tx });
 }
 
 /// Broadcast an event to all live subscribers, dropping any that have closed
@@ -366,15 +378,17 @@ fn handle_connection<B: CaptureBackend, S: FrameStore>(
             }
         };
 
-        // Reply to the requester (for Subscribe this is the initial snapshot).
-        write_event(&mut stream, &event)?;
-
         if is_subscribe {
             // Register this connection for future pushes and stop reading it
-            // for commands (the client now only listens).
-            add_subscriber(subs, stream);
+            // for commands (the client now only listens). The snapshot reply
+            // flows through the subscriber queue itself, so registration and
+            // the reply are atomic w.r.t. broadcasts (see add_subscriber).
+            add_subscriber(subs, stream, &event);
             return Ok(());
         }
+
+        // Reply to the requester.
+        write_event(&mut stream, &event)?;
 
         // State-changing events are pushed to all subscribers too.
         if event.is_state_change() {
