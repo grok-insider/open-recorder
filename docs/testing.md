@@ -86,11 +86,13 @@ else uses `MockBackend`.
 
 ## What CI runs
 
-Four jobs (`.github/workflows/ci.yml`):
+Five jobs (`.github/workflows/ci.yml`):
 
 - **`rust`** (every push/PR, fast): `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -- -D warnings` (default features
   only), `cargo test --workspace` (GPU tests excluded via `#[ignore]`).
+- **`msrv`** (every push/PR): `cargo check --workspace` on Rust 1.87, so the
+  `rust-version` claim in `Cargo.toml` stays honest.
 - **`cross-check`** (every push/PR): `cargo check --workspace` for
   `x86_64-pc-windows-gnu` and `aarch64-apple-darwin` — protects the Phase 0
   "compiles everywhere with the mock backend" guarantee without linking.

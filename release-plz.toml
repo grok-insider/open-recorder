@@ -1,14 +1,22 @@
-# release-plz — automated versioning + releases for the open-recorder workspace.
-# Docs: https://release-plz.dev/docs/config
+# release-plz — the RELEASE half of the pipeline only (config docs:
+# https://release-plz.dev/docs/config).
 #
-# Model: every crate shares ONE version via `version.workspace = true`
-# (root Cargo.toml `[workspace.package] version`). We elect `ord-cli` (the `ord`
-# binary) as the single release unit; the other six crates ride the shared
-# workspace version and fold their commits into ord-cli's bump + changelog via
-# `changelog_include`. On each push to master, release-plz opens/updates a
-# "release PR" that bumps that one version field (all crates follow), refreshes
-# Cargo.lock, and regenerates the root CHANGELOG.md from Conventional Commits.
-# Merging the release PR tags `vX.Y.Z` and creates the GitHub Release.
+# Division of labor:
+#   * The "release PR" (version bump + Cargo.lock + CHANGELOG) is produced by
+#     OUR OWN `release-pr` job in .github/workflows/release.yml (patch line;
+#     deliberate minor/major via manual-version-bump.yml). It is NOT
+#     `release-plz release-pr`: that command's git-only change detection runs
+#     `cargo package` on the previous tag's worktree, which can never resolve
+#     the git-pinned waycap-rs fork against crates.io (upstream
+#     release-plz#2651-adjacent).
+#   * `release-plz release` (this config) runs on every master push: with
+#     `release_always = true` it sees an untagged workspace version and cuts the
+#     `vX.Y.Z` tag + GitHub Release from CHANGELOG.md. It never packages, so the
+#     fork dependency is irrelevant here.
+#
+# Every crate shares ONE version via `version.workspace = true` (root Cargo.toml
+# `[workspace.package] version`); `ord-cli` (the `ord` binary) is the single
+# release unit that emits the tag + Release.
 #
 # Nothing is published to crates.io. Delivery is:
 #   * the GitHub Release — the static `ord` musl binary + the ordd/ord-hud/ord-ui
@@ -16,6 +24,11 @@
 #   * the grok-insider cachix cache — ci.yml's `build` job pushes the closures on the
 #     same master push, and `flake.nix` reads the version from Cargo.toml, so the
 #     cached store paths track it as `open-recorder-X.Y.Z`.
+#
+# NOTE: do NOT set `publish = false` in the Cargo manifests — release-plz skips
+# manifest-unpublishable packages' git releases entirely ("nothing to release";
+# learned the hard way cutting v0.4.0). The publish guard is the release-plz
+# `publish = false` below.
 
 [workspace]
 # Not on crates.io: determine the current version from the `v*` git tag instead
@@ -34,8 +47,6 @@ semver_check = false
 # other six crates ride the shared workspace version with no tag/release of their
 # own — there is only one version field, so they all move in lockstep for free.
 release = false
-# Make the release PR easy to spot/filter.
-pr_labels = ["release"]
 
 [[package]]
 name = "ord-cli"

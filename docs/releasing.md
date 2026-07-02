@@ -1,9 +1,11 @@
 # Versioning & releasing
 
 open-recorder uses **SemVer**, with the workspace `Cargo.toml` as the single
-source of truth and **git tags** (`vX.Y.Z`) as the release markers. While the
-project is pre-1.0, the minor version moves on feature drops and the patch on
-fixes; breaking wire/config changes are called out via the protocol version.
+source of truth and **git tags** (`vX.Y.Z`) as the release markers. The
+**automatic stream stays on the patch line** (`z` bumps: `0.4.0 → 0.4.1` on
+`feat:`/`fix:` commits, open-media's model); deliberate **minor/major
+milestones** (feature drops, IPC protocol bumps) are cut by a repo admin via
+the *Manual Version Bump* workflow.
 
 ## The three version surfaces
 
@@ -13,23 +15,28 @@ fixes; breaking wire/config changes are called out via the protocol version.
 | **Binary `--version`** | `ord --version`, `ordd --version` | Prints `X.Y.Z [protocol N]`, plus the short git rev `(abc1234)` for local `cargo` builds. Nix builds omit the rev (no `.git` in the flake source) so they stay reproducible. Implemented in `ord-common` (`version.rs` + `build.rs`). |
 | **Wire protocol** | `PROTOCOL_VERSION` in `ord-common/src/frame.rs` | Bumped on any incompatible `Command`/`Event` change. The framing layer rejects peer skew loudly (a stale `ord`/`ordd`/`ord-hud`), so `ord` and `ordd` from different releases refuse to talk instead of mis-decoding. |
 
-## Cutting a release (automated with release-plz)
+## Cutting a release (the automated patch line)
 
-Releases are driven by [release-plz](https://release-plz.dev)
-(`release-plz.toml` + `.github/workflows/release.yml`). You do **not** bump the
-version, edit `CHANGELOG.md`, or tag by hand — a clear [Conventional
-Commit](https://www.conventionalcommits.org) drives all three.
+You do **not** bump the version, edit `CHANGELOG.md`, or tag by hand — a clear
+[Conventional Commit](https://www.conventionalcommits.org) drives all three.
 
 1. Land `feat:`/`fix:`/… PRs on `master` as usual. If `Command`/`Event` shapes
    changed incompatibly, bump `PROTOCOL_VERSION` (`ord-common/src/frame.rs`) in
-   that same commit.
-2. release-plz keeps a **release PR** open (`chore: release vX.Y.Z`) that bumps
-   the single `[workspace.package].version` (every crate inherits it via
-   `version.workspace = true`), refreshes `Cargo.lock`, and regenerates
-   `CHANGELOG.md` from the commits since the last `v*` tag. `ord-cli` is the
-   release unit; the other six crates fold in via `changelog_include`.
-3. **Merge the release PR to ship.** `release-plz-release` tags `vX.Y.Z` and
-   creates the GitHub Release, then two artifact jobs attach prebuilt binaries:
+   that same commit — and prefer shipping it via a manual **minor** bump (below).
+2. The **`release-pr` job** (`.github/workflows/release.yml` — our own job, see
+   "Why not `release-plz release-pr`") keeps a release PR open
+   (`chore: release vX.Y.Z+1`) whenever `feat`/`fix` commits have landed since
+   the last tag: it bumps the single `[workspace.package].version` to the next
+   **patch**, refreshes `Cargo.lock`, and writes the `CHANGELOG.md` section via
+   `grok-insider/release-changelog-action` (AI notes over the commit range,
+   Keep-a-Changelog heading enforced). The PR regenerates from master on every
+   push; chore/docs/ci-only pushes don't churn it but still ride into the notes.
+   Breaking commits since the tag are flagged in the PR body as a nudge toward
+   a manual minor instead.
+3. **Merge the release PR to ship.** `release-plz-release` (release-plz with
+   `release_always = true`) sees the untagged version, tags `vX.Y.Z` and
+   creates the GitHub Release from the changelog, then two artifact jobs attach
+   prebuilt binaries:
    - `upload-ord` — the portable **static `ord`** client (`x86_64` musl), for
      PATH installs / compositor keybinds.
    - `upload-appimages` — **`ordd` / `ord-hud` / `ord-ui` AppImages**, bundled
@@ -39,6 +46,32 @@ Commit](https://www.conventionalcommits.org) drives all three.
    consumers substitute `open-recorder-X.Y.Z` instead of compiling. Cachix is
    deliberately handled in `ci.yml`, not `release.yml`.
 
+The `release-pr` job also has a `workflow_dispatch` handle with a `force` input
+that bypasses the feat/fix filter — useful to kick a release PR on demand.
+
+## Minor/major milestones (Manual Version Bump)
+
+`.github/workflows/manual-version-bump.yml` (`workflow_dispatch`, repo-admin
+gated, with a dry-run option) opens a `chore: release vX.Y.0` / `vX+1.0.0` PR:
+version bump + `Cargo.lock` + AI changelog section, exactly like the automatic
+PR but for a deliberate milestone. Merging it releases through the same
+`release_always` path. Use it for feature drops and **IPC protocol bumps** —
+the automatic stream never leaves the patch line.
+
+## Why not `release-plz release-pr`
+
+`release-plz release-pr` is broken upstream for this workspace
+(release-plz/release-plz#2651-adjacent): in git-only mode its change detection
+reconstructs the last tag's worktree and runs `cargo package` on it, which
+tries to resolve the git-pinned `waycap-rs` fork against crates.io (`^3.0.0`
+does not exist there) and fails. open-media hit the same wall and only escaped
+by publishing its git dependency to crates.io — not an option for a fork of
+someone else's crate (whose own deps are forked git branches). The **release
+step is unaffected**: `release-plz release` never packages; it only checks the
+workspace version against the `v*` tags and cuts the tag + GitHub Release
+(proven by v0.3.0 and v0.4.0). Hence the split: our own `release-pr` job +
+release-plz for the release.
+
 Nothing is published to crates.io (`git_only = true` + `publish = false` in
 `release-plz.toml`). Do **not** set `publish = false` in the Cargo manifests:
 release-plz skips manifest-unpublishable packages entirely — including their
@@ -46,39 +79,9 @@ git tag + GitHub Release — so a manifest-level flag silently turns
 `release-plz release` into "nothing to release" (verified against 0.3.159).
 
 The pipeline is live: the repo's *"Allow GitHub Actions to create and approve
-pull requests"* setting is enabled, and release-plz cut **v0.3.0** through it
-(release PRs #2/#3). The `CACHIX_AUTH_TOKEN` secret and the `v*` tags exist.
-
-**AI-changelog enrichment.** After release-plz opens/updates the release PR,
-`release.yml` runs `grok-insider/release-changelog-action`, which rewrites that
-PR's `CHANGELOG.md` entry with user-facing, AI-written notes (overwriting the
-git-cliff baseline) and commits it back to the PR branch.
-
-## Manual release PR (current procedure)
-
-`release-plz release-pr` is **broken upstream for this workspace**
-(release-plz/release-plz#2651-adjacent): in git-only mode it reconstructs the
-last tag's worktree and runs `cargo package` on it, which tries to resolve the
-git-pinned `waycap-rs` fork against crates.io (`^3.0.0` does not exist there)
-and fails. The `release-plz-pr` job in `release.yml` is therefore
-`continue-on-error`, and release PRs are opened by hand until the upstream
-source-diff fallback lands. The **release step is unaffected**:
-`release-plz release` only checks the current workspace version against the
-`v*` tags and cuts the tag + GitHub Release (proven by v0.3.0 and v0.4.0).
-
-To cut a release:
-
-1. Branch from master, bump `[workspace.package].version` in the root
-   `Cargo.toml` (Conventional-Commits semantics: `feat!`/`BREAKING CHANGE` →
-   minor while 0.x, `feat` → minor, `fix` → patch).
-2. `cargo update --workspace` to refresh `Cargo.lock`.
-3. Add the `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md` (Keep a
-   Changelog form, summarized from the Conventional Commits since the last
-   tag). This is the one sanctioned hand-edit of the changelog.
-4. Open the PR titled `chore: release vX.Y.Z`, let CI pass, merge.
-5. The master push runs `release-plz release`: tag + GitHub Release; the
-   `upload-ord`/`upload-appimages` jobs attach the binaries and ci.yml's
-   `build` job pushes the closures to cachix.
+pull requests"* setting is enabled. Secrets: `RELEASE_PLZ_TOKEN` (PAT so
+release-PR branches trigger CI), `OPENROUTER_API_KEY` (AI changelog; falls back
+to a plain commit list without it), `CACHIX_AUTH_TOKEN`.
 
 ## How a consumer updates
 

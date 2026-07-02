@@ -139,31 +139,36 @@ nix develop                     # devshell with pipewire/ffmpeg/cuda/clang toolc
 
 ## CI / release
 
-Two workflows, both on `x86_64-linux`:
+Three workflows, all on `x86_64-linux` runners:
 
 - **`.github/workflows/ci.yml`** — on every push/PR: `cargo fmt --check`,
-  `cargo clippy -D warnings`, `cargo test --all` (GPU tests excluded), the
-  `--all-features` devshell lane, and `nix flake check`. On master/tags it also
-  builds every package with Nix and pushes the closures to `grok-insider.cachix.org`,
-  so flake consumers pull prebuilt instead of compiling.
-- **`.github/workflows/release.yml`** — automated releases via **release-plz**
-  (`release-plz.toml`). Each master push maintains a `chore: release vX.Y.Z` PR
-  that bumps the single `[workspace.package].version` (every crate inherits it),
-  refreshes `Cargo.lock`, and regenerates `CHANGELOG.md` from Conventional
-  Commits; merging it tags `vX.Y.Z` + creates the GitHub Release. `ord-cli` is
-  the release unit; the other six crates fold in via `changelog_include`. Two
-  artifact jobs then attach prebuilt binaries: the static `ord` client (`x86_64`
-  musl, on-PATH for keybinds) and the `ordd`/`ord-hud`/`ord-ui` **AppImages**
-  (`nix bundle` from the flake; the wrapper resolves the host NVIDIA driver on
-  foreign distros). No crates.io publish (`git_only`). Cachix stays in ci.yml by
-  design; release.yml only does the tag/Release + artifacts.
+  `cargo clippy -D warnings`, `cargo test --all` (GPU tests excluded), an MSRV
+  `cargo check` (1.87), a cross-target `cargo check` lane (windows-gnu +
+  apple-darwin, protects Phase 0), the `--all-features` devshell lane, and
+  `nix flake check`. On master/tags it also builds every package with Nix and
+  pushes the closures to `grok-insider.cachix.org`, so flake consumers pull
+  prebuilt instead of compiling.
+- **`.github/workflows/release.yml`** — the **patch-line release pipeline**.
+  A self-owned `release-pr` job (NOT `release-plz release-pr`, whose git-only
+  change detection cannot package the git-pinned waycap-rs fork) maintains a
+  `chore: release vX.Y.Z+1` PR whenever `feat`/`fix` commits landed since the
+  last tag: version bump (every crate inherits the single
+  `[workspace.package].version`), `Cargo.lock`, and an AI-written
+  `CHANGELOG.md` section. Merging it makes `release-plz release`
+  (`release_always`) tag `vX.Y.Z` + create the GitHub Release; two artifact
+  jobs attach the static `ord` client (`x86_64` musl) and the
+  `ordd`/`ord-hud`/`ord-ui` **AppImages**. No crates.io publish (`git_only`).
+  Cachix stays in ci.yml by design.
+- **`.github/workflows/manual-version-bump.yml`** — repo-admin
+  `workflow_dispatch` for deliberate **minor/major** milestones (feature drops,
+  IPC protocol bumps); the automatic stream never leaves the patch line.
 
-**Commit messages are Conventional Commits** — they drive the version bump and
-the changelog, so prefix every subject (`feat:`/`fix:`/`docs:`/`refactor:`/
+**Commit messages are Conventional Commits** — they drive the release trigger
+and the changelog, so prefix every subject (`feat:`/`fix:`/`docs:`/`refactor:`/
 `perf:`/`test:`/`chore:`/`ci:`; use `feat!:` or a `BREAKING CHANGE:` footer for a
-break, and bump `PROTOCOL_VERSION` on any incompatible IPC change). Never
-hand-edit `CHANGELOG.md` — release-plz regenerates it. See `CONTRIBUTING.md` and
-`docs/releasing.md`.
+break, and bump `PROTOCOL_VERSION` on any incompatible IPC change — then ship it
+via a manual minor). Never hand-edit `CHANGELOG.md` — the release pipeline
+generates it. See `CONTRIBUTING.md` and `docs/releasing.md`.
 
 ## Status
 

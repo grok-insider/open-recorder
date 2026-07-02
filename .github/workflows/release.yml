@@ -1,16 +1,28 @@
 name: Release
 
-# Automated versioning + GitHub Releases via release-plz (config: release-plz.toml).
+# Automated patch-line versioning + GitHub Releases. Deliberate major/minor
+# milestones go through the Manual Version Bump workflow (open-media's model).
 #
 # Flow on every push to master:
-#   * release-plz-pr      — opens/updates the "release PR" (bumps the single
-#                           [workspace.package].version + Cargo.lock, regenerates
-#                           CHANGELOG.md from Conventional Commits).
-#   * release-plz-release — when that PR is merged, creates the `vX.Y.Z` tag +
-#                           GitHub Release from the changelog.
+#   * release-pr          — OUR OWN job (not release-plz): opens/updates the
+#                           "release PR" that bumps the single
+#                           [workspace.package].version to the next PATCH
+#                           (x.y.z -> x.y.z+1), refreshes Cargo.lock, and writes
+#                           the CHANGELOG section via the AI changelog action.
+#                           Only feat/fix commits since the last tag trigger it.
+#   * release-plz-release — when a release PR (auto or manual) is merged,
+#                           creates the `vX.Y.Z` tag + GitHub Release from the
+#                           changelog (release-plz, release_always = true).
 #   * upload-ord          — builds the portable static `ord` client and attaches it.
 #   * upload-appimages    — bundles ordd/ord-hud/ord-ui as AppImages (via the Nix
 #                           flake) and attaches them, for non-Nix Linux users.
+#
+# Why the release PR is hand-rolled: `release-plz release-pr` in git-only mode
+# reconstructs the last tag's worktree and runs `cargo package` on it, which can
+# never resolve the git-pinned waycap-rs fork against crates.io (upstream
+# release-plz#2651-adjacent; open-media hit the same wall and only escaped by
+# publishing its git dep to crates.io — not an option for a fork of someone
+# else's crate). The `release-plz release` step never packages, so it stays.
 #
 # Cachix is intentionally NOT handled here: ci.yml's `build` job runs on the same
 # master push and pushes the closures to grok-insider.cachix.org (flake.nix reads the
@@ -20,92 +32,187 @@ name: Release
 on:
   push:
     branches: [master]
+  # Manual test/kick handle for the release-pr job. `force` bypasses the
+  # feat/fix filter so the flow can be exercised end-to-end on demand.
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Open the release PR even without feat/fix commits
+        required: false
+        type: boolean
+        default: false
 
 # Least privilege by default; each job elevates only what it needs.
 permissions:
   contents: read
 
 jobs:
-  # Keep the release PR up to date on every push. Merging that PR is what later
-  # triggers the `release` job (via the resulting push to master).
-  #
-  # KNOWN-BROKEN upstream (release-plz/release-plz#2651 + the git-only
-  # packaging flow): `release-plz release-pr` reconstructs the last tag's
-  # worktree and runs `cargo package` on it, which cannot resolve the
-  # git-pinned waycap-rs fork against crates.io. Until upstream lands the
-  # source-diff fallback, this job is continue-on-error and release PRs are
-  # opened MANUALLY (see docs/releasing.md "Manual release PR"). The
-  # `release-plz-release` job below is unaffected — it only tags + creates the
-  # GitHub Release, which is why manual release PRs still cut releases.
-  release-plz-pr:
-    name: release-plz PR
+  # Keep the patch-line release PR up to date on every push. Merging that PR is
+  # what later triggers the `release` job (via the resulting push to master).
+  release-pr:
+    name: release PR (patch line)
     if: github.repository_owner == 'grok-insider'
-    continue-on-error: true
     runs-on: ubuntu-latest
     permissions:
       contents: write
       pull-requests: write
     concurrency:
-      group: release-plz-${{ github.ref }}
+      group: release-pr
       cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+      CARGO_NET_RETRY: "10"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # Persist the PAT so the AI changelog step can push to the Release PR branch.
+          # PAT so pushes to the release branch trigger required CI (a
+          # GITHUB_TOKEN-pushed branch doesn't).
           persist-credentials: true
           token: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz (release-pr)
-        id: release-plz
-        uses: release-plz/action@v0.5
-        with:
-          command: release-pr
-        env:
-          # PAT so the release PR triggers required CI (a GITHUB_TOKEN-opened PR doesn't).
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
 
-      # Rewrite the release PR's CHANGELOG section with user-facing, AI-written
-      # notes (shared action overwrites release-plz's git-cliff baseline).
-      - name: Check out the Release PR
-        if: ${{ steps.release-plz.outputs.pr != '' }}
+      # Decide whether a release PR is due. Both races with the sibling
+      # `release-plz-release` job are safe: if the current version is untagged,
+      # this push IS the release (skip); once it's tagged, the commit range
+      # v<current>..HEAD is empty, so the feat/fix filter skips too.
+      - name: Decide the next version
+        id: decide
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
-          PR_JSON: ${{ steps.release-plz.outputs.pr }}
+          FORCE: ${{ inputs.force == true && 'true' || 'false' }}
         run: |
           set -euo pipefail
-          pr="$(jq -r '.number // empty' <<<"$PR_JSON")"
-          ver="$(jq -r '.releases[0].version // empty' <<<"$PR_JSON")"
-          [ -n "$pr" ] && [ -n "$ver" ] || { echo "No release PR to enrich."; exit 0; }
-          gh pr checkout "$pr"
-          { echo "RP_PR=$pr"; echo "RP_VER=$ver"; } >> "$GITHUB_ENV"
-      - name: Generate AI changelog into the Release PR
-        if: ${{ env.RP_PR != '' }}
+          current="$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
+          if [[ ! "$current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Cargo.toml workspace version '$current' is not x.y.z."
+            exit 1
+          fi
+          major="${BASH_REMATCH[1]}" minor="${BASH_REMATCH[2]}" patch="${BASH_REMATCH[3]}"
+          if ! git rev-parse -q --verify "refs/tags/v${current}" >/dev/null; then
+            echo "::notice::v${current} is not tagged yet — this push is releasing it; no new release PR."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Only user-facing changes (feat/fix) warrant a release; chore/docs/ci
+          # pushes still ride into the next release's notes via the commit range.
+          if [ "$FORCE" != "true" ] \
+            && ! git log "v${current}..HEAD" --no-merges --format=%s \
+               | grep -qE '^(feat|fix)(\(.*\))?!?:'; then
+            echo "::notice::no feat/fix commits since v${current}; nothing to release."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The automatic stream stays on the patch line (z+1). Breaking commits
+          # are only flagged in the PR body: deliberate minor/major milestones go
+          # through the Manual Version Bump workflow.
+          breaking=false
+          if git log "v${current}..HEAD" --no-merges --format='%s%n%b' \
+            | grep -qE '^[a-z]+(\(.*\))?!:|^BREAKING CHANGE'; then
+            breaking=true
+          fi
+          next="${major}.${minor}.$(( patch + 1 ))"
+          {
+            echo "skip=false"
+            echo "current=$current"
+            echo "next=$next"
+            echo "breaking=$breaking"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Bump the workspace version
+        if: ${{ steps.decide.outputs.skip == 'false' }}
+        env:
+          NEXT: ${{ steps.decide.outputs.next }}
+        run: |
+          set -euo pipefail
+          sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"${NEXT}\"/" Cargo.toml
+          sed -i -E "s|(ord-[a-z-]+ = \{ path = \"crates/ord-[a-z-]+\", version = \")[^\"]+(\" \})|\1${NEXT}\2|g" Cargo.toml
+          cargo update --workspace
+          if git diff --quiet -- Cargo.toml Cargo.lock; then
+            echo "::error::Version bump produced no Cargo.toml or Cargo.lock changes."
+            exit 1
+          fi
+
+      - name: Generate the AI changelog section
+        if: ${{ steps.decide.outputs.skip == 'false' }}
         uses: grok-insider/release-changelog-action@v1
         with:
-          version: ${{ env.RP_VER }}
+          version: ${{ steps.decide.outputs.next }}
+          range: v${{ steps.decide.outputs.current }}..HEAD
           openrouter-api-key: ${{ secrets.OPENROUTER_API_KEY }}
           project-description: "Linux screen/game recorder with NVENC, overlay HUD and daemon (ord + ordd + ord-hud + ord-ui)"
-      # The AI action has overwritten release-plz's heading before (v0.3.0
-      # shipped as a bare `## 0.3.0`); force the Keep-a-Changelog form.
+      # The AI action has emitted a bare `## 0.3.0` heading before; force the
+      # Keep-a-Changelog form.
       - name: Normalize the changelog heading (Keep a Changelog)
-        if: ${{ env.RP_PR != '' }}
+        if: ${{ steps.decide.outputs.skip == 'false' }}
+        env:
+          NEXT: ${{ steps.decide.outputs.next }}
         run: |
           set -euo pipefail
-          sed -i -E "0,/^##[[:space:]]+\[?${RP_VER}\]?([[:space:]].*)?$/s//## [${RP_VER}] - $(date -u +%F)/" CHANGELOG.md
-      - name: Commit AI changelog to the Release PR
-        if: ${{ env.RP_PR != '' }}
+          sed -i -E "0,/^##[[:space:]]+\[?${NEXT}\]?([[:space:]].*)?$/s//## [${NEXT}] - $(date -u +%F)/" CHANGELOG.md
+
+      - name: Open or update the release PR
+        if: ${{ steps.decide.outputs.skip == 'false' }}
+        env:
+          CURRENT: ${{ steps.decide.outputs.current }}
+          NEXT: ${{ steps.decide.outputs.next }}
+          BREAKING: ${{ steps.decide.outputs.breaking }}
         run: |
           set -euo pipefail
+          branch="release-plz-v${NEXT}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- CHANGELOG.md; then
-            git add CHANGELOG.md
-            git commit -m "docs(changelog): generate release notes for v${RP_VER}"
-            git push
+          git switch -c "$branch"
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "chore: release v${NEXT}"
+          # Regenerated from master on every push, so the PR always covers the
+          # full v${CURRENT}..HEAD range.
+          git push --force --set-upstream origin "$branch"
+
+          gh label create release --color 0e8a16 \
+            --description "release PRs (auto patch line + manual bumps)" \
+            2>/dev/null || true
+
+          body="$(mktemp)"
+          {
+            echo "Automated patch-line release PR: **v${CURRENT} -> v${NEXT}**."
+            echo
+            echo "Bumps the single workspace version + \`Cargo.lock\`, and adds the"
+            echo "AI-generated \`CHANGELOG.md\` section for the commits since v${CURRENT}."
+            echo "Regenerated from master on every push until merged."
+            echo
+            if [ "$BREAKING" = "true" ]; then
+              echo "**WARNING: breaking commits (\`!\`/\`BREAKING CHANGE\`) landed since"
+              echo "v${CURRENT}.** The automatic stream still bumps the patch component;"
+              echo "if this deserves a minor milestone instead, close this PR and run the"
+              echo "Manual Version Bump workflow."
+              echo
+            fi
+            echo "Merging tags \`v${NEXT}\` + creates the GitHub Release (release-plz"
+            echo "\`release_always\`), attaches the static \`ord\` + AppImages, and pushes"
+            echo "the closures to cachix."
+          } > "$body"
+
+          existing="$(gh pr list --state open --head "$branch" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "chore: release v${NEXT}" --body-file "$body"
+          else
+            gh pr create \
+              --base master \
+              --head "$branch" \
+              --title "chore: release v${NEXT}" \
+              --body-file "$body" \
+              --label release
           fi
+
+          # A stale release PR for a superseded version (e.g. a manual minor bump
+          # landed in between) must not linger as a second open release path.
+          for stale in $(gh pr list --state open --label release --json number,headRefName \
+            --jq ".[] | select(.headRefName != \"$branch\" and (.headRefName | startswith(\"release-plz-v\"))) | .number"); do
+            gh pr close "$stale" --comment "Superseded by the release PR for v${NEXT}." --delete-branch
+          done
 
   # On a release-PR merge: create the `vX.Y.Z` tag + GitHub Release. Exposes
   # whether a release was cut (and its tag/version) to the artifact jobs below.

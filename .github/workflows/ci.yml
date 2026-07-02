@@ -9,7 +9,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # PR pushes supersede each other, but master/tag runs must complete: a
+  # cancelled master run skips the build→cachix job and leaves that commit's
+  # closure uncached (observed when two master merges landed 10 min apart).
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   # Fast Rust gate on EVERY push/PR: no GPU, no nix, default (pure) features.
@@ -26,6 +29,20 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # The Cargo.toml `rust-version` claim (1.87) is only honest if something
+  # checks it: a dependency bump or new std API can silently raise the real
+  # floor. `cargo check` on the pinned MSRV toolchain catches that.
+  msrv:
+    name: cargo check (MSRV 1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - run: cargo check --workspace
 
   # Protect the v0.3.0 cross-platform guarantee: the workspace must keep
   # *compiling* off-Linux with the mock backend (transport seam, dirs paths,

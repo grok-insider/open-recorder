@@ -97,20 +97,21 @@ Keep subjects short and imperative; add a scope when it helps
 
 ## Releases
 
-Releasing is automated with [release-plz](https://release-plz.dev)
-(`release-plz.toml` + `.github/workflows/release.yml`). Don't bump versions or
-hand-edit `CHANGELOG.md` — a clear Conventional Commit *is* the changelog entry.
+Releasing is automated (`.github/workflows/release.yml` +
+`release-plz.toml`). Don't bump versions or hand-edit `CHANGELOG.md` — a clear
+Conventional Commit *is* the changelog entry.
 
 1. Merge Conventional-Commit PRs to `master` as usual.
-2. release-plz keeps a **release PR** open (`chore: release v…`) that bumps the
-   single `[workspace.package].version` (every crate inherits it via
-   `version.workspace = true`), refreshes `Cargo.lock`, and regenerates
-   `CHANGELOG.md` from the commits since the last tag. An **AI-changelog step**
-   (`grok-insider/release-changelog-action` in `release.yml`) then rewrites the
-   PR's changelog entry into user-facing notes — one more reason to never
-   hand-edit `CHANGELOG.md`.
-3. **Merge the release PR to ship.** It tags `vX.Y.Z` and creates the GitHub
-   Release, which gets:
+2. The `release-pr` job keeps a **release PR** open (`chore: release v…`)
+   whenever `feat`/`fix` commits landed since the last tag: it bumps the single
+   `[workspace.package].version` to the next **patch** (every crate inherits it
+   via `version.workspace = true`), refreshes `Cargo.lock`, and writes the
+   `CHANGELOG.md` section via the **AI-changelog action**
+   (`grok-insider/release-changelog-action`) — one more reason to never
+   hand-edit `CHANGELOG.md`. Deliberate minor/major milestones go through the
+   repo-admin *Manual Version Bump* workflow instead.
+3. **Merge the release PR to ship.** `release-plz release` tags `vX.Y.Z` and
+   creates the GitHub Release, which gets:
    - the **static `ord` client** (`x86_64` musl) for PATH installs, and
    - **`ordd` / `ord-hud` / `ord-ui` AppImages** (bundled from the flake) for
      non-Nix Linux users.
@@ -122,10 +123,10 @@ hand-edit `CHANGELOG.md` — a clear Conventional Commit *is* the changelog entr
 Nothing is published to crates.io.
 
 **Repo setup (done).** *Settings → Actions → General → "Allow GitHub Actions to
-create and approve pull requests"* is enabled — release-plz opened the v0.3.0
-release PRs (#2/#3) through it. Secrets in place: `CACHIX_AUTH_TOKEN` (cachix
-push) and `RELEASE_PLZ_TOKEN` (so the release PR triggers required CI); the
-`v*` tags exist, so release-plz computes the next bump automatically.
+create and approve pull requests"* is enabled. Secrets in place:
+`CACHIX_AUTH_TOKEN` (cachix push), `RELEASE_PLZ_TOKEN` (so release-PR branches
+trigger required CI), and `OPENROUTER_API_KEY` (AI changelog; falls back to a
+plain commit list without it); the `v*` tags exist.
 
 See [`docs/releasing.md`](./docs/releasing.md) for the version surfaces (package
 version, binary `--version`, wire `PROTOCOL_VERSION`) and how consumers update.
