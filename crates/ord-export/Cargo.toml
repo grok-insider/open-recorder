@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+publish.workspace = true
 description = "open-recorder smart export: AV1/HEVC/H264 NVENC transcode + HandBrake-style manual options, driven via ffmpeg"
 
 [dependencies]
