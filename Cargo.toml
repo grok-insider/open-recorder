@@ -19,10 +19,6 @@ rust-version = "1.87"
 license = "MIT"
 authors = ["Grok Insider <admin@grokinsider.net>"]
 repository = "https://github.com/grok-insider/open-recorder"
-# Not published to crates.io (git-only releases via release-plz; delivery is the
-# GitHub Release + cachix). Manifest-level so cargo package/publish never runs
-# against a registry where our git-pinned deps (waycap-rs fork) do not exist.
-publish = false
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

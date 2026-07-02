@@ -39,8 +39,11 @@ Commit](https://www.conventionalcommits.org) drives all three.
    consumers substitute `open-recorder-X.Y.Z` instead of compiling. Cachix is
    deliberately handled in `ci.yml`, not `release.yml`.
 
-Nothing is published to crates.io (`git_only = true`, and every manifest
-carries `publish = false` via `[workspace.package]`).
+Nothing is published to crates.io (`git_only = true` + `publish = false` in
+`release-plz.toml`). Do **not** set `publish = false` in the Cargo manifests:
+release-plz skips manifest-unpublishable packages entirely — including their
+git tag + GitHub Release — so a manifest-level flag silently turns
+`release-plz release` into "nothing to release" (verified against 0.3.159).
 
 The pipeline is live: the repo's *"Allow GitHub Actions to create and approve
 pull requests"* setting is enabled, and release-plz cut **v0.3.0** through it

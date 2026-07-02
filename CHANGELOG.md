@@ -43,7 +43,9 @@ The full-codebase audit round. **Breaking:** the IPC protocol bumped 4 → 5
 - `--help` prints to stdout and exits 0 across `ord` and `ord export`.
 - Library refresh is incremental (only new/changed clips are re-probed), and
   the filter/sort result is cached between repaints.
-- Every crate is `publish = false` at the manifest level (git-only releases).
+- Releases stay git-only: crates.io publishing is disabled in
+  `release-plz.toml` (manifest-level `publish = false` was tried and reverted —
+  release-plz skips such packages' git releases entirely).
 
 ### Fixed
 
