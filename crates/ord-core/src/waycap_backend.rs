@@ -299,25 +299,33 @@ impl CaptureBackend for WaycapBackend {
 
         // Forward waycap-rs (crossbeam) frames onto our bounded mpsc channel,
         // converting each into our EncodedFrame. Exits when stop is set or the
-        // channel closes. If the channel is full (consumer stalled), drop the
-        // frame rather than grow memory — a saved clip may glitch there, but the
-        // periodic pump means this should never happen.
+        // channel closes. If the channel is full (consumer stalled), drop
+        // *until the next keyframe* rather than grow memory: admitting deltas
+        // after a dropped keyframe would leave a headless (undecodable) GOP in
+        // the ring, and a save spanning it would glitch until the next
+        // keyframe anyway. The periodic pump means this should never happen.
         let video_stop = Arc::clone(&stop);
         let forwarder = std::thread::spawn(move || {
             let mut dropped = 0u64;
+            let mut awaiting_keyframe = false;
             while !video_stop.load(Ordering::Acquire) {
                 match video_recv.recv_timeout(Duration::from_millis(100)) {
                     Ok(f) => {
+                        if awaiting_keyframe && !f.is_keyframe {
+                            dropped += 1;
+                            continue;
+                        }
                         let frame = EncodedFrame::new(f.data, f.is_keyframe, f.pts, f.dts);
                         match tx.try_send(frame) {
-                            Ok(()) => {}
+                            Ok(()) => awaiting_keyframe = false,
                             Err(mpsc::TrySendError::Full(_)) => {
+                                awaiting_keyframe = true;
                                 dropped += 1;
                                 if dropped % 300 == 1 {
                                     tracing::warn!(
                                         cap = VIDEO_CHANNEL_CAP,
                                         dropped,
-                                        "video forward channel full; dropping frames (consumer stalled)"
+                                        "video forward channel full; dropping until next keyframe (consumer stalled)"
                                     );
                                 }
                             }
@@ -339,13 +347,24 @@ impl CaptureBackend for WaycapBackend {
             let (atx, arx) = mpsc::sync_channel(AUDIO_CHANNEL_CAP);
             let audio_stop = Arc::clone(&stop);
             let handle = std::thread::spawn(move || {
+                let mut dropped = 0u64;
                 while !audio_stop.load(Ordering::Acquire) {
                     match audio_recv.recv_timeout(Duration::from_millis(100)) {
                         Ok(f) => {
                             let frame = EncodedAudioFrame::new(f.data, f.pts, f.timestamp / 1000);
                             match atx.try_send(frame) {
                                 Ok(()) => {}
-                                Err(mpsc::TrySendError::Full(_)) => {} // backstop only
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    // Backstop only — but observable, like video.
+                                    dropped += 1;
+                                    if dropped % 1000 == 1 {
+                                        tracing::warn!(
+                                            cap = AUDIO_CHANNEL_CAP,
+                                            dropped,
+                                            "audio forward channel full; dropping packets (consumer stalled)"
+                                        );
+                                    }
+                                }
                                 Err(mpsc::TrySendError::Disconnected(_)) => break,
                             }
                         }

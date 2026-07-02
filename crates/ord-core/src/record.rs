@@ -47,6 +47,9 @@ mod stub {
         pub fn push_audio(&mut self, _f: &EncodedAudioFrame) -> Result<(), MuxError> {
             Ok(())
         }
+        pub fn held_audio_frames(&self) -> usize {
+            0
+        }
         pub fn finish(self) -> Result<PathBuf, MuxError> {
             Ok(PathBuf::new())
         }
@@ -63,11 +66,14 @@ mod imp {
 
     use crate::mux::{bitstream, stream};
 
-    /// How much encoded audio (µs) is held while waiting for the first video
-    /// keyframe. NVENC emits frames with encode latency, so in pump order the
-    /// audio for the recording's first moments arrives BEFORE the keyframe
-    /// carrying the matching timestamp — dropping it left recordings with a
-    /// silent (and player-confusing) audio hole at the start.
+    /// How much encoded audio (µs) may be held back at any time. Before the
+    /// header it bounds the preroll: NVENC emits frames with encode latency, so
+    /// in pump order the audio for the recording's first moments arrives BEFORE
+    /// the keyframe carrying the matching timestamp — dropping it left
+    /// recordings with a silent (and player-confusing) audio hole at the start.
+    /// After the header it bounds the backlog held while waiting for video to
+    /// advance: if video stalls (encoder hang, frozen compositor) while audio
+    /// keeps flowing, the queue must not grow for the life of the recording.
     const AUDIO_PREROLL_US: i64 = 5_000_000;
 
     /// An open recording: a live ffmpeg output context fed encoded packets.
@@ -162,19 +168,36 @@ mod imp {
             }
             self.pending_audio.push_back(frame.clone());
             if !self.started {
-                // Bound the preroll: keep only the newest few seconds.
-                while let (Some(front), Some(back)) =
-                    (self.pending_audio.front(), self.pending_audio.back())
-                {
-                    if back.timestamp_micros - front.timestamp_micros > AUDIO_PREROLL_US {
-                        self.pending_audio.pop_front();
-                    } else {
-                        break;
-                    }
-                }
+                self.bound_pending_audio();
                 return Ok(());
             }
-            self.flush_audio()
+            self.flush_audio()?;
+            self.bound_pending_audio();
+            Ok(())
+        }
+
+        /// Keep only the newest [`AUDIO_PREROLL_US`] of held-back audio. Before
+        /// the header this trims the preroll silently; after it, dropping means
+        /// video has stalled for seconds while audio kept arriving — worth a
+        /// warning, and strictly better than unbounded growth.
+        fn bound_pending_audio(&mut self) {
+            let mut dropped = 0usize;
+            while let (Some(front), Some(back)) =
+                (self.pending_audio.front(), self.pending_audio.back())
+            {
+                if back.timestamp_micros - front.timestamp_micros > AUDIO_PREROLL_US {
+                    self.pending_audio.pop_front();
+                    dropped += 1;
+                } else {
+                    break;
+                }
+            }
+            if dropped > 0 && self.started {
+                tracing::warn!(
+                    dropped,
+                    "video stalled during recording; dropping oldest held-back audio"
+                );
+            }
         }
 
         /// Write buffered audio up to the newest video pts; drop anything from
@@ -203,6 +226,12 @@ mod imp {
                 packet.write_interleaved(&mut self.octx)?;
             }
             Ok(())
+        }
+
+        /// How many audio frames are currently held back waiting for video.
+        /// Diagnostics/testing: bounded by [`AUDIO_PREROLL_US`] worth of audio.
+        pub fn held_audio_frames(&self) -> usize {
+            self.pending_audio.len()
         }
 
         /// Finalize the file and return its path. Buffered audio past the last

@@ -10,9 +10,12 @@
 //! is kept in pts order (correcting the occasional B-frame reorder), eviction is
 //! a time window anchored to the newest pts seen, and `window` materializes a
 //! range in order. Payloads are appended in arrival order; eviction leaves holes
-//! that a periodic compaction reclaims, so disk use stays bounded to roughly the
-//! live window. The hot path (`push`) does one positioned write and no
-//! allocation beyond the metadata entry.
+//! that an *incremental* compaction reclaims (a bounded slice of live payload is
+//! migrated per push; see [`COMPACT_BUDGET_BYTES`]), so disk use stays bounded
+//! to roughly the live window while `push` latency stays bounded no matter how
+//! large the window is. The hot path (`push`) does one positioned write, at
+//! most one budgeted compaction slice, and no allocation beyond the metadata
+//! entry.
 
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
@@ -27,7 +30,8 @@ use crate::store::{FrameMeta, FrameStore};
 use crate::Ticks;
 
 /// One frame's location + metadata. The payload lives at `[offset, offset+len)`
-/// in the spill file.
+/// in the spill file. During an in-flight compaction, `new_offset` records
+/// where the payload has already been copied to in the replacement file.
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     offset: u64,
@@ -35,11 +39,29 @@ struct Entry {
     pts: Ticks,
     dts: Ticks,
     is_keyframe: bool,
+    new_offset: Option<u64>,
 }
 
 /// Compaction triggers once dead (evicted) payload bytes exceed this AND make up
 /// more than half the file, so steady-state churn rewrites the file rarely.
 const COMPACT_MIN_DEAD_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Per-push byte budget for incremental compaction copying. Bounds the extra
+/// I/O any single `push` performs: the store contract says `push` sits on the
+/// capture drain path and must never stall it, so the file rewrite is
+/// amortized across pushes instead of running as one synchronous sweep (which
+/// took seconds on a large window and overflowed the capture channel).
+const COMPACT_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+
+/// An in-flight incremental compaction: live payloads migrate into `tmp` a
+/// budgeted slice per push; the swap happens only once every live entry has
+/// been copied. Reads keep using the old file (old offsets stay authoritative)
+/// until the swap, so `window` is never split across files.
+struct Compaction {
+    tmp_path: PathBuf,
+    tmp: File,
+    new_write_offset: u64,
+}
 
 /// A bounded, time-windowed store that spills encoded payloads to disk.
 pub struct DiskFrameStore {
@@ -56,6 +78,11 @@ pub struct DiskFrameStore {
     capacity_ticks: Ticks,
     ticks_per_sec: i64,
     max_pts: Ticks,
+    compact_min_dead_bytes: u64,
+    compaction: Option<Compaction>,
+    /// Frames dropped because a spill write failed (ENOSPC, dead disk). A
+    /// growing count means the replay window is silently hollowing out.
+    write_errors: u64,
 }
 
 impl DiskFrameStore {
@@ -88,7 +115,23 @@ impl DiskFrameStore {
             capacity_ticks: capacity_seconds.max(1) as i64 * ticks_per_sec,
             ticks_per_sec,
             max_pts: i64::MIN,
+            compact_min_dead_bytes: COMPACT_MIN_DEAD_BYTES,
+            compaction: None,
+            write_errors: 0,
         })
+    }
+
+    /// Tune when compaction starts (dead bytes threshold). Mainly for tests —
+    /// the default only rewrites the file once ≥ 32 MiB are reclaimable.
+    pub fn with_compact_min_dead_bytes(mut self, bytes: u64) -> Self {
+        self.compact_min_dead_bytes = bytes;
+        self
+    }
+
+    /// Frames dropped because their spill write failed (e.g. disk full). A
+    /// nonzero, growing value means the replay window is hollowing out.
+    pub fn write_errors(&self) -> u64 {
+        self.write_errors
     }
 
     /// Insert `entry` into the pts-ordered index (append-fast-path, else sorted
@@ -123,47 +166,96 @@ impl DiskFrameStore {
         }
     }
 
-    /// Reclaim file space when evicted payloads dominate the file: copy live
-    /// frames (one at a time, bounded memory) into a fresh spill file and swap.
+    /// Reclaim file space when evicted payloads dominate the file. The rewrite
+    /// is *incremental*: each call copies at most [`COMPACT_BUDGET_BYTES`] of
+    /// live payload into the replacement file, and the swap happens on the
+    /// call that finishes the migration — `push` latency stays bounded no
+    /// matter how large the window is.
     fn maybe_compact(&mut self) {
-        if self.dead_bytes < COMPACT_MIN_DEAD_BYTES || self.dead_bytes * 2 <= self.write_offset {
+        if self.compaction.is_none()
+            && (self.dead_bytes < self.compact_min_dead_bytes
+                || self.dead_bytes * 2 <= self.write_offset)
+        {
             return;
         }
-        if let Err(e) = self.compact() {
+        if let Err(e) = self.compact_step() {
             // Compaction is an optimization; on failure keep serving from the
             // existing (larger) file rather than risk losing the buffer.
             tracing::warn!(error = %e, "replay disk compaction failed; continuing");
+            self.abort_compaction();
         }
     }
 
-    fn compact(&mut self) -> io::Result<()> {
-        let tmp_path = self.path.with_extension("compact");
-        let tmp = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        let mut new_offset = 0u64;
+    fn compact_step(&mut self) -> io::Result<()> {
+        if self.compaction.is_none() {
+            let tmp_path = self.path.with_extension("compact");
+            let tmp = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            for e in self.index.iter_mut() {
+                e.new_offset = None;
+            }
+            self.compaction = Some(Compaction {
+                tmp_path,
+                tmp,
+                new_write_offset: 0,
+            });
+        }
+        let Some(c) = self.compaction.as_mut() else {
+            return Ok(());
+        };
+
+        let mut budget = COMPACT_BUDGET_BYTES;
         let mut buf = Vec::new();
-        let mut new_index: VecDeque<Entry> = VecDeque::with_capacity(self.index.len());
-        for e in &self.index {
+        let mut remaining = false;
+        for e in self.index.iter_mut() {
+            if e.new_offset.is_some() {
+                continue;
+            }
+            if budget < e.len as u64 {
+                remaining = true;
+                break;
+            }
             buf.resize(e.len as usize, 0);
             self.file.read_exact_at(&mut buf, e.offset)?;
-            tmp.write_all_at(&buf, new_offset)?;
-            new_index.push_back(Entry {
-                offset: new_offset,
-                ..*e
-            });
-            new_offset += e.len as u64;
+            c.tmp.write_all_at(&buf, c.new_write_offset)?;
+            e.new_offset = Some(c.new_write_offset);
+            c.new_write_offset += e.len as u64;
+            budget -= e.len as u64;
         }
-        tmp.sync_data().ok();
-        std::fs::rename(&tmp_path, &self.path)?;
-        self.file = tmp;
-        self.index = new_index;
-        self.write_offset = new_offset;
-        self.dead_bytes = 0;
+        if remaining {
+            return Ok(());
+        }
+
+        // Every live entry is migrated: swap the files. Entries evicted after
+        // being copied leave dead bytes in the fresh file; account for them so
+        // the next compaction cycle triggers correctly.
+        let Some(c) = self.compaction.take() else {
+            return Ok(());
+        };
+        c.tmp.sync_data().ok();
+        std::fs::rename(&c.tmp_path, &self.path)?;
+        self.file = c.tmp;
+        for e in self.index.iter_mut() {
+            if let Some(new) = e.new_offset.take() {
+                e.offset = new;
+            }
+        }
+        self.write_offset = c.new_write_offset;
+        self.dead_bytes = c.new_write_offset.saturating_sub(self.live_bytes as u64);
         Ok(())
+    }
+
+    fn abort_compaction(&mut self) {
+        if let Some(c) = self.compaction.take() {
+            let _ = std::fs::remove_file(&c.tmp_path);
+        }
+        for e in self.index.iter_mut() {
+            e.new_offset = None;
+        }
     }
 }
 
@@ -185,8 +277,13 @@ impl FrameStore for DiskFrameStore {
             .write_all_at(&frame.data, self.write_offset)
             .is_err()
         {
-            // A failed spill write must not panic the hot path; drop the frame.
-            tracing::warn!("replay disk write failed; dropping frame");
+            // A failed spill write must not panic the hot path; drop the frame
+            // and count it so the hollowing window is observable.
+            self.write_errors += 1;
+            tracing::warn!(
+                total = self.write_errors,
+                "replay disk write failed; dropping frame"
+            );
             return;
         }
         let entry = Entry {
@@ -195,6 +292,7 @@ impl FrameStore for DiskFrameStore {
             pts: frame.pts,
             dts: frame.dts,
             is_keyframe: frame.is_keyframe,
+            new_offset: None,
         };
         self.write_offset += len as u64;
         self.live_bytes += len;
@@ -205,12 +303,15 @@ impl FrameStore for DiskFrameStore {
     }
 
     fn clear(&mut self) {
+        self.abort_compaction();
         self.index.clear();
         self.live_bytes = 0;
         self.dead_bytes = 0;
         self.write_offset = 0;
         self.max_pts = i64::MIN;
-        let _ = self.file.set_len(0);
+        if let Err(e) = self.file.set_len(0) {
+            tracing::warn!(error = %e, "could not truncate replay spill on clear");
+        }
     }
 
     fn set_capacity_seconds(&mut self, capacity_seconds: u32) {
@@ -260,20 +361,43 @@ impl FrameStore for DiskFrameStore {
     }
 
     fn window(&self, start: usize, count: usize) -> Vec<EncodedFrame> {
-        let mut out = Vec::with_capacity(count);
-        for e in self.index.iter().skip(start).take(count) {
-            let mut buf = vec![0u8; e.len as usize];
-            if self.file.read_exact_at(&mut buf, e.offset).is_err() {
+        // Payloads are appended in arrival order, so a save window is mostly
+        // contiguous on disk: coalescing adjacent entries into one read cuts
+        // syscalls by ~the GOP length, and `Bytes::slice` hands each frame a
+        // zero-copy view of the shared buffer.
+        const MAX_COALESCED_READ: u64 = 8 * 1024 * 1024;
+        let entries: Vec<&Entry> = self.index.iter().skip(start).take(count).collect();
+        let mut out = Vec::with_capacity(entries.len());
+        let mut i = 0;
+        while i < entries.len() {
+            let run_offset = entries[i].offset;
+            let mut run_len = entries[i].len as u64;
+            let mut j = i + 1;
+            while j < entries.len()
+                && entries[j].offset == run_offset + run_len
+                && run_len + entries[j].len as u64 <= MAX_COALESCED_READ
+            {
+                run_len += entries[j].len as u64;
+                j += 1;
+            }
+            let mut buf = vec![0u8; run_len as usize];
+            if self.file.read_exact_at(&mut buf, run_offset).is_err() {
                 // A read failure yields a short window rather than a panic; the
                 // muxer will reject a truncated clip and surface a clear error.
                 break;
             }
-            out.push(EncodedFrame::new(
-                Bytes::from(buf),
-                e.is_keyframe,
-                e.pts,
-                e.dts,
-            ));
+            let shared = Bytes::from(buf);
+            let mut off = 0usize;
+            for e in &entries[i..j] {
+                out.push(EncodedFrame::new(
+                    shared.slice(off..off + e.len as usize),
+                    e.is_keyframe,
+                    e.pts,
+                    e.dts,
+                ));
+                off += e.len as usize;
+            }
+            i = j;
         }
         out
     }
@@ -396,6 +520,51 @@ mod tests {
         s.push(frame(0.0, true, 9, 3));
         assert_eq!(s.len(), 1);
         assert_eq!(s.oldest_pts(), Some(0));
+    }
+
+    #[test]
+    fn compaction_reclaims_space_and_preserves_payloads() {
+        let path = tmp("compact");
+        let mut s = DiskFrameStore::create(&path, 5, MICROS_PER_SEC)
+            .unwrap()
+            .with_compact_min_dead_bytes(4 * 1024);
+        // 1 KiB frames 1 s apart with a 5 s window: most of the file becomes
+        // dead bytes, so the (lowered) threshold trips and the incremental
+        // migration completes within the same pushes.
+        for i in 0..100u32 {
+            s.push(frame(i as f64, true, i as u8, 1024));
+        }
+        assert_eq!(s.len(), 6);
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            file_len < 40 * 1024,
+            "compaction never reclaimed space: file is {file_len} bytes"
+        );
+        // Every surviving payload is intact after the file swap.
+        let win = s.window(0, s.len());
+        assert_eq!(win.len(), 6);
+        for (k, f) in win.iter().enumerate() {
+            let fill = (94 + k) as u8;
+            assert_eq!(&f.data[..], &[fill; 1024][..], "frame {k} corrupted");
+        }
+        assert_eq!(s.write_errors(), 0);
+    }
+
+    #[test]
+    fn compaction_survives_clear_and_reuse() {
+        let path = tmp("compact-clear");
+        let mut s = DiskFrameStore::create(&path, 3, MICROS_PER_SEC)
+            .unwrap()
+            .with_compact_min_dead_bytes(1024);
+        for i in 0..20u32 {
+            s.push(frame(i as f64, true, i as u8, 512));
+        }
+        s.clear();
+        assert_eq!(s.len(), 0);
+        // The store keeps working after an aborted/afterwards-cleared cycle.
+        s.push(frame(0.0, true, 0xEE, 256));
+        let win = s.window(0, 1);
+        assert_eq!(&win[0].data[..], &[0xEE; 256][..]);
     }
 
     #[test]

@@ -219,6 +219,42 @@ fn recorder_drops_until_first_keyframe() {
 }
 
 #[test]
+fn recorder_bounds_held_audio_during_video_stall() {
+    // Regression: after the header is written, a stalled video stream (encoder
+    // hang, frozen compositor) with audio still flowing must not grow the
+    // held-back audio queue without bound for the life of the recording.
+    let aparams = Some(AudioParams {
+        sample_rate: 48_000,
+        channels: 2,
+        codec: AudioCodec::Opus,
+    });
+    let out = std::env::temp_dir().join(format!("ord-record-stall-{}.mkv", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    let mut rec = Recorder::start(&out, params(), aparams).expect("start");
+
+    // One keyframe opens the file, then video freezes.
+    rec.push_video(&EncodedFrame::new(access_unit(true), true, 0, 0))
+        .expect("push keyframe");
+
+    // A minute of 20 ms audio chunks with no video progress.
+    let chunk = 20_000i64;
+    for i in 1..3_000i64 {
+        rec.push_audio(&EncodedAudioFrame::new(vec![0xfcu8; 40], i, i * chunk))
+            .expect("push audio");
+    }
+
+    // The 5 s hold-back window is 250 chunks; anything near 3000 means the
+    // bound regressed.
+    assert!(
+        rec.held_audio_frames() <= 260,
+        "held audio grew unbounded: {} frames",
+        rec.held_audio_frames()
+    );
+    let _ = rec.finish().expect("finish");
+    let _ = std::fs::remove_file(&out);
+}
+
+#[test]
 fn recorder_without_keyframe_finishes_safely() {
     // A recording that never sees a keyframe must not panic on finish.
     let out = std::env::temp_dir().join(format!("ord-record-empty-{}.mkv", std::process::id()));
