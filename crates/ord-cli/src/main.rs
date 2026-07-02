@@ -250,11 +250,7 @@ fn set_dotted(doc: &mut toml::Value, key: &str, value: &str) -> Result<(), Strin
 
 /// `ord config set key value`: fetch the effective config, patch one dotted
 /// key, and send the result back — the daemon persists the sparse diff.
-fn config_set(
-    client: &mut ord_common::Client,
-    key: &str,
-    value: &str,
-) -> Result<String, String> {
+fn config_set(client: &mut ord_common::Client, key: &str, value: &str) -> Result<String, String> {
     let reply = client
         .request(&Command::GetConfig)
         .map_err(|e| e.to_string())?;

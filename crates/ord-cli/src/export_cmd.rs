@@ -271,8 +271,8 @@ pub fn run_export(args: impl Iterator<Item = String>) -> Result<(), String> {
     }
     let p = parse_export(args.into_iter())?;
     let trim = p.trim()?;
-    let summary = export(&p.input, &p.output, &p.profile, trim)
-        .map_err(|e| format!("export failed: {e}"))?;
+    let summary =
+        export(&p.input, &p.output, &p.profile, trim).map_err(|e| format!("export failed: {e}"))?;
 
     let mib = summary.size_bytes as f64 / (1024.0 * 1024.0);
     let how = if summary.encoder.is_empty() {
