@@ -29,6 +29,24 @@ pub fn human_duration(secs: f64) -> String {
     }
 }
 
+/// Format a duration in seconds as `m:ss.mmm` (or `h:mm:ss.mmm` past an
+/// hour), e.g. `0:05.240` — the frame-accurate readout for the editor, where
+/// a one-frame step must visibly change the display.
+pub fn human_duration_ms(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "—".to_string();
+    }
+    let total_ms = (secs * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let total = total_ms / 1000;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}.{ms:03}")
+    } else {
+        format!("{m}:{s:02}.{ms:03}")
+    }
+}
+
 /// Format an epoch-seconds timestamp relative to `now`, e.g. `3 min ago`.
 /// Returns `—` for a missing (zero) timestamp.
 pub fn relative_time(epoch: u64, now: u64) -> String {
@@ -75,6 +93,19 @@ mod tests {
         assert_eq!(human_duration(3661.0), "1:01:01");
         assert_eq!(human_duration(-1.0), "—");
         assert_eq!(human_duration(f64::NAN), "—");
+    }
+
+    #[test]
+    fn durations_ms() {
+        assert_eq!(human_duration_ms(5.24), "0:05.240");
+        assert_eq!(human_duration_ms(72.007), "1:12.007");
+        assert_eq!(human_duration_ms(0.0), "0:00.000");
+        assert_eq!(human_duration_ms(3661.5), "1:01:01.500");
+        // Millisecond rounding carries into the seconds field.
+        assert_eq!(human_duration_ms(0.9996), "0:01.000");
+        assert_eq!(human_duration_ms(-1.0), "—");
+        assert_eq!(human_duration_ms(f64::NAN), "—");
+        assert_eq!(human_duration_ms(f64::INFINITY), "—");
     }
 
     #[test]

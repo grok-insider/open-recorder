@@ -318,6 +318,104 @@ impl View {
     }
 }
 
+/// What a drag starting at an on-track pixel grabs. The grab radius is wider
+/// than the visual handles (the fat-finger rule); in/out handles win over cut
+/// lines, and everything else scrubs the playhead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DragTarget {
+    In,
+    Out,
+    /// Sliding cut boundary `i` (see [`Segments::cut_points`]).
+    Cut(usize),
+    Playhead,
+}
+
+/// The cut line nearest `px` within `grab` px. `cuts` entries are
+/// `(boundary index, boundary time, on-screen x)`; returns `(index, time)`.
+pub fn nearest_cut(px: f32, cuts: &[(usize, f64, f32)], grab: f32) -> Option<(usize, f64)> {
+    cuts.iter()
+        .map(|&(i, t, x)| (i, t, (x - px).abs()))
+        .filter(|(_, _, d)| *d <= grab)
+        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, t, _)| (i, t))
+}
+
+/// Classify what a drag starting at `px` grabs: the nearer of the in/out
+/// handles when within `grab`, else a cut line within `grab`, else the
+/// playhead (a scrub).
+pub fn classify_drag(
+    px: f32,
+    in_x: f32,
+    out_x: f32,
+    cuts: &[(usize, f64, f32)],
+    grab: f32,
+) -> DragTarget {
+    let din = (px - in_x).abs();
+    let dout = (px - out_x).abs();
+    if din <= grab && din <= dout {
+        DragTarget::In
+    } else if dout <= grab {
+        DragTarget::Out
+    } else if let Some((i, _)) = nearest_cut(px, cuts, grab) {
+        DragTarget::Cut(i)
+    } else {
+        DragTarget::Playhead
+    }
+}
+
+/// Snap `t` to the nearest marker within `snap_px` on screen, given the
+/// current `view` over a track `track_w` px wide. Unsnapped `t` when no
+/// marker is in radius.
+pub fn snap_to_marker(t: f64, markers: &[f64], view: &View, track_w: f32, snap_px: f32) -> f64 {
+    let px_per_sec = track_w as f64 / view.span.max(1e-9);
+    let radius = snap_px as f64 / px_per_sec.max(1e-9);
+    markers
+        .iter()
+        .copied()
+        .map(|m| (m, (m - t).abs()))
+        .filter(|(_, d)| *d <= radius)
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(m, _)| m)
+        .unwrap_or(t)
+}
+
+/// Pointer-anchored zoom: apply an exponential wheel `scroll_delta` to `zoom`
+/// and re-derive `scroll` so the time under the pointer (at track fraction
+/// `frac`) stays put. Returns `(new_zoom, new_scroll)`, zoom clamped to
+/// `[1, max_zoom]`.
+pub fn zoom_anchored(
+    duration: f64,
+    zoom: f32,
+    scroll: f32,
+    frac: f32,
+    scroll_delta: f32,
+    max_zoom: f32,
+) -> (f32, f32) {
+    let old = View::new(duration, zoom, scroll);
+    let anchor = old.time_at(frac);
+    let factor = (scroll_delta as f64 * 0.005).exp() as f32;
+    let new_zoom = (zoom * factor).clamp(1.0, max_zoom);
+    let span = duration / new_zoom as f64;
+    let start = (anchor - frac as f64 * span).clamp(0.0, (duration - span).max(0.0));
+    let max_start = (duration - span).max(1e-9);
+    let new_scroll = (start / max_start).clamp(0.0, 1.0) as f32;
+    (new_zoom, new_scroll)
+}
+
+/// The cut list for export: the kept spans inside `[in_p, out_p]`, or `None`
+/// when nothing is actually cut out (a plain trim covers it — no re-encode
+/// detour through the concat filter). `Some(vec![])` means every piece is cut.
+pub fn export_spans(segments: &Segments, in_p: f64, out_p: f64) -> Option<Vec<(f64, f64)>> {
+    if segments.is_trivial() {
+        return None;
+    }
+    let spans = segments.kept_within(in_p, out_p);
+    if spans.len() == 1 && spans[0].0 <= in_p + 1e-6 && spans[0].1 >= out_p - 1e-6 {
+        return None; // splits exist but every piece is kept
+    }
+    Some(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,5 +603,161 @@ mod tests {
         let mut s = Segments::new(f64::NAN);
         assert!(!s.split_at(1.0));
         assert!(s.kept_within(0.0, 1.0).is_empty());
+    }
+
+    #[test]
+    fn export_spans_none_when_trivial_or_all_kept() {
+        let s = Segments::new(10.0);
+        assert_eq!(export_spans(&s, 0.0, 10.0), None);
+        // Splits exist but every piece is kept -> a plain trim covers it.
+        let mut s = Segments::new(10.0);
+        s.split_at(4.0);
+        assert_eq!(export_spans(&s, 0.0, 10.0), None);
+        assert_eq!(export_spans(&s, 2.0, 8.0), None);
+    }
+
+    #[test]
+    fn export_spans_reduces_cuts_to_kept_pieces() {
+        let mut s = Segments::new(10.0);
+        s.split_at(3.0);
+        s.split_at(7.0);
+        s.toggle_at(5.0);
+        assert_eq!(
+            export_spans(&s, 0.0, 10.0),
+            Some(vec![(0.0, 3.0), (7.0, 10.0)])
+        );
+        // Narrower in/out intersects the kept spans.
+        assert_eq!(
+            export_spans(&s, 1.0, 8.0),
+            Some(vec![(1.0, 3.0), (7.0, 8.0)])
+        );
+        // Everything cut -> Some(empty): the caller must not export.
+        s.toggle_at(1.0);
+        s.toggle_at(9.0);
+        assert_eq!(export_spans(&s, 0.0, 10.0), Some(vec![]));
+    }
+
+    #[test]
+    fn export_spans_cut_outside_window_is_a_plain_trim() {
+        // The only cut piece lies entirely outside in/out, so the window is
+        // one kept span covering it -> None (plain trim suffices).
+        let mut s = Segments::new(10.0);
+        s.split_at(8.0);
+        s.toggle_at(9.0);
+        assert_eq!(export_spans(&s, 0.0, 8.0), None);
+    }
+
+    #[test]
+    fn snap_snaps_within_radius_only() {
+        // Whole 10 s clip over a 100 px track: 10 px/s. snap_px 6 -> 0.6 s.
+        let v = View::new(10.0, 1.0, 0.0);
+        let markers = [5.0];
+        assert!(approx(snap_to_marker(5.5, &markers, &v, 100.0, 6.0), 5.0));
+        // Exactly at the radius edge still snaps (<=).
+        assert!(approx(snap_to_marker(5.6, &markers, &v, 100.0, 6.0), 5.0));
+        // Just beyond the radius does not.
+        assert!(approx(snap_to_marker(5.61, &markers, &v, 100.0, 6.0), 5.61));
+        // No markers -> unchanged.
+        assert!(approx(snap_to_marker(5.5, &[], &v, 100.0, 6.0), 5.5));
+    }
+
+    #[test]
+    fn snap_picks_nearest_marker_and_respects_zoom() {
+        let v = View::new(10.0, 1.0, 0.0);
+        let markers = [4.8, 5.3];
+        assert!(approx(snap_to_marker(5.2, &markers, &v, 100.0, 6.0), 5.3));
+        // Zoomed 10x: 100 px/s, radius shrinks to 0.06 s -> no snap at 0.5 s.
+        let vz = View::new(10.0, 10.0, 0.0);
+        assert!(approx(snap_to_marker(5.2, &markers, &vz, 100.0, 6.0), 5.2));
+        assert!(approx(snap_to_marker(5.25, &markers, &vz, 100.0, 6.0), 5.3));
+    }
+
+    #[test]
+    fn drag_classification_priorities() {
+        const GRAB: f32 = 10.0;
+        let cuts = [(1usize, 5.0f64, 50.0f32)];
+        // Near the in handle.
+        assert_eq!(classify_drag(12.0, 10.0, 90.0, &cuts, GRAB), DragTarget::In);
+        // Near the out handle.
+        assert_eq!(
+            classify_drag(88.0, 10.0, 90.0, &cuts, GRAB),
+            DragTarget::Out
+        );
+        // Overlapping handles: in wins the tie (din <= dout).
+        assert_eq!(classify_drag(50.0, 50.0, 50.0, &cuts, GRAB), DragTarget::In);
+        // On a cut line away from both handles.
+        assert_eq!(
+            classify_drag(52.0, 0.0, 100.0, &cuts, GRAB),
+            DragTarget::Cut(1)
+        );
+        // Handle beats a cut line when both are in range.
+        assert_eq!(
+            classify_drag(52.0, 55.0, 100.0, &cuts, GRAB),
+            DragTarget::In
+        );
+        // Away from every handle and cut line -> scrub.
+        assert_eq!(
+            classify_drag(30.0, 0.0, 100.0, &cuts, GRAB),
+            DragTarget::Playhead
+        );
+    }
+
+    #[test]
+    fn drag_grab_radius_edges() {
+        const GRAB: f32 = 10.0;
+        // Exactly at the radius grabs; a hair beyond scrubs.
+        assert_eq!(classify_drag(10.0, 0.0, 100.0, &[], GRAB), DragTarget::In);
+        assert_eq!(
+            classify_drag(10.5, 0.0, 100.0, &[], GRAB),
+            DragTarget::Playhead
+        );
+        let cuts = [(1usize, 5.0f64, 50.0f32)];
+        assert_eq!(
+            classify_drag(60.0, 0.0, 100.0, &cuts, GRAB),
+            DragTarget::Cut(1)
+        );
+        assert_eq!(
+            classify_drag(60.5, 0.0, 100.0, &cuts, GRAB),
+            DragTarget::Playhead
+        );
+    }
+
+    #[test]
+    fn nearest_cut_picks_closest() {
+        let cuts = [(1usize, 3.0f64, 30.0f32), (2, 7.0, 70.0)];
+        assert_eq!(nearest_cut(35.0, &cuts, 10.0), Some((1, 3.0)));
+        assert_eq!(nearest_cut(65.0, &cuts, 10.0), Some((2, 7.0)));
+        assert_eq!(nearest_cut(50.0, &cuts, 10.0), None);
+        assert_eq!(nearest_cut(50.0, &[], 10.0), None);
+    }
+
+    #[test]
+    fn zoom_anchored_keeps_pointer_time_fixed() {
+        let dur = 30.0;
+        let (zoom, scroll) = (2.0f32, 0.4f32);
+        let frac = 0.7f32;
+        let anchor = View::new(dur, zoom, scroll).time_at(frac);
+        let (z2, s2) = zoom_anchored(dur, zoom, scroll, frac, 120.0, 60.0);
+        assert!(z2 > zoom);
+        let after = View::new(dur, z2, s2).time_at(frac);
+        assert!((after - anchor).abs() < 1e-3, "{after} vs {anchor}");
+        // And zooming back out re-anchors too.
+        let (z3, s3) = zoom_anchored(dur, z2, s2, frac, -120.0, 60.0);
+        let back = View::new(dur, z3, s3).time_at(frac);
+        assert!((back - anchor).abs() < 1e-3);
+    }
+
+    #[test]
+    fn zoom_anchored_clamps() {
+        // Zooming out at 1x stays at 1x, scroll pinned to a valid value.
+        let (z, s) = zoom_anchored(30.0, 1.0, 0.0, 0.5, -500.0, 60.0);
+        assert!((z - 1.0).abs() < 1e-6);
+        assert!((0.0..=1.0).contains(&s));
+        // Zooming in hard clamps at max_zoom.
+        let (z, _) = zoom_anchored(30.0, 50.0, 0.5, 0.5, 10_000.0, 60.0);
+        assert!((z - 60.0).abs() < 1e-6);
+        // At the clip edge the anchor clamp keeps scroll in range.
+        let (_, s) = zoom_anchored(30.0, 4.0, 1.0, 1.0, 240.0, 60.0);
+        assert!((0.0..=1.0).contains(&s));
     }
 }

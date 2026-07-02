@@ -50,6 +50,40 @@ pub const KIN: Color32 = Color32::from_rgb(201, 162, 75);
 /// Quiet indigo for selection/focus fills.
 pub const AI: Color32 = Color32::from_rgb(94, 111, 163);
 
+// ---- Editor / grid surfaces ------------------------------------------------
+
+/// Thumbnail placeholder background (a step below the window BG so the empty
+/// frame reads as a screen, not a hole).
+pub const THUMB_BG: Color32 = Color32::from_rgb(10, 11, 13);
+/// Timeline playhead line + head.
+pub const PLAYHEAD: Color32 = Color32::WHITE;
+/// Text painted on accent fills and dark bubbles (trim-handle labels, the
+/// hover time bubble).
+pub const ON_ACCENT: Color32 = Color32::WHITE;
+/// Filmstrip tile tint (dimmed so overlays stay readable on top).
+pub const FILMSTRIP_TINT: Color32 = Color32::from_gray(150);
+/// Timeline ruler tick + label color.
+pub const RULER_TEXT: Color32 = Color32::from_gray(120);
+/// Dim over the timeline outside the in/out selection.
+pub const SCRIM: Color32 = Color32::from_black_alpha(130);
+/// Heavy dim over cut-out timeline pieces.
+pub const SCRIM_CUT: Color32 = Color32::from_black_alpha(190);
+/// Small label plate on cut-out pieces.
+pub const SCRIM_LABEL: Color32 = Color32::from_black_alpha(170);
+/// Hover time-bubble background.
+pub const BUBBLE_BG: Color32 = Color32::from_black_alpha(200);
+
+/// Faint white lift over the hovered timeline piece (compositing, so it can't
+/// be a const — `from_white_alpha` is gamma-corrected at runtime).
+pub fn hover_lift() -> Color32 {
+    Color32::from_white_alpha(5)
+}
+
+/// Ghost line under the timeline pointer.
+pub fn ghost_line() -> Color32 {
+    Color32::from_white_alpha(70)
+}
+
 // ---- Rhythm ----------------------------------------------------------------
 
 /// 8-pt spacing scale.
@@ -130,6 +164,11 @@ pub fn card() -> egui::Frame {
         .stroke(Stroke::new(1.0, HAIRLINE))
         .rounding(RADIUS_CARD)
         .inner_margin(egui::Margin::same(SP_3))
+}
+
+/// A clip card carrying the keyboard-focus ring.
+pub fn card_focused() -> egui::Frame {
+    card().stroke(Stroke::new(1.5, AI))
 }
 
 /// The header/footer chrome strip.

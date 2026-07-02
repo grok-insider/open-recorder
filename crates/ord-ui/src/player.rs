@@ -189,6 +189,10 @@ struct Shared {
     play_anchor: Mutex<Option<Instant>>,
     audio_buf: Mutex<VecDeque<f32>>,
     frames: Mutex<VecDeque<Frame>>,
+    /// Recycled frame-plane buffers: display-consumed (and dropped) frames
+    /// return their `Vec<u8>`s here so the decode thread's per-frame packing
+    /// reuses capacity instead of allocating multi-MB buffers 60×/s.
+    buf_pool: Mutex<Vec<Vec<u8>>>,
 }
 
 impl Shared {
@@ -255,6 +259,7 @@ impl Player {
             play_anchor: Mutex::new(None),
             audio_buf: Mutex::new(VecDeque::new()),
             frames: Mutex::new(VecDeque::new()),
+            buf_pool: Mutex::new(Vec::new()),
         });
 
         // Set up audio output (best-effort). Falls back to wall-clock if absent.
@@ -487,11 +492,16 @@ impl Player {
             self.progress_at = Instant::now();
         }
 
-        // Pick the newest decoded frame at or before the clock.
+        // Pick the newest decoded frame at or before the clock; frames popped
+        // over (and consumed ones below) return their buffers to the pool.
         let mut chosen: Option<Frame> = None;
+        let mut stale: Vec<Frame> = Vec::new();
         {
             let mut q = lock_tolerant(&self.shared.frames);
             while q.front().map(|f| f.pts() <= pos + 0.005).unwrap_or(false) {
+                if let Some(prev) = chosen.take() {
+                    stale.push(prev);
+                }
                 chosen = q.pop_front();
             }
             // Right after a seek the queue may only hold frames slightly ahead
@@ -500,6 +510,9 @@ impl Player {
             if chosen.is_none() && self.needs_frame {
                 chosen = q.pop_front();
             }
+        }
+        for f in stale {
+            recycle_frame(&self.shared.buf_pool, f);
         }
         if let Some(f) = chosen {
             let pts = f.pts();
@@ -524,13 +537,22 @@ impl Player {
                                 ));
                             }
                         }
+                        // The pixels were copied into the ColorImage above.
+                        pool_give(&self.shared.buf_pool, vf.rgba);
                     }
                     Frame::Nv12(nv) => {
-                        *lock_tolerant(&self.gl_pending) = Some(nv);
+                        // The previous frame's planes are already on the GPU.
+                        let old = lock_tolerant(&self.gl_pending).replace(nv);
+                        if let Some(prev) = old {
+                            pool_give(&self.shared.buf_pool, prev.y);
+                            pool_give(&self.shared.buf_pool, prev.uv);
+                        }
                     }
                 }
                 self.shown_pts = pts;
                 self.needs_frame = false;
+            } else {
+                recycle_frame(&self.shared.buf_pool, f);
             }
         }
 
@@ -870,7 +892,10 @@ impl DecodeSession {
             if let Some((_, adec)) = self.audio.as_mut() {
                 adec.flush();
             }
-            lock_tolerant(&self.shared.frames).clear();
+            let stale: Vec<Frame> = lock_tolerant(&self.shared.frames).drain(..).collect();
+            for f in stale {
+                recycle_frame(&self.shared.buf_pool, f);
+            }
             lock_tolerant(&self.shared.audio_buf).clear();
             // The demuxer is now at the keyframe BEFORE `t`; decode-and-drop up
             // to the target so the first queued frame is the one asked for.
@@ -997,7 +1022,13 @@ impl DecodeSession {
                 continue;
             }
 
-            if let Some(f) = make_frame(&frame, &mut self.scaler, self.render_gl, pts) {
+            if let Some(f) = make_frame(
+                &frame,
+                &mut self.scaler,
+                self.render_gl,
+                pts,
+                &self.shared.buf_pool,
+            ) {
                 self.shared.decoded.fetch_add(1, Ordering::Relaxed);
                 lock_tolerant(&self.shared.frames).push_back(f);
             }
@@ -1161,12 +1192,13 @@ fn make_frame(
     scaler: &mut Option<ff::software::scaling::context::Context>,
     render_gl: bool,
     pts: f64,
+    pool: &Mutex<Vec<Vec<u8>>>,
 ) -> Option<Frame> {
     let (full_range, bt601) = color_flags(frame);
 
     // Fast path: GPU render + cuvid's native NV12 → pack planes directly.
     if render_gl && frame.format() == ff::format::Pixel::NV12 {
-        return Some(Frame::Nv12(pack_nv12(frame, pts, full_range, bt601)));
+        return Some(Frame::Nv12(pack_nv12(pool, frame, pts, full_range, bt601)));
     }
 
     // Otherwise swscale to the target format at preview width (built lazily).
@@ -1195,9 +1227,9 @@ fn make_frame(
     let mut out = ff::frame::Video::empty();
     sc.run(frame, &mut out).ok()?;
     if render_gl {
-        Some(Frame::Nv12(pack_nv12(&out, pts, full_range, bt601)))
+        Some(Frame::Nv12(pack_nv12(pool, &out, pts, full_range, bt601)))
     } else {
-        Some(Frame::Rgba(pack_rgba(&out, pts)))
+        Some(Frame::Rgba(pack_rgba(pool, &out, pts)))
     }
 }
 
@@ -1214,6 +1246,7 @@ fn color_flags(frame: &ff::frame::Video) -> (bool, bool) {
 
 /// Copy an NV12 frame's Y and interleaved-UV planes into tight (unpadded) buffers.
 fn pack_nv12(
+    pool: &Mutex<Vec<Vec<u8>>>,
     src: &ff::frame::Video,
     pts: f64,
     full_range: bool,
@@ -1222,9 +1255,9 @@ fn pack_nv12(
     let w = src.width() as usize;
     let h = src.height() as usize;
 
-    let y = pack_plane(src.data(0), src.stride(0), w, h);
+    let y = pack_plane(pool, src.data(0), src.stride(0), w, h);
     // NV12 chroma: h/2 rows of w bytes (w/2 interleaved Cb,Cr pairs).
-    let uv = pack_plane(src.data(1), src.stride(1), w, h / 2);
+    let uv = pack_plane(pool, src.data(1), src.stride(1), w, h / 2);
 
     crate::glvideo::Nv12 {
         w,
@@ -1238,22 +1271,65 @@ fn pack_nv12(
 }
 
 /// Copy a scaled RGBA frame into a tight (no row padding) buffer.
-fn pack_rgba(rgba: &ff::frame::Video, pts: f64) -> VideoFrame {
+fn pack_rgba(pool: &Mutex<Vec<Vec<u8>>>, rgba: &ff::frame::Video, pts: f64) -> VideoFrame {
     let w = rgba.width() as usize;
     let h = rgba.height() as usize;
     VideoFrame {
         width: w,
         height: h,
-        rgba: pack_plane(rgba.data(0), rgba.stride(0), w * 4, h),
+        rgba: pack_plane(pool, rgba.data(0), rgba.stride(0), w * 4, h),
         pts,
     }
 }
 
+/// Cap on recycled plane buffers — a little above the paused look-ahead, well
+/// under the playing queue, so the pool absorbs the steady display-consume
+/// cycle without pinning a whole queue's worth of memory.
+const BUF_POOL_MAX: usize = 8;
+
+fn pool_take(pool: &Mutex<Vec<Vec<u8>>>) -> Vec<u8> {
+    lock_tolerant(pool).pop().unwrap_or_default()
+}
+
+fn pool_give(pool: &Mutex<Vec<Vec<u8>>>, buf: Vec<u8>) {
+    let mut p = lock_tolerant(pool);
+    if p.len() < BUF_POOL_MAX {
+        p.push(buf);
+    }
+}
+
+/// Return a consumed/dropped frame's plane buffers to the pool.
+fn recycle_frame(pool: &Mutex<Vec<Vec<u8>>>, frame: Frame) {
+    match frame {
+        Frame::Rgba(f) => pool_give(pool, f.rgba),
+        Frame::Nv12(f) => {
+            pool_give(pool, f.y);
+            pool_give(pool, f.uv);
+        }
+    }
+}
+
 /// Copy `h` rows of `row` bytes out of a (possibly padded) plane into a tight
-/// buffer. `with_capacity` + extend: no zero-fill memset of multi-MB buffers
-/// on the per-frame path, and a single memcpy when the plane is already tight.
-fn pack_plane(data: &[u8], stride: usize, row: usize, h: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(row * h);
+/// buffer drawn from the pool (its retained capacity makes the steady-state
+/// per-frame packing allocation-free).
+fn pack_plane(
+    pool: &Mutex<Vec<Vec<u8>>>,
+    data: &[u8],
+    stride: usize,
+    row: usize,
+    h: usize,
+) -> Vec<u8> {
+    let mut buf = pool_take(pool);
+    pack_plane_into(&mut buf, data, stride, row, h);
+    buf
+}
+
+/// The pure packing: `reserve` + extend, so there is no zero-fill memset of
+/// multi-MB buffers on the per-frame path, and a single memcpy when the plane
+/// is already tight.
+fn pack_plane_into(buf: &mut Vec<u8>, data: &[u8], stride: usize, row: usize, h: usize) {
+    buf.clear();
+    buf.reserve(row * h);
     if stride == row {
         buf.extend_from_slice(&data[..row * h]);
     } else {
@@ -1261,7 +1337,6 @@ fn pack_plane(data: &[u8], stride: usize, row: usize, h: usize) -> Vec<u8> {
             buf.extend_from_slice(&data[r * stride..r * stride + row]);
         }
     }
-    buf
 }
 
 /// The resampler's output layout must describe the device's REAL channel
@@ -1325,13 +1400,39 @@ mod tests {
     fn pack_plane_strips_row_padding() {
         // 3 rows of 4 bytes with stride 6 (2 padding bytes per row).
         let data: Vec<u8> = (0..18).collect();
-        let tight = pack_plane(&data, 6, 4, 3);
+        let mut tight = Vec::new();
+        pack_plane_into(&mut tight, &data, 6, 4, 3);
         assert_eq!(tight, vec![0, 1, 2, 3, 6, 7, 8, 9, 12, 13, 14, 15]);
     }
 
     #[test]
     fn pack_plane_tight_stride_is_one_copy() {
         let data: Vec<u8> = (0..12).collect();
-        assert_eq!(pack_plane(&data, 4, 4, 3), data);
+        let mut buf = vec![9u8; 3]; // stale content must be replaced
+        pack_plane_into(&mut buf, &data, 4, 4, 3);
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn buffer_pool_reuses_capacity_and_caps() {
+        let pool = Mutex::new(Vec::new());
+        // A returned buffer's capacity is reused by the next take.
+        pool_give(&pool, Vec::with_capacity(4096));
+        let buf = pool_take(&pool);
+        assert!(buf.capacity() >= 4096);
+        assert!(buf.is_empty() || buf.capacity() >= buf.len());
+        // Packing through the pool produces correct bytes.
+        pool_give(&pool, buf);
+        let data: Vec<u8> = (0..12).collect();
+        let packed = pack_plane(&pool, &data, 4, 4, 3);
+        assert_eq!(packed, data);
+        // The pool never grows past its cap.
+        for _ in 0..(BUF_POOL_MAX * 2) {
+            pool_give(&pool, Vec::new());
+        }
+        assert_eq!(lock_tolerant(&pool).len(), BUF_POOL_MAX);
+        // An empty pool hands out a fresh buffer.
+        lock_tolerant(&pool).clear();
+        assert!(pool_take(&pool).is_empty());
     }
 }

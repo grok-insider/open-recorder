@@ -6,7 +6,7 @@
 //! (via [`ord_export`] presets), Reveal, and Delete. Metadata and thumbnails are
 //! loaded off the UI thread so the window stays responsive.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -19,7 +19,7 @@ use ord_export::{export_with, ExportSummary, Preset, Trim};
 
 use crate::editor::{EditorAction, EditorState};
 use crate::format::{human_duration, human_size, relative_time, resolution};
-use crate::library::{filter_sort, scan_dir, Clip, SortOrder};
+use crate::library::{changed_paths, filter_sort, scan_dir, Clip, SortOrder};
 use crate::meta::{self, ClipMeta};
 use crate::settings_view::{SettingsAction, SettingsView};
 use crate::theme;
@@ -73,6 +73,23 @@ struct ClipState {
 pub struct LibraryApp {
     clips_dir: PathBuf,
     clips: Vec<Clip>,
+    /// Finished exports (`<clips_dir>/exports`), shown in their own section.
+    export_clips: Vec<Clip>,
+    /// Last-seen mtime per discovered file, so a refresh only re-probes
+    /// new/changed clips instead of sweeping the whole library.
+    mtimes: HashMap<PathBuf, Option<SystemTime>>,
+    /// Bumped on every (re)scan; part of the view-cache key.
+    library_gen: u64,
+    /// Cached `filter_sort` results (recomputing + cloning the whole clip
+    /// vector every repaint is wasted work at 60 fps).
+    view_clips: Vec<Clip>,
+    view_exports: Vec<Clip>,
+    view_key: Option<(String, SortOrder, u64)>,
+    /// Keyboard-focused card: an index into the current view (library cards
+    /// first, then exports).
+    focused: Option<usize>,
+    /// The focus just moved via the keyboard: scroll the card into view once.
+    focus_scroll: bool,
     states: HashMap<PathBuf, ClipState>,
     loader_rx: Receiver<Loaded>,
     loader_tx: Sender<Loaded>,
@@ -82,7 +99,8 @@ pub struct LibraryApp {
     confirm_delete: Option<PathBuf>,
     status: Option<(String, Instant)>,
     styled: bool,
-    loading: bool,
+    /// The initial scan+load has been kicked off.
+    scanned: bool,
     /// When `Some`, the trim editor is shown instead of the library grid.
     editor: Option<EditorState>,
     /// A library rescan (new clip saved / recording stopped) arrived while the
@@ -120,9 +138,8 @@ pub struct LibraryApp {
 }
 
 impl LibraryApp {
-    /// Build the app, scanning `clips_dir` immediately.
+    /// Build the app; the first `update` scans `clips_dir` before painting.
     pub fn new(clips_dir: PathBuf) -> Self {
-        let clips = scan_dir(&clips_dir);
         let (loader_tx, loader_rx) = channel();
         let (export_tx, export_rx) = channel();
         let (daemon_tx, daemon_rx) = channel();
@@ -130,7 +147,15 @@ impl LibraryApp {
         let (events_tx, events_rx) = channel();
         Self {
             clips_dir,
-            clips,
+            clips: Vec::new(),
+            export_clips: Vec::new(),
+            mtimes: HashMap::new(),
+            library_gen: 0,
+            view_clips: Vec::new(),
+            view_exports: Vec::new(),
+            view_key: None,
+            focused: None,
+            focus_scroll: false,
             states: HashMap::new(),
             loader_rx,
             loader_tx,
@@ -140,7 +165,7 @@ impl LibraryApp {
             confirm_delete: None,
             status: None,
             styled: false,
-            loading: false,
+            scanned: false,
             editor: None,
             pending_refresh: false,
             watchdog: crate::diag::Watchdog::start(std::time::Duration::from_secs(4)),
@@ -374,12 +399,38 @@ impl LibraryApp {
         self.status = Some((msg.into(), Instant::now()));
     }
 
-    /// (Re)scan the directory and kick off background loading.
+    /// (Re)scan the library + exports and kick off background loading — but
+    /// only for new/changed files: entries whose path+mtime are unchanged
+    /// keep their probed metadata and thumbnail texture, and removed paths
+    /// are dropped.
     fn refresh(&mut self, ctx: &egui::Context) {
-        self.clips = scan_dir(&self.clips_dir);
-        self.states.clear();
+        let clips = scan_dir(&self.clips_dir);
+        let export_clips = scan_dir(&meta::exports_dir(&self.clips_dir));
+        let fresh: Vec<(PathBuf, Option<SystemTime>)> = clips
+            .iter()
+            .chain(export_clips.iter())
+            .map(|c| (c.path.clone(), file_mtime(&c.path)))
+            .collect();
+        let changed: HashSet<PathBuf> = changed_paths(&self.mtimes, &fresh).into_iter().collect();
+        for path in &changed {
+            self.states.remove(path);
+        }
+        self.mtimes = fresh.into_iter().collect();
+        let live = &self.mtimes;
+        self.states.retain(|path, _| live.contains_key(path));
+        let to_load: Vec<Clip> = clips
+            .iter()
+            .chain(export_clips.iter())
+            .filter(|c| changed.contains(&c.path))
+            .cloned()
+            .collect();
+        self.clips = clips;
+        self.export_clips = export_clips;
+        self.library_gen = self.library_gen.wrapping_add(1);
         self.confirm_delete = None;
-        self.start_loading(ctx);
+        if !to_load.is_empty() {
+            self.start_loading(to_load, ctx);
+        }
     }
 
     /// Rescan now — unless the editor is open, in which case defer until it
@@ -393,13 +444,87 @@ impl LibraryApp {
         }
     }
 
-    /// Spawn the loader thread for the current clip set.
-    fn start_loading(&mut self, ctx: &egui::Context) {
-        let clips = self.clips.clone();
+    /// Recompute the cached query/sort views only when their inputs (query,
+    /// sort order, library generation) changed since the last repaint.
+    fn rebuild_views(&mut self) {
+        let dirty = match &self.view_key {
+            Some((q, s, g)) => q != &self.query || *s != self.sort || *g != self.library_gen,
+            None => true,
+        };
+        if !dirty {
+            return;
+        }
+        self.view_clips = filter_sort(&self.clips, &self.query, self.sort);
+        self.view_exports = filter_sort(&self.export_clips, &self.query, self.sort);
+        self.view_key = Some((self.query.clone(), self.sort, self.library_gen));
+        let total = self.view_clips.len() + self.view_exports.len();
+        if self.focused.is_some_and(|i| i >= total) {
+            self.focused = total.checked_sub(1);
+        }
+    }
+
+    /// Keyboard navigation over the card grid: arrows move the focused card
+    /// (grid-aware via `cols`), Enter opens it, Delete asks the usual
+    /// confirmation. Inert while a widget (the search box) has focus.
+    fn grid_keys(&mut self, ctx: &egui::Context, cols: usize, clips: &[Clip], exports: &[Clip]) {
+        let total = clips.len() + exports.len();
+        if total == 0 || ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+        let (left, right, up, down, enter, delete) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+                i.key_pressed(egui::Key::Delete),
+            )
+        });
+        if left || right || up || down {
+            let next = match self.focused {
+                None => 0,
+                Some(i) => {
+                    let i = i.min(total - 1);
+                    if left {
+                        i.saturating_sub(1)
+                    } else if right {
+                        (i + 1).min(total - 1)
+                    } else if up {
+                        i.saturating_sub(cols)
+                    } else {
+                        (i + cols).min(total - 1)
+                    }
+                }
+            };
+            self.focused = Some(next);
+            self.focus_scroll = true;
+        }
+        let Some(i) = self.focused.filter(|i| *i < total) else {
+            return;
+        };
+        let (clip, is_export) = if i < clips.len() {
+            (&clips[i], false)
+        } else {
+            (&exports[i - clips.len()], true)
+        };
+        if enter {
+            if is_export {
+                open_clip(&clip.path);
+            } else {
+                self.open_editor(clip, ctx);
+            }
+        }
+        if delete {
+            self.confirm_delete = Some(clip.path.clone());
+        }
+    }
+
+    /// Spawn a loader thread for `clips` (metadata probe + thumbnail decode).
+    fn start_loading(&mut self, clips: Vec<Clip>, ctx: &egui::Context) {
         let tx = self.loader_tx.clone();
         let ctx = ctx.clone();
         let visible = Arc::clone(&self.visible);
-        self.loading = true;
         std::thread::spawn(move || {
             // Only nudge a repaint when the window is visible; while hidden the
             // data is still queued and gets drained/shown on the next re-show, so
@@ -459,6 +584,8 @@ impl LibraryApp {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
                     self.set_status(format!("Exported → {name}  ({})", human_size(s.size_bytes)));
+                    // The new file must appear in the Exports section.
+                    self.request_refresh(ctx);
                 }
                 Err(e) if e == ord_export::ExportError::Cancelled.to_string() => {
                     self.set_status("Export cancelled");
@@ -570,6 +697,10 @@ fn decode_image(path: &Path) -> Option<egui::ColorImage> {
         [w as usize, h as usize],
         img.as_raw(),
     ))
+}
+
+fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
 fn now_epoch() -> u64 {
@@ -692,10 +823,12 @@ impl eframe::App for LibraryApp {
         }
 
         self.watchdog.beat("library");
-        if !self.loading {
-            self.start_loading(ctx);
+        if !self.scanned {
+            self.scanned = true;
+            self.refresh(ctx);
         }
         self.start_daemon_poll(ctx);
+        self.rebuild_views();
 
         let now = now_epoch();
         let total_size: u64 = self
@@ -713,11 +846,15 @@ impl eframe::App for LibraryApp {
                     self.daemon_badge(ui);
                     ui.add_space(theme::SP_3);
 
-                    // Search-as-you-type over clip names; Esc clears.
+                    // Search-as-you-type over clip names; Esc clears; Ctrl+F
+                    // focuses it from anywhere in the library.
                     let search = egui::TextEdit::singleline(&mut self.query)
                         .hint_text("Search clips…")
                         .desired_width(180.0);
                     let resp = ui.add(search);
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+                        resp.request_focus();
+                    }
                     if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         self.query.clear();
                     }
@@ -780,7 +917,7 @@ impl eframe::App for LibraryApp {
         egui::CentralPanel::default()
             .frame(panel_frame)
             .show(ctx, |ui| {
-                if self.clips.is_empty() {
+                if self.clips.is_empty() && self.export_clips.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(96.0);
                         ui.label(
@@ -801,10 +938,7 @@ impl eframe::App for LibraryApp {
                     return;
                 }
 
-                // The query/sort view of the model (also the owned snapshot that
-                // lets the card closures mutate `self`).
-                let clips = filter_sort(&self.clips, &self.query, self.sort);
-                if clips.is_empty() {
+                if self.view_clips.is_empty() && self.view_exports.is_empty() {
                     ui.vertical_centered(|ui| {
                         ui.add_space(96.0);
                         ui.label(
@@ -825,20 +959,41 @@ impl eframe::App for LibraryApp {
                 const CARD_OUTER_W: f32 = CARD_INNER_W + 2.0 * theme::SP_3 + 8.0;
                 let spacing = theme::SP_3;
                 let cols = (((avail + spacing) / (CARD_OUTER_W + spacing)).floor() as usize).max(1);
+                // Owned snapshots of the cached views, so the card closures can
+                // mutate `self`; restored below (no per-repaint clone).
+                let clips = std::mem::take(&mut self.view_clips);
+                let exports = std::mem::take(&mut self.view_exports);
+                self.grid_keys(ctx, cols, &clips, &exports);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         ui.add_space(4.0);
                         ui.spacing_mut().item_spacing = egui::vec2(spacing, spacing);
+                        let mut idx = 0usize;
                         for row in clips.chunks(cols) {
                             ui.horizontal(|ui| {
                                 for clip in row {
-                                    self.card(ui, clip, now, ctx);
+                                    self.card(ui, clip, now, ctx, false, idx);
+                                    idx += 1;
                                 }
                             });
                         }
+                        if !exports.is_empty() {
+                            theme::section(ui, "Exports");
+                            for row in exports.chunks(cols) {
+                                ui.horizontal(|ui| {
+                                    for clip in row {
+                                        self.card(ui, clip, now, ctx, true, idx);
+                                        idx += 1;
+                                    }
+                                });
+                            }
+                        }
                         ui.add_space(8.0);
                     });
+                self.focus_scroll = false;
+                self.view_clips = clips;
+                self.view_exports = exports;
             });
     }
 }
@@ -964,12 +1119,30 @@ impl LibraryApp {
         }
     }
 
-    fn card(&mut self, ui: &mut egui::Ui, clip: &Clip, now: u64, ctx: &egui::Context) {
-        theme::card().show(ui, |ui| {
+    fn card(
+        &mut self,
+        ui: &mut egui::Ui,
+        clip: &Clip,
+        now: u64,
+        ctx: &egui::Context,
+        is_export: bool,
+        idx: usize,
+    ) {
+        let focused = self.focused == Some(idx);
+        let frame = if focused {
+            theme::card_focused()
+        } else {
+            theme::card()
+        };
+        let resp = frame.show(ui, |ui| {
             ui.set_width(CARD_INNER_W);
             ui.vertical(|ui| {
-                if self.thumbnail(ui, clip) {
-                    self.open_editor(clip, ctx);
+                if self.thumbnail(ui, clip, is_export) {
+                    if is_export {
+                        open_clip(&clip.path);
+                    } else {
+                        self.open_editor(clip, ctx);
+                    }
                 }
                 ui.add_space(theme::SP_2);
 
@@ -1011,14 +1184,19 @@ impl LibraryApp {
                 );
 
                 ui.add_space(theme::SP_2);
-                self.actions(ui, clip, ctx);
+                self.actions(ui, clip, ctx, is_export);
             });
         });
+        if focused && self.focus_scroll {
+            resp.response.scroll_to_me(None);
+        }
     }
 
-    /// Render the thumbnail; returns true if it was clicked (opens the editor).
-    fn thumbnail(&self, ui: &mut egui::Ui, clip: &Clip) -> bool {
+    /// Render the thumbnail; returns true if it was clicked (opens the editor,
+    /// or plays the file for an export).
+    fn thumbnail(&self, ui: &mut egui::Ui, clip: &Clip, is_export: bool) -> bool {
         let size = egui::vec2(THUMB_W, THUMB_H);
+        let hover = if is_export { "Play" } else { "Edit / trim" };
         match self.states.get(&clip.path).and_then(|s| s.texture.as_ref()) {
             Some(tex) => ui
                 .add(
@@ -1027,12 +1205,12 @@ impl LibraryApp {
                         .rounding(8.0)
                         .sense(egui::Sense::click()),
                 )
-                .on_hover_text("Edit / trim")
+                .on_hover_text(hover)
                 .clicked(),
             None => {
                 let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
                 ui.painter()
-                    .rect_filled(rect, theme::RADIUS, egui::Color32::from_rgb(10, 11, 13));
+                    .rect_filled(rect, theme::RADIUS, theme::THUMB_BG);
                 ui.painter().text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -1040,7 +1218,7 @@ impl LibraryApp {
                     egui::FontId::proportional(26.0),
                     theme::INK_3,
                 );
-                resp.on_hover_text("Edit / trim").clicked()
+                resp.on_hover_text(hover).clicked()
             }
         }
     }
@@ -1052,10 +1230,11 @@ impl LibraryApp {
         }
     }
 
-    fn actions(&mut self, ui: &mut egui::Ui, clip: &Clip, ctx: &egui::Context) {
+    fn actions(&mut self, ui: &mut egui::Ui, clip: &Clip, ctx: &egui::Context, is_export: bool) {
         // One quiet row: primary actions inline, the rest behind "⋯". A delete
         // confirmation temporarily replaces the row (no accidental deletes,
-        // no modal).
+        // no modal). Exports are finished artifacts: they play, copy, reveal,
+        // and delete, but re-editing/re-exporting an export is not offered.
         let confirming = self.confirm_delete.as_deref() == Some(clip.path.as_path());
         if confirming {
             ui.horizontal(|ui| {
@@ -1082,32 +1261,34 @@ impl LibraryApp {
             if ui.button("Open").clicked() {
                 open_clip(&clip.path);
             }
-            if ui.button("Edit").clicked() {
-                self.open_editor(clip, ctx);
-            }
-            // Owned snapshot so the menu closure can still borrow `self` mutably.
-            let job = self
-                .exports
-                .get(&clip.path)
-                .map(|j| (*lock_tolerant(&j.progress), Arc::clone(&j.cancel)));
-            if let Some((prog, cancel)) = job {
-                ui.label(
-                    egui::RichText::new(format!("Exporting… {}%", (prog * 100.0) as u32))
-                        .size(theme::TEXT_LABEL)
-                        .color(theme::AI),
-                );
-                if ui.button("Cancel").clicked() {
-                    cancel.store(true, Ordering::Relaxed);
+            if !is_export {
+                if ui.button("Edit").clicked() {
+                    self.open_editor(clip, ctx);
                 }
-            } else {
-                ui.menu_button("Export", |ui| {
-                    for preset in Preset::ALL {
-                        if ui.button(preset.label()).clicked() {
-                            self.start_export(clip, preset, ctx);
-                            ui.close_menu();
-                        }
+                // Owned snapshot so the menu closure can still borrow `self` mutably.
+                let job = self
+                    .exports
+                    .get(&clip.path)
+                    .map(|j| (*lock_tolerant(&j.progress), Arc::clone(&j.cancel)));
+                if let Some((prog, cancel)) = job {
+                    ui.label(
+                        egui::RichText::new(format!("Exporting… {}%", (prog * 100.0) as u32))
+                            .size(theme::TEXT_LABEL)
+                            .color(theme::AI),
+                    );
+                    if ui.button("Cancel").clicked() {
+                        cancel.store(true, Ordering::Relaxed);
                     }
-                });
+                } else {
+                    ui.menu_button("Export", |ui| {
+                        for preset in Preset::ALL {
+                            if ui.button(preset.label()).clicked() {
+                                self.start_export(clip, preset, ctx);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use ord_export::{Preset, Trim};
 
-use crate::format::human_duration;
+use crate::format::{human_duration, human_duration_ms};
 use crate::player::{DecKind, Player, PreviewFrame};
-use crate::timeline::{Segments, Timeline, View};
+use crate::prefs::{self, EditorPrefs};
+use crate::timeline::{self, DragTarget, Segments, Timeline, View};
 
 const FILMSTRIP_TILES: usize = 14;
 /// Snap radius (px) for markers under the in/out/playhead drags and clicks.
@@ -37,15 +38,6 @@ pub enum EditorAction {
     },
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Drag {
-    In,
-    Out,
-    Playhead,
-    /// Sliding cut boundary `i` (see [`Segments::cut_points`]).
-    Cut(usize),
-}
-
 /// Editor state for a single clip.
 pub struct EditorState {
     clip: PathBuf,
@@ -62,7 +54,7 @@ pub struct EditorState {
     chapters_rx: Receiver<Vec<f64>>,
     mute_export: bool,
     volume: f32,
-    drag: Option<Drag>,
+    drag: Option<DragTarget>,
     /// Pre-drag snapshot for a cut-line drag (one undo entry per drag).
     drag_undo: Option<Segments>,
     strip_rx: Receiver<(usize, egui::ColorImage)>,
@@ -75,6 +67,9 @@ impl EditorState {
     /// Open the editor for `clip`. Returns an error if the media can't be opened.
     pub fn new(clip: PathBuf, label: String, ctx: &egui::Context) -> Result<Self, String> {
         let mut player = Player::open(&clip)?;
+        let saved = prefs::load();
+        player.set_volume(saved.volume);
+        player.set_loop(saved.looping);
         if crate::tuning::autoplay() {
             player.play();
         }
@@ -94,7 +89,7 @@ impl EditorState {
             markers: Vec::new(),
             chapters_rx,
             mute_export: false,
-            volume: 1.0,
+            volume: saved.volume,
             drag: None,
             drag_undo: None,
             strip_rx,
@@ -414,20 +409,6 @@ impl EditorState {
         }
     }
 
-    /// Snap `t` to the nearest marker within [`SNAP_PX`] on screen.
-    fn snap_to_marker(&self, t: f64, view: &View, track_w: f32) -> f64 {
-        let px_per_sec = track_w as f64 / view.span.max(1e-9);
-        let radius = SNAP_PX as f64 / px_per_sec.max(1e-9);
-        self.markers
-            .iter()
-            .copied()
-            .map(|m| (m, (m - t).abs()))
-            .filter(|(_, d)| *d <= radius)
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(m, _)| m)
-            .unwrap_or(t)
-    }
-
     /// Debug overlay + throttled log to `/tmp/ord-ui-debug.log` (toggle: F3 or
     /// the `ORD_DEBUG` env var). Surfaces clock vs audio-buffer vs queue state so
     /// A/V-sync and decode/throughput issues are visible.
@@ -568,20 +549,29 @@ impl EditorState {
             if ui.selectable_label(looping, "↻ Loop").clicked() {
                 looping = !looping;
                 self.player.set_loop(looping);
+                let _ = prefs::save(EditorPrefs {
+                    volume: self.volume,
+                    looping,
+                });
             }
 
             if self.player.has_audio() {
                 ui.separator();
                 ui.label("Vol");
-                if ui
-                    .add(
-                        egui::Slider::new(&mut self.volume, 0.0..=1.0)
-                            .show_value(false)
-                            .fixed_decimals(2),
-                    )
-                    .changed()
-                {
+                let slider = ui.add(
+                    egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                        .show_value(false)
+                        .fixed_decimals(2),
+                );
+                if slider.changed() {
                     self.player.set_volume(self.volume);
+                }
+                // Persist once the adjustment settles, not per drag tick.
+                if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                    let _ = prefs::save(EditorPrefs {
+                        volume: self.volume,
+                        looping: self.player.looping(),
+                    });
                 }
             }
 
@@ -589,8 +579,8 @@ impl EditorState {
                 let pos = self.player.position();
                 ui.monospace(format!(
                     "{} / {}",
-                    human_duration(pos),
-                    human_duration(self.player.duration())
+                    human_duration_ms(pos),
+                    human_duration_ms(self.player.duration())
                 ));
                 // NVDEC fell back to CPU decoding: say so, instead of leaving
                 // "the editor is sometimes heavy" undiagnosable (F3 has detail).
@@ -762,20 +752,15 @@ impl EditorState {
             if pan != 0.0 && self.zoom > 1.0 {
                 self.scroll = (self.scroll - pan * 0.01 / self.zoom).clamp(0.0, 1.0);
             } else if scroll_y != 0.0 && !shift {
-                let old = View::new(dur, self.zoom, self.scroll);
                 let frac = pointer
                     .map(|p| {
                         ((p.x - track_guess.left()) / track_guess.width().max(1.0)).clamp(0.0, 1.0)
                     })
                     .unwrap_or(0.5);
-                let anchor = old.time_at(frac);
-                let factor = (scroll_y as f64 * 0.005).exp() as f32;
-                self.zoom = (self.zoom * factor).clamp(1.0, 60.0);
-                // Re-derive scroll so `anchor` stays under the pointer.
-                let span = dur / self.zoom as f64;
-                let start = (anchor - frac as f64 * span).clamp(0.0, (dur - span).max(0.0));
-                let max_start = (dur - span).max(1e-9);
-                self.scroll = (start / max_start).clamp(0.0, 1.0) as f32;
+                let (zoom, scroll) =
+                    timeline::zoom_anchored(dur, self.zoom, self.scroll, frac, scroll_y, 60.0);
+                self.zoom = zoom;
+                self.scroll = scroll;
             }
         }
 
@@ -806,7 +791,7 @@ impl EditorState {
             egui::pos2(cl(out_x), track.bottom()),
         );
         painter.rect_filled(sel, 0.0, accent.linear_multiply(0.22));
-        let dim = egui::Color32::from_black_alpha(130);
+        let dim = crate::theme::SCRIM;
         painter.rect_filled(
             egui::Rect::from_min_max(track.left_top(), egui::pos2(cl(in_x), track.bottom())),
             0.0,
@@ -834,7 +819,7 @@ impl EditorState {
                     egui::pos2(x0, track.top()),
                     egui::pos2(x1, track.bottom()),
                 );
-                painter.rect_filled(r, 0.0, egui::Color32::from_black_alpha(190));
+                painter.rect_filled(r, 0.0, crate::theme::SCRIM_CUT);
                 // Sparse diagonal hatch: reads as "removed" at a glance.
                 let hatch = painter.with_clip_rect(r);
                 let stroke = egui::Stroke::new(1.0, crate::theme::SHU.linear_multiply(0.30));
@@ -860,7 +845,7 @@ impl EditorState {
                 if r.width() > 42.0 {
                     let c = r.center();
                     let label = egui::Rect::from_center_size(c, egui::vec2(38.0, 14.0));
-                    painter.rect_filled(label, 3.0, egui::Color32::from_black_alpha(170));
+                    painter.rect_filled(label, 3.0, crate::theme::SCRIM_LABEL);
                     painter.text(
                         c,
                         egui::Align2::CENTER_CENTER,
@@ -940,19 +925,19 @@ impl EditorState {
                     egui::Align2::CENTER_CENTER,
                     label,
                     egui::FontId::proportional(8.0),
-                    egui::Color32::WHITE,
+                    crate::theme::ON_ACCENT,
                 );
             }
         }
 
-        // Playhead: a white line with a triangle head in the ruler.
+        // Playhead: a line with a triangle head in the ruler.
         if track.x_range().contains(ph_x) {
             painter.line_segment(
                 [
                     egui::pos2(ph_x, rect.top()),
                     egui::pos2(ph_x, track.bottom()),
                 ],
-                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::Stroke::new(2.0, crate::theme::PLAYHEAD),
             );
             painter.add(egui::Shape::convex_polygon(
                 vec![
@@ -960,7 +945,7 @@ impl EditorState {
                     egui::pos2(ph_x + 5.0, rect.top()),
                     egui::pos2(ph_x, rect.top() + 7.0),
                 ],
-                egui::Color32::WHITE,
+                crate::theme::PLAYHEAD,
                 egui::Stroke::NONE,
             ));
         }
@@ -983,7 +968,7 @@ impl EditorState {
                                 egui::pos2(cl(x_of(seg.start)), track.top()),
                                 egui::pos2(cl(x_of(seg.end)), track.bottom()),
                             );
-                            painter.rect_filled(r, 0.0, egui::Color32::from_white_alpha(5));
+                            painter.rect_filled(r, 0.0, crate::theme::hover_lift());
                         }
                     }
                     painter.line_segment(
@@ -991,13 +976,13 @@ impl EditorState {
                             egui::pos2(p.x, track.top()),
                             egui::pos2(p.x, track.bottom()),
                         ],
-                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70)),
+                        egui::Stroke::new(1.0, crate::theme::ghost_line()),
                     );
-                    let text = human_duration(t);
+                    let text = human_duration_ms(t);
                     let galley = painter.layout_no_wrap(
                         text,
                         egui::FontId::proportional(10.0),
-                        egui::Color32::WHITE,
+                        crate::theme::ON_ACCENT,
                     );
                     let pad = egui::vec2(5.0, 3.0);
                     let mut pos = egui::pos2(p.x + 8.0, track.top() + 4.0);
@@ -1005,8 +990,8 @@ impl EditorState {
                         pos.x = p.x - 8.0 - galley.size().x - 2.0 * pad.x;
                     }
                     let bubble = egui::Rect::from_min_size(pos, galley.size() + 2.0 * pad);
-                    painter.rect_filled(bubble, 3.0, egui::Color32::from_black_alpha(200));
-                    painter.galley(bubble.min + pad, galley, egui::Color32::WHITE);
+                    painter.rect_filled(bubble, 3.0, crate::theme::BUBBLE_BG);
+                    painter.galley(bubble.min + pad, galley, crate::theme::ON_ACCENT);
                 }
             }
         }
@@ -1030,20 +1015,22 @@ impl EditorState {
         // and cut lines says "this edge drags" before you commit to the drag.
         // The grab radius is bigger than the visual handle (fat-finger rule).
         const GRAB: f32 = 10.0;
-        let cut_pts: Vec<(usize, f64)> = self.segments.cut_points().collect();
-        let nearest_cut = move |px: f32| -> Option<(usize, f64)> {
-            cut_pts
-                .iter()
-                .map(|&(i, t)| (i, t, (x_of(t) - px).abs()))
-                .filter(|(_, _, d)| *d <= GRAB)
-                .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
-                .map(|(i, t, _)| (i, t))
+        let cut_xs: Vec<(usize, f64, f32)> = self
+            .segments
+            .cut_points()
+            .map(|(i, t)| (i, t, x_of(t)))
+            .collect();
+        let snap = |markers: &[f64], t: f64| {
+            timeline::snap_to_marker(t, markers, &view, track.width(), SNAP_PX)
         };
         if resp.hovered() {
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
                 let din = (p.x - x_of(self.timeline.in_point())).abs();
                 let dout = (p.x - x_of(self.timeline.out_point())).abs();
-                if din <= GRAB || dout <= GRAB || nearest_cut(p.x).is_some() {
+                if din <= GRAB
+                    || dout <= GRAB
+                    || timeline::nearest_cut(p.x, &cut_xs, GRAB).is_some()
+                {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
             }
@@ -1051,19 +1038,17 @@ impl EditorState {
 
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
-                // Pick the nearest in/out handle, else a cut line, else scrub.
-                let din = (p.x - x_of(self.timeline.in_point())).abs();
-                let dout = (p.x - x_of(self.timeline.out_point())).abs();
-                self.drag = Some(if din <= GRAB && din <= dout {
-                    Drag::In
-                } else if dout <= GRAB {
-                    Drag::Out
-                } else if let Some((i, _)) = nearest_cut(p.x) {
+                let target = timeline::classify_drag(
+                    p.x,
+                    x_of(self.timeline.in_point()),
+                    x_of(self.timeline.out_point()),
+                    &cut_xs,
+                    GRAB,
+                );
+                if let DragTarget::Cut(_) = target {
                     self.drag_undo = Some(self.segments.clone());
-                    Drag::Cut(i)
-                } else {
-                    Drag::Playhead
-                });
+                }
+                self.drag = Some(target);
                 if self.player.is_playing() {
                     self.player.pause();
                 }
@@ -1073,18 +1058,18 @@ impl EditorState {
             if let (Some(drag), Some(p)) = (self.drag, resp.interact_pointer_pos()) {
                 // Handles, cut lines, and the playhead snap to nearby markers,
                 // so a mark placed in-game becomes a precise edit point.
-                let t = self.snap_to_marker(time_at(p.x), &view, track.width());
+                let t = snap(&self.markers, time_at(p.x));
                 match drag {
-                    Drag::In => {
+                    DragTarget::In => {
                         self.timeline.set_in(t);
                         self.seek_to(self.timeline.in_point());
                     }
-                    Drag::Out => {
+                    DragTarget::Out => {
                         self.timeline.set_out(t);
                         self.seek_to(self.timeline.out_point());
                     }
-                    Drag::Playhead => self.seek_to(t),
-                    Drag::Cut(i) => {
+                    DragTarget::Playhead => self.seek_to(t),
+                    DragTarget::Cut(i) => {
                         // The preview follows the sliding cut, frame-accurate.
                         if let Some(applied) = self.segments.move_cut(i, t) {
                             self.seek_to(applied);
@@ -1103,7 +1088,7 @@ impl EditorState {
         }
         if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                let t = self.snap_to_marker(time_at(p.x), &view, track.width());
+                let t = snap(&self.markers, time_at(p.x));
                 self.seek_to(t);
             }
         }
@@ -1111,7 +1096,7 @@ impl EditorState {
         // anywhere else, toggle that piece cut/kept (same as X).
         if resp.secondary_clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                if let Some((_, ct)) = nearest_cut(p.x) {
+                if let Some((_, ct)) = timeline::nearest_cut(p.x, &cut_xs, GRAB) {
                     self.edit_cuts(|s| s.join_at(ct).is_some());
                 } else {
                     let t = time_at(p.x);
@@ -1143,7 +1128,7 @@ impl EditorState {
                 tex.id(),
                 r,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::from_gray(150),
+                crate::theme::FILMSTRIP_TINT,
             );
         }
     }
@@ -1156,7 +1141,7 @@ impl EditorState {
         view: &View,
     ) {
         let step = nice_step(view.span);
-        let weak = egui::Color32::from_gray(120);
+        let weak = crate::theme::RULER_TEXT;
         let mut t = (view.start / step).floor() * step;
         while t <= view.start + view.span {
             if t >= 0.0 {
@@ -1290,27 +1275,22 @@ impl EditorState {
         }
     }
 
-    /// The cut list for export: the kept spans inside in/out, or `None` when
-    /// nothing is actually cut out (a plain trim covers it — no re-encode
-    /// detour through the concat filter).
+    /// The cut list for export (see [`timeline::export_spans`]).
     fn export_segments(&self) -> Option<Vec<Trim>> {
-        if self.segments.is_trivial() {
-            return None;
-        }
-        let (i, o) = (self.timeline.in_point(), self.timeline.out_point());
-        let spans = self.segments.kept_within(i, o);
-        if spans.len() == 1 && spans[0].0 <= i + 1e-6 && spans[0].1 >= o - 1e-6 {
-            return None; // splits exist but every piece is kept
-        }
-        Some(
+        timeline::export_spans(
+            &self.segments,
+            self.timeline.in_point(),
+            self.timeline.out_point(),
+        )
+        .map(|spans| {
             spans
                 .into_iter()
                 .map(|(a, b)| Trim {
                     start_secs: a,
                     end_secs: b,
                 })
-                .collect(),
-        )
+                .collect()
+        })
     }
 }
 

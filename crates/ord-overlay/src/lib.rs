@@ -9,10 +9,12 @@
 //! tested), and a [`NoopOverlay`] for headless/dev use. The real layer-shell
 //! surface is added behind a feature in a later step.
 
+pub mod apply;
 pub mod hud;
 #[cfg(feature = "layershell")]
 pub mod layershell;
 
+pub use apply::apply;
 pub use hud::{Hud, Toast, ToastKind};
 #[cfg(feature = "layershell")]
 pub use layershell::LayerShellOverlay;

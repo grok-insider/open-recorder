@@ -30,6 +30,8 @@ pub mod meta;
 #[cfg(feature = "gui")]
 pub mod player;
 #[cfg(feature = "gui")]
+pub mod prefs;
+#[cfg(feature = "gui")]
 pub mod settings_view;
 #[cfg(feature = "gui")]
 pub mod theme;

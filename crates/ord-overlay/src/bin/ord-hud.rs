@@ -7,63 +7,8 @@ use std::sync::mpsc::{self, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
 use ord_common::{socket_path, Event};
-use ord_overlay::hud::{Hud, ToastKind};
-use ord_overlay::{LayerShellOverlay, Overlay};
-
-/// Map a daemon event onto a HUD update.
-fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {
-    match event {
-        Event::ClipSaved { duration, .. } => {
-            hud.toast(
-                ToastKind::Saved,
-                format!("Clip saved ({}s)", duration.get()),
-                now_ms,
-            );
-        }
-        Event::BufferState { enabled } => {
-            hud.set_buffer_active(*enabled);
-            let kind = if *enabled {
-                ToastKind::Recording
-            } else {
-                ToastKind::Stopped
-            };
-            let text = if *enabled {
-                "Replay buffer on"
-            } else {
-                "Replay buffer off"
-            };
-            hud.toast(kind, text, now_ms);
-        }
-        Event::RecordState { recording, .. } => {
-            let (kind, text) = if *recording {
-                (ToastKind::Recording, "Recording started")
-            } else {
-                (ToastKind::Stopped, "Recording stopped")
-            };
-            hud.toast(kind, text, now_ms);
-        }
-        Event::Status { buffer_enabled, .. } => hud.set_buffer_active(*buffer_enabled),
-        Event::Error { message } => hud.toast(ToastKind::Error, message.clone(), now_ms),
-        Event::Marked { auto_saving } => {
-            let text = if *auto_saving {
-                "Marked — saving clip"
-            } else {
-                "Marked"
-            };
-            hud.toast(ToastKind::Marked, text, now_ms);
-        }
-        Event::CaptureRestarted => {
-            hud.toast(ToastKind::Recording, "Capture recovered", now_ms);
-        }
-        Event::ScreenshotSaved { .. } => {
-            hud.toast(ToastKind::Saved, "Screenshot saved", now_ms);
-        }
-        // Pushed on every settings apply: the overlay section governs us.
-        Event::Config { effective, .. } => {
-            hud.set_show_status_dot(effective.overlay.show_status_dot);
-        }
-    }
-}
+use ord_overlay::hud::Hud;
+use ord_overlay::{apply, LayerShellOverlay, Overlay};
 
 /// One-shot fetch of the effective config (for `overlay.*`) on (re)connect.
 /// Best-effort: an unreachable daemon just leaves the current HUD settings.

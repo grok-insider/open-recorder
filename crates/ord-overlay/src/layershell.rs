@@ -138,6 +138,10 @@ struct State {
     glyph_cache: GlyphCache,
     width: u32,
     height: u32,
+    /// Integer output scale (wl_surface preferred buffer scale). The shm
+    /// buffer is allocated at `logical × scale` and all rasterization runs in
+    /// physical pixels, so the HUD stays crisp on HiDPI outputs.
+    scale: i32,
     configured: bool,
 }
 
@@ -194,6 +198,7 @@ impl State {
             glyph_cache: GlyphCache::new(),
             width,
             height,
+            scale: 1,
             configured: false,
         };
 
@@ -216,21 +221,26 @@ impl State {
         if !self.configured {
             return;
         }
+        let scale = self.scale.max(1);
+        let s = scale as f32;
 
         // Rasterize any not-yet-cached glyphs first, while `font` and
         // `glyph_cache` can be borrowed together (before the canvas borrows the
-        // pool). The font size is constant, so each glyph is rasterized at most
-        // once per process; thereafter a visible toast only blits.
+        // pool). The font size is constant per scale (the cache is cleared on
+        // a scale change), so each glyph is rasterized at most once;
+        // thereafter a visible toast only blits. Glyphs are rasterized at the
+        // PHYSICAL pixel size so text is sharp on HiDPI outputs.
         for toast in hud.toasts().iter().take(MAX_ROWS as usize) {
             for ch in toast.text.chars() {
                 if !self.glyph_cache.contains_key(&ch) {
-                    let (metrics, bitmap) = self.font.rasterize(ch, FONT_PX);
+                    let (metrics, bitmap) = self.font.rasterize(ch, FONT_PX * s);
                     self.glyph_cache.insert(ch, Glyph { metrics, bitmap });
                 }
             }
         }
 
-        let (w, h) = (self.width, self.height);
+        // The buffer is physical-size; every coordinate below is physical.
+        let (w, h) = physical_size(self.width, self.height, scale);
         let stride = (w * 4) as i32;
         let (buffer, canvas) =
             match self
@@ -245,8 +255,8 @@ impl State {
         canvas.fill(0);
 
         let cache = &self.glyph_cache;
-        let right = w as f32 - SHADOW as f32;
-        let mut y = SHADOW as f32;
+        let right = w as f32 - SHADOW as f32 * s;
+        let mut y = SHADOW as f32 * s;
         for toast in hud.toasts().iter().take(MAX_ROWS as usize) {
             // Fade + slide on appear and just before expiry.
             let age = now_ms.saturating_sub(toast.created_at_ms) as f32;
@@ -255,10 +265,10 @@ impl State {
             let fade_out = ease_out_cubic(remaining / FADE_OUT_MS);
             let alpha = fade_in.min(fade_out);
             if alpha > 0.001 {
-                let slide = (1.0 - fade_in) * SLIDE_PX + (1.0 - fade_out) * SLIDE_PX;
+                let slide = ((1.0 - fade_in) * SLIDE_PX + (1.0 - fade_out) * SLIDE_PX) * s;
                 let text_w = measure_text(cache, &toast.text);
-                let card_w = (PAD_X + ICON_BOX + ICON_GAP + text_w + PAD_X)
-                    .clamp(CARD_MIN_W as f32, CARD_MAX_W as f32);
+                let card_w = ((PAD_X + ICON_BOX + ICON_GAP + PAD_X) * s + text_w)
+                    .clamp(CARD_MIN_W as f32 * s, CARD_MAX_W as f32 * s);
                 let x0 = right - card_w + slide;
                 draw_card(
                     canvas,
@@ -271,9 +281,10 @@ impl State {
                     toast.kind,
                     &toast.text,
                     alpha,
+                    s,
                 );
             }
-            y += (CARD_H + CARD_GAP) as f32;
+            y += (CARD_H + CARD_GAP) as f32 * s;
         }
 
         // Persistent replay-buffer indicator: a small dot in the top-right
@@ -288,10 +299,20 @@ impl State {
             } else {
                 accent(ToastKind::Recording)
             };
-            draw_dot(canvas, w, h, w as f32 - 11.0, 11.0, 4.5, color);
+            draw_dot(
+                canvas,
+                w,
+                h,
+                w as f32 - 11.0 * s,
+                11.0 * s,
+                4.5 * s,
+                color,
+                s,
+            );
         }
 
         let surface = self.layer.wl_surface();
+        surface.set_buffer_scale(scale);
         surface.damage_buffer(0, 0, w as i32, h as i32);
         if let Err(e) = buffer.attach_to(surface) {
             eprintln!("ord-overlay: attach failed: {e}");
@@ -300,6 +321,12 @@ impl State {
         surface.commit();
         let _ = self.conn.flush();
     }
+}
+
+/// Physical shm-buffer size for a logical surface size at an integer scale.
+fn physical_size(logical_w: u32, logical_h: u32, scale: i32) -> (u32, u32) {
+    let s = scale.max(1) as u32;
+    (logical_w * s, logical_h * s)
 }
 
 #[inline]
@@ -373,6 +400,7 @@ fn measure_text(cache: &GlyphCache, text: &str) -> f32 {
 }
 
 /// Draw one toast card: soft shadow, rounded body + hairline, icon, and text.
+/// `s` is the integer output scale as f32; all inputs/outputs are physical px.
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
     canvas: &mut [u8],
@@ -385,31 +413,33 @@ fn draw_card(
     kind: ToastKind,
     text: &str,
     alpha: f32,
+    s: f32,
 ) {
-    let h = CARD_H as f32;
+    let h = CARD_H as f32 * s;
     let (cx, cy) = (x0 + w / 2.0, y0 + h / 2.0);
     let (hw, hh) = (w / 2.0, h / 2.0);
 
-    let pad = SHADOW as f32;
+    let pad = SHADOW as f32 * s;
     let xs = (x0 - pad).floor().max(0.0) as u32;
     let xe = ((x0 + w + pad).ceil() as u32).min(width);
     let ys = (y0 - pad).floor().max(0.0) as u32;
     let ye = ((y0 + h + pad).ceil() as u32).min(height);
-    let feather = 13.0;
-    let sh_cy = cy + 4.0;
+    let feather = 13.0 * s;
+    let sh_cy = cy + 4.0 * s;
+    let radius = CARD_RADIUS * s;
     for py in ys..ye {
         for px in xs..xe {
             let fx = px as f32 + 0.5;
             let fy = py as f32 + 0.5;
             let idx = ((py * width + px) * 4) as usize;
             // Soft drop shadow (outside the card body).
-            let ds = sd_round_box(fx, fy, cx, sh_cy, hw, hh, CARD_RADIUS);
+            let ds = sd_round_box(fx, fy, cx, sh_cy, hw, hh, radius);
             if ds > 0.0 && ds < feather {
-                let s = 1.0 - ds / feather;
-                blend(canvas, idx, 0.0, 0.0, 0.0, 0.40 * s * s * alpha);
+                let t = 1.0 - ds / feather;
+                blend(canvas, idx, 0.0, 0.0, 0.0, 0.40 * t * t * alpha);
             }
             // Card body with AA edge.
-            let d = sd_round_box(fx, fy, cx, cy, hw, hh, CARD_RADIUS);
+            let d = sd_round_box(fx, fy, cx, cy, hw, hh, radius);
             let cov = (0.5 - d).clamp(0.0, 1.0);
             if cov > 0.0 {
                 blend(
@@ -421,7 +451,7 @@ fn draw_card(
                     CARD_ALPHA * cov * alpha,
                 );
                 // Faint light hairline just inside the edge for definition.
-                let ring = (1.0 - (d + 1.2).abs()).clamp(0.0, 1.0);
+                let ring = (1.0 - (d + 1.2 * s).abs()).clamp(0.0, 1.0);
                 if ring > 0.0 {
                     blend(canvas, idx, 255.0, 255.0, 255.0, 0.05 * ring * alpha);
                 }
@@ -429,18 +459,30 @@ fn draw_card(
         }
     }
 
-    let icx = x0 + PAD_X + ICON_BOX / 2.0;
+    let icx = x0 + (PAD_X + ICON_BOX / 2.0) * s;
     let icy = y0 + h / 2.0;
-    draw_icon(canvas, width, height, kind, icx, icy, accent(kind), alpha);
+    draw_icon(
+        canvas,
+        width,
+        height,
+        kind,
+        icx,
+        icy,
+        accent(kind),
+        alpha,
+        s,
+    );
 
-    let tx = x0 + PAD_X + ICON_BOX + ICON_GAP;
-    let baseline = y0 + h / 2.0 + FONT_PX * 0.34;
+    let tx = x0 + (PAD_X + ICON_BOX + ICON_GAP) * s;
+    let baseline = y0 + h / 2.0 + FONT_PX * s * 0.34;
     draw_text(
         canvas, width, height, cache, text, tx, baseline, TEXT_RGB, alpha,
     );
 }
 
-/// Draw a small anti-aliased filled dot with a faint halo (the buffer indicator).
+/// Draw a small anti-aliased filled dot with a faint halo (the buffer
+/// indicator). `cx`/`cy`/`r` are physical px; `s` scales the halo.
+#[allow(clippy::too_many_arguments)]
 fn draw_dot(
     canvas: &mut [u8],
     width: u32,
@@ -449,8 +491,10 @@ fn draw_dot(
     cy: f32,
     r: f32,
     color: (f32, f32, f32),
+    s: f32,
 ) {
-    let half = r + 3.0;
+    let halo_w = 3.0 * s;
+    let half = r + halo_w;
     let xs = (cx - half).floor().max(0.0) as u32;
     let xe = ((cx + half).ceil() as u32).min(width);
     let ys = (cy - half).floor().max(0.0) as u32;
@@ -464,15 +508,16 @@ fn draw_dot(
             let cov = (0.5 - d).clamp(0.0, 1.0);
             if cov > 0.0 {
                 blend(canvas, idx, color.0, color.1, color.2, cov * 0.9);
-            } else if d < 3.0 {
-                let halo = (1.0 - d / 3.0).clamp(0.0, 1.0) * 0.18;
+            } else if d < halo_w {
+                let halo = (1.0 - d / halo_w).clamp(0.0, 1.0) * 0.18;
                 blend(canvas, idx, color.0, color.1, color.2, halo);
             }
         }
     }
 }
 
-/// Draw the per-kind status icon (anti-aliased, procedural — no glyph needed).
+/// Draw the per-kind status icon (anti-aliased, procedural — no glyph
+/// needed). `cx`/`cy` are physical px; `s` scales the icon geometry.
 #[allow(clippy::too_many_arguments)]
 fn draw_icon(
     canvas: &mut [u8],
@@ -483,25 +528,27 @@ fn draw_icon(
     cy: f32,
     color: (f32, f32, f32),
     alpha: f32,
+    s: f32,
 ) {
-    let half = ICON_BOX / 2.0 + 1.0;
+    let icon_box = ICON_BOX * s;
+    let half = icon_box / 2.0 + s;
     let xs = (cx - half).floor().max(0.0) as u32;
     let xe = ((cx + half).ceil() as u32).min(width);
     let ys = (cy - half).floor().max(0.0) as u32;
     let ye = ((cy + half).ceil() as u32).min(height);
-    let stroke = 1.7;
+    let stroke = 1.7 * s;
     for py in ys..ye {
         for px in xs..xe {
             let fx = px as f32 + 0.5;
             let fy = py as f32 + 0.5;
             let cov = match kind {
                 ToastKind::Recording => {
-                    let r = ICON_BOX * 0.30;
+                    let r = icon_box * 0.30;
                     let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() - r;
                     (0.5 - d).clamp(0.0, 1.0)
                 }
                 ToastKind::Saved => {
-                    let r = ICON_BOX * 0.36;
+                    let r = icon_box * 0.36;
                     let d = sd_segment(
                         fx,
                         fy,
@@ -521,12 +568,12 @@ fn draw_icon(
                     (0.5 - d).clamp(0.0, 1.0)
                 }
                 ToastKind::Stopped => {
-                    let s = ICON_BOX * 0.26;
-                    let d = sd_round_box(fx, fy, cx, cy, s, s, 2.5);
+                    let sq = icon_box * 0.26;
+                    let d = sd_round_box(fx, fy, cx, cy, sq, sq, 2.5 * s);
                     (0.5 - d).clamp(0.0, 1.0)
                 }
                 ToastKind::Error => {
-                    let r = ICON_BOX * 0.28;
+                    let r = icon_box * 0.28;
                     let d = sd_segment(fx, fy, cx - r, cy - r, cx + r, cy + r).min(sd_segment(
                         fx,
                         fy,
@@ -539,7 +586,7 @@ fn draw_icon(
                 }
                 ToastKind::Marked => {
                     // A bookmark flag: vertical pole + a short top stroke.
-                    let r = ICON_BOX * 0.30;
+                    let r = icon_box * 0.30;
                     let d = sd_segment(fx, fy, cx - r * 0.4, cy - r, cx - r * 0.4, cy + r).min(
                         sd_segment(fx, fy, cx - r * 0.4, cy - r, cx + r * 0.8, cy - r * 0.35),
                     ) - stroke;
@@ -604,9 +651,17 @@ impl CompositorHandler for State {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: i32,
+        surface: &wl_surface::WlSurface,
+        new_factor: i32,
     ) {
+        if surface != self.layer.wl_surface() || new_factor < 1 || new_factor == self.scale {
+            return;
+        }
+        self.scale = new_factor;
+        // Glyphs are rasterized at the physical pixel size, so a scale change
+        // invalidates every cached bitmap.
+        self.glyph_cache.clear();
+        self.layer.wl_surface().set_buffer_scale(new_factor);
     }
     fn transform_changed(
         &mut self,
@@ -701,5 +756,105 @@ impl
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blend_full_alpha_writes_source_bgra() {
+        let mut c = vec![0u8; 8];
+        blend(&mut c, 0, 255.0, 128.0, 10.0, 1.0);
+        assert_eq!(&c[..4], &[10, 128, 255, 255]);
+        // Zero alpha is a no-op.
+        blend(&mut c, 4, 255.0, 255.0, 255.0, 0.0);
+        assert_eq!(&c[4..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn blend_composites_over_destination() {
+        // Opaque black dest + 50% white source -> mid grey, still opaque.
+        let mut c = vec![0u8, 0, 0, 255];
+        blend(&mut c, 0, 255.0, 255.0, 255.0, 0.5);
+        assert_eq!(&c[..3], &[127, 127, 127]);
+        assert_eq!(c[3], 255);
+    }
+
+    #[test]
+    fn blend_out_of_bounds_is_a_noop() {
+        let mut c = vec![7u8; 6];
+        blend(&mut c, 4, 255.0, 255.0, 255.0, 1.0); // idx + 4 > len
+        assert_eq!(c, vec![7u8; 6]);
+        // Coverage above 1 clamps rather than overflowing.
+        let mut c = vec![0u8; 4];
+        blend(&mut c, 0, 255.0, 255.0, 255.0, 2.0);
+        assert_eq!(c, vec![255u8; 4]);
+    }
+
+    #[test]
+    fn sd_round_box_signs_and_distances() {
+        // Center is inside (negative), a point on the straight edge is ~0,
+        // and far outside the distance is euclidean.
+        assert!(sd_round_box(50.0, 50.0, 50.0, 50.0, 10.0, 10.0, 2.0) < 0.0);
+        assert!(sd_round_box(60.0, 50.0, 50.0, 50.0, 10.0, 10.0, 2.0).abs() < 1e-4);
+        let d = sd_round_box(80.0, 50.0, 50.0, 50.0, 10.0, 10.0, 2.0);
+        assert!((d - 20.0).abs() < 1e-4, "{d}");
+        // A sharp corner (r=0) measures the diagonal distance.
+        let d = sd_round_box(13.0, 14.0, 0.0, 0.0, 10.0, 10.0, 0.0);
+        assert!((d - 5.0).abs() < 1e-4, "{d}");
+    }
+
+    #[test]
+    fn sd_segment_distances() {
+        // On the segment.
+        assert!(sd_segment(5.0, 0.0, 0.0, 0.0, 10.0, 0.0) < 1e-6);
+        // Perpendicular offset.
+        assert!((sd_segment(5.0, 3.0, 0.0, 0.0, 10.0, 0.0) - 3.0).abs() < 1e-6);
+        // Beyond an endpoint clamps to the endpoint distance.
+        assert!((sd_segment(13.0, 4.0, 0.0, 0.0, 10.0, 0.0) - 5.0).abs() < 1e-6);
+        // Degenerate zero-length segment is distance-to-point.
+        assert!((sd_segment(3.0, 4.0, 0.0, 0.0, 0.0, 0.0) - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn measure_text_sums_cached_advances() {
+        let font = match Font::from_bytes(FONT_DATA, fontdue::FontSettings::default()) {
+            Ok(f) => f,
+            Err(e) => panic!("embedded font must load: {e}"),
+        };
+        let mut cache = GlyphCache::new();
+        for ch in "ab".chars() {
+            let (metrics, bitmap) = font.rasterize(ch, FONT_PX);
+            cache.insert(ch, Glyph { metrics, bitmap });
+        }
+        let a = cache[&'a'].metrics.advance_width;
+        let b = cache[&'b'].metrics.advance_width;
+        assert!(a > 0.0 && b > 0.0);
+        assert!((measure_text(&cache, "ab") - (a + b)).abs() < 1e-4);
+        assert_eq!(measure_text(&cache, ""), 0.0);
+        // Glyphs missing from the cache measure zero instead of panicking.
+        assert_eq!(measure_text(&cache, "zz"), 0.0);
+    }
+
+    #[test]
+    fn ease_out_cubic_clamps_and_eases() {
+        assert_eq!(ease_out_cubic(-1.0), 0.0);
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert_eq!(ease_out_cubic(2.0), 1.0);
+        let mid = ease_out_cubic(0.5);
+        assert!(mid > 0.5 && mid < 1.0);
+    }
+
+    #[test]
+    fn physical_size_scales_and_guards() {
+        assert_eq!(physical_size(420, 100, 1), (420, 100));
+        assert_eq!(physical_size(420, 100, 2), (840, 200));
+        assert_eq!(physical_size(420, 100, 3), (1260, 300));
+        // Degenerate scales clamp to 1 instead of zeroing the buffer.
+        assert_eq!(physical_size(420, 100, 0), (420, 100));
+        assert_eq!(physical_size(420, 100, -2), (420, 100));
     }
 }

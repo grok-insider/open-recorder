@@ -2,7 +2,9 @@
 //! newest first. Pure logic (no GUI), fully tested. The egui view renders from
 //! this.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// One discovered clip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +115,21 @@ pub fn filter_sort(clips: &[Clip], query: &str, order: SortOrder) -> Vec<Clip> {
     out
 }
 
+/// Paths from a fresh scan that are new or whose mtime changed vs the
+/// previously-known map — the set a refresh must (re)probe/thumbnail;
+/// everything else keeps its cached state. Removed paths simply vanish from
+/// the fresh set (the caller drops their state by retaining known keys).
+pub fn changed_paths(
+    known: &HashMap<PathBuf, Option<SystemTime>>,
+    fresh: &[(PathBuf, Option<SystemTime>)],
+) -> Vec<PathBuf> {
+    fresh
+        .iter()
+        .filter(|(path, mtime)| known.get(path) != Some(mtime))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 /// Scan a directory for clips, sorted newest-first. Missing dir -> empty list.
 pub fn scan_dir(dir: &Path) -> Vec<Clip> {
     let mut clips: Vec<Clip> = match std::fs::read_dir(dir) {
@@ -212,6 +229,36 @@ mod tests {
     fn sort_order_labels() {
         assert_eq!(SortOrder::ALL.len(), 3);
         assert_eq!(SortOrder::default().label(), "Newest");
+    }
+
+    #[test]
+    fn changed_paths_diffs_by_path_and_mtime() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = |s: u64| Some(UNIX_EPOCH + Duration::from_secs(s));
+        let p = |name: &str| PathBuf::from(format!("/clips/{name}.mkv"));
+
+        let mut known = HashMap::new();
+        known.insert(p("a"), t(100));
+        known.insert(p("b"), t(200));
+        known.insert(p("gone"), t(300));
+
+        let fresh = vec![
+            (p("a"), t(100)), // unchanged
+            (p("b"), t(250)), // touched -> reload
+            (p("new"), t(400)),
+        ];
+        let changed = changed_paths(&known, &fresh);
+        assert_eq!(changed, vec![p("b"), p("new")]);
+
+        // No known state -> everything loads.
+        assert_eq!(changed_paths(&HashMap::new(), &fresh).len(), 3);
+        // Identical scan -> nothing loads.
+        let same: Vec<_> = known.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        assert!(changed_paths(&known, &same).is_empty());
+        // A file whose mtime is unreadable both times is not "changed".
+        let mut k2 = HashMap::new();
+        k2.insert(p("x"), None);
+        assert!(changed_paths(&k2, &[(p("x"), None)]).is_empty());
     }
 
     #[test]

@@ -353,16 +353,19 @@ fn contract_home(path: &str) -> String {
 
 /// One labeled form row: gold override dot, fixed-width label left, control
 /// right-aligned — then a quiet caption underneath explaining the impact.
+/// `overridden` is the per-frame list from [`SettingsModel::overridden`],
+/// computed once by the form (recomputing the full config diff per row per
+/// frame was measurable waste).
 fn row(
     ui: &mut egui::Ui,
-    model: &SettingsModel,
+    overridden: &[String],
     path: &str,
     label: &str,
     caption: &str,
     control: impl FnOnce(&mut egui::Ui),
 ) {
     ui.horizontal(|ui| {
-        let overridden = model.is_overridden(path);
+        let overridden = overridden.iter().any(|p| p == path);
         let (rect, resp) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
         if overridden {
             ui.painter().circle_filled(rect.center(), 2.2, theme::KIN);
@@ -601,14 +604,14 @@ fn path_input(
 }
 
 fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<BrowseTarget> {
-    // Read-only snapshot for override dots while the closures borrow draft.
-    let snapshot = model.clone();
+    // Computed once per frame; each row only scans this list for its path.
+    let overridden = model.overridden();
     let mut browse = None;
 
     theme::section(ui, "Capture");
     row(
         ui,
-        &snapshot,
+        &overridden,
         "capture.fps",
         "Frame rate",
         "Frames per second the buffer records at. Higher is smoother but costs \
@@ -619,7 +622,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "capture.buffer_seconds",
         "Replay buffer",
         "How many seconds of the past are kept in RAM for `ord save`. Longer \
@@ -637,7 +640,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "capture.quality",
         "Quality preset",
         "Encoder constant-quality level. Higher looks better and makes bigger \
@@ -654,7 +657,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "capture.codec",
         "Codec",
         "H.264 plays everywhere. HEVC and AV1 give noticeably smaller clips at \
@@ -671,7 +674,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "capture.bitrate_kbps",
         "Constant bitrate",
         "Lock the encoder to a fixed bitrate: predictable RAM use and clip sizes \
@@ -690,7 +693,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "capture.clear_on_save",
         "Clear buffer after save",
         "Drop everything buffered after each save, so back-to-back saves never \
@@ -703,7 +706,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     theme::section(ui, "Audio");
     row(
         ui,
-        &snapshot,
+        &overridden,
         "audio.desktop",
         "Desktop audio",
         "Record the game/desktop output — including friends' voices playing \
@@ -714,7 +717,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "audio.mic",
         "Microphone",
         "Record your own voice, mixed with desktop audio into one track.",
@@ -726,7 +729,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     theme::section(ui, "Overlay");
     row(
         ui,
-        &snapshot,
+        &overridden,
         "overlay.show_status_dot",
         "Show status dot",
         "The small corner dot over your game: red while the replay buffer is \
@@ -740,7 +743,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     theme::section(ui, "Storage");
     row(
         ui,
-        &snapshot,
+        &overridden,
         "storage.clips_dir",
         "Clips folder",
         "Where saved clips and recordings land. Empty = ~/Videos/open-recorder; \
@@ -760,7 +763,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "storage.template",
         "Filename template",
         "Tokens: {game} {rec} {epoch} {date} {time}. A `/` creates subfolders — \
@@ -773,7 +776,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "storage.max_gib",
         "Auto-prune over",
         "Delete the oldest clips once the library exceeds this size. Files in \
@@ -792,7 +795,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "storage.max_age_days",
         "Auto-prune older than",
         "Delete clips older than this many days, regardless of library size.",
@@ -812,7 +815,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     theme::section(ui, "Markers");
     row(
         ui,
-        &snapshot,
+        &overridden,
         "markers.auto_save_seconds",
         "Auto-save on mark",
         "`ord mark` bookmarks the moment (a chapter in the next save). With \
@@ -833,7 +836,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     theme::section(ui, "Hooks");
     row(
         ui,
-        &snapshot,
+        &overridden,
         "hooks.on_clip_saved",
         "After every save, run",
         "Program run with the clip path as $1 after each verified save — use it \
@@ -855,7 +858,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     theme::section(ui, "Export defaults");
     row(
         ui,
-        &snapshot,
+        &overridden,
         "export.codec",
         "Codec",
         "Default codec for exports. AV1 compresses best and plays in modern \
@@ -872,7 +875,7 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     );
     row(
         ui,
-        &snapshot,
+        &overridden,
         "export.container",
         "Container",
         "MP4 is the most shareable (Discord inline, phones); MKV is more robust \
