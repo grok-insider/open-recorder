@@ -34,7 +34,7 @@ fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {
             };
             hud.toast(kind, text, now_ms);
         }
-        Event::RecordState { recording } => {
+        Event::RecordState { recording, .. } => {
             let (kind, text) = if *recording {
                 (ToastKind::Recording, "Recording started")
             } else {

@@ -48,8 +48,13 @@ pub enum Event {
     },
     /// The replay buffer changed state.
     BufferState { enabled: bool },
-    /// A manual recording changed state.
-    RecordState { recording: bool },
+    /// A manual recording changed state. `path` is the file being written
+    /// (start) or the finalized recording (stop); `None` when no file exists
+    /// (e.g. a stop on a non-`mux` build).
+    RecordState {
+        recording: bool,
+        path: Option<String>,
+    },
     /// Current daemon status snapshot (reply to `Command::Status`).
     Status {
         buffer_enabled: bool,
@@ -164,7 +169,10 @@ mod tests {
                 duration: clip(30),
             },
             Event::BufferState { enabled: true },
-            Event::RecordState { recording: false },
+            Event::RecordState {
+                recording: false,
+                path: Some("/home/friend/Videos/open-recorder/rec.mkv".to_string()),
+            },
             Event::Status {
                 buffer_enabled: true,
                 recording: false,

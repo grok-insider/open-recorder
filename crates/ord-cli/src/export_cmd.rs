@@ -20,23 +20,50 @@ pub fn usage() -> &'static str {
        --preset high|discord|source   start from a preset (default: high)\n  \
        --codec av1|hevc|h264          video codec (default from preset)\n  \
        --container mp4|mkv            output container\n  \
-       --cq N                         constant quality (lower = better)\n  \
+       --cq N                         constant quality 0-51 (lower = better)\n  \
        --bitrate N[k|M]               average video bitrate (VBR)\n  \
        --target-size N                aim for ~N MiB (hard cap)\n  \
        --max-height N                 downscale to at most N px tall\n  \
        --scale WxH                    force exact resolution\n  \
        --fps N                        force frame rate\n  \
-       --start S --end S              trim window in seconds (both or neither)\n  \
-       --no-hardware                  force software encoding\n"
+       --start S                      trim: start at S seconds\n  \
+       --end S                        trim: end at S seconds\n  \
+       --normalize                    loudness-normalize the audio (EBU R128)\n  \
+       --hardware / --no-hardware     force NVENC on / software encoding\n"
 }
 
 /// The fully-resolved inputs to an export, produced by [`parse_export`].
+/// `start`/`end` stay optional here: an end-only trim starts at 0, and a
+/// start-only trim resolves its end from the probed source duration at run
+/// time (parsing stays pure).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParsedExport {
     pub input: PathBuf,
     pub output: PathBuf,
     pub profile: ExportProfile,
-    pub trim: Option<Trim>,
+    pub start: Option<f64>,
+    pub end: Option<f64>,
+}
+
+impl ParsedExport {
+    /// Resolve the trim window, probing the source only when the end is open.
+    fn trim(&self) -> Result<Option<Trim>, String> {
+        Ok(match (self.start, self.end) {
+            (None, None) => None,
+            (start, Some(end)) => Some(Trim {
+                start_secs: start.unwrap_or(0.0),
+                end_secs: end,
+            }),
+            (Some(start), None) => {
+                let info = ord_export::probe::probe(&self.input)
+                    .map_err(|e| format!("could not probe input for --start: {e}"))?;
+                Some(Trim {
+                    start_secs: start,
+                    end_secs: info.duration_secs,
+                })
+            }
+        })
+    }
 }
 
 fn parse_codec(s: &str) -> Result<ExportCodec, String> {
@@ -219,27 +246,32 @@ pub fn parse_export(args: impl Iterator<Item = String>) -> Result<ParsedExport, 
         .map(PathBuf::from)
         .unwrap_or_else(|| default_output(&input, &profile));
 
-    let trim = match (start, end) {
-        (None, None) => None,
-        (Some(s), Some(e)) => Some(Trim {
-            start_secs: s,
-            end_secs: e,
-        }),
-        _ => return Err("--start and --end must be given together".into()),
-    };
+    if let (Some(s), Some(e)) = (start, end) {
+        if e <= s {
+            return Err("--end must be after --start".into());
+        }
+    }
 
     Ok(ParsedExport {
         input,
         output,
         profile,
-        trim,
+        start,
+        end,
     })
 }
 
-/// Parse args, run the export, and print a summary.
+/// Parse args, run the export, and print a summary. `--help` prints usage to
+/// stdout and succeeds.
 pub fn run_export(args: impl Iterator<Item = String>) -> Result<(), String> {
-    let p = parse_export(args)?;
-    let summary = export(&p.input, &p.output, &p.profile, p.trim)
+    let args: Vec<String> = args.collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{}", usage());
+        return Ok(());
+    }
+    let p = parse_export(args.into_iter())?;
+    let trim = p.trim()?;
+    let summary = export(&p.input, &p.output, &p.profile, trim)
         .map_err(|e| format!("export failed: {e}"))?;
 
     let mib = summary.size_bytes as f64 / (1024.0 * 1024.0);
@@ -285,7 +317,7 @@ mod tests {
         let p = parse("clip.mkv").unwrap();
         assert_eq!(p.profile, ExportProfile::high_quality());
         assert_eq!(p.output, PathBuf::from("clip-export.mp4"));
-        assert!(p.trim.is_none());
+        assert_eq!((p.start, p.end), (None, None));
     }
 
     #[test]
@@ -351,17 +383,24 @@ mod tests {
     }
 
     #[test]
-    fn trim_requires_both_ends() {
-        assert!(parse("i.mkv --start 5").is_err());
-        assert!(parse("i.mkv --end 10").is_err());
+    fn trim_flags_allow_one_sided_windows() {
+        // Start-only defers the end to the probed duration; end-only starts
+        // at 0 — both are valid now.
+        let p = parse("i.mkv --start 5").unwrap();
+        assert_eq!((p.start, p.end), (Some(5.0), None));
+        let p = parse("i.mkv --end 10").unwrap();
+        assert_eq!((p.start, p.end), (None, Some(10.0)));
+        assert_eq!(p.trim().unwrap().map(|t| t.start_secs), Some(0.0));
+
         let p = parse("i.mkv --start 5 --end 10").unwrap();
         assert_eq!(
-            p.trim,
+            p.trim().unwrap(),
             Some(Trim {
                 start_secs: 5.0,
                 end_secs: 10.0
             })
         );
+        assert!(parse("i.mkv --start 10 --end 5").is_err());
     }
 
     #[test]

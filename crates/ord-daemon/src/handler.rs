@@ -165,12 +165,22 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
                 Some(Err(e)) => Event::Error {
                     message: format!("recording failed to finalize: {e}"),
                 },
-                _ => Event::RecordState { recording: false },
+                Some(Ok(path)) => Event::RecordState {
+                    recording: false,
+                    path: Some(path.to_string_lossy().into_owned()),
+                },
+                None => Event::RecordState {
+                    recording: false,
+                    path: None,
+                },
             }
         } else {
             let path = (self.record_path)();
-            match self.engine.start_recording(path) {
-                Ok(()) => Event::RecordState { recording: true },
+            match self.engine.start_recording(path.clone()) {
+                Ok(()) => Event::RecordState {
+                    recording: true,
+                    path: Some(path.to_string_lossy().into_owned()),
+                },
                 Err(e) => Event::Error {
                     message: format!("could not start recording: {e}"),
                 },
@@ -291,14 +301,20 @@ mod tests {
         // H.264, so the muxer would (correctly) reject them and auto-stop — real
         // frame streaming is covered by record_golden.rs.
         let mut h = handler_with(60, 10, 1, 60);
-        assert_eq!(
+        assert!(matches!(
             h.handle(Command::ToggleRecord),
-            Event::RecordState { recording: true }
-        );
-        assert_eq!(
+            Event::RecordState {
+                recording: true,
+                path: Some(_)
+            }
+        ));
+        assert!(matches!(
             h.handle(Command::ToggleRecord),
-            Event::RecordState { recording: false }
-        );
+            Event::RecordState {
+                recording: false,
+                path: Some(_)
+            }
+        ));
     }
 
     #[test]

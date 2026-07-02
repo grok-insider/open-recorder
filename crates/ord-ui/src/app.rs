@@ -204,7 +204,7 @@ impl LibraryApp {
                         "Replay buffer off"
                     });
                 }
-                Ok(Event::RecordState { recording }) => {
+                Ok(Event::RecordState { recording, .. }) => {
                     if let Some(d) = self.daemon.as_mut() {
                         d.recording = recording;
                     }
@@ -280,7 +280,7 @@ impl LibraryApp {
                     self.set_status(format!("Saved {}s → {name}", duration.get()));
                     self.request_refresh(ctx);
                 }
-                Event::RecordState { recording } => {
+                Event::RecordState { recording, .. } => {
                     if let Some(d) = self.daemon.as_mut() {
                         d.recording = recording;
                     }
