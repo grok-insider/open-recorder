@@ -23,7 +23,7 @@ keypress, browse, trim, and export clips. **NVIDIA-first (NVENC), Wayland-native
 | `ord-common` | – | Shared newtypes, layered config, and the bincode IPC protocol + socket framing. |
 | `ord-core` | – | Ring buffer, keyframe-aware clip selection, engine, codec-keyed bitstream + clip muxer + streaming recorder (`mux`), NVENC capture (`waycap`). |
 | `ord-export` | – | Pure ffmpeg-arg export planner + ffprobe wrapper + ffmpeg runner with NVENC→software fallback; presets. |
-| `ord-daemon` | `ordd` | Capture supervision, Unix-socket control plane, game detection (`hyprctl`), storage prune, watchdog, post-save verify + hook. |
+| `ord-daemon` | `ordd` | Capture supervision, Unix-socket control plane (loopback TCP off-unix), game detection (`hyprctl`), storage prune, watchdog, post-save verify + hook. |
 | `ord-cli` | `ord` | Thin control client for compositor keybinds + local `doctor`/`export`. |
 | `ord-overlay` | `ord-hud` | `Overlay` trait + click-through `wlr-layer-shell` HUD that subscribes to the daemon. |
 | `ord-ui` | `ord-ui` | egui clip library + inline player/editor/trim/export + settings. |
@@ -231,6 +231,8 @@ Architecture: [`docs/architecture.md`](./docs/architecture.md).
 | [`docs/hdr.md`](./docs/hdr.md) | HDR capture (Main10 encode + KMS capture) notes. |
 | [`docs/testing.md`](./docs/testing.md) | Test strategy: unit / integration / golden / bench / GPU lanes. |
 | [`docs/releasing.md`](./docs/releasing.md) | SemVer/tag scheme + the release-plz flow. |
+| [`docs/roadmap-status.md`](./docs/roadmap-status.md) | The shipped record: what each release delivered. |
+| [`docs/spike-results.md`](./docs/spike-results.md) | The Phase-1 spike: zero-copy capture→NVENC validated on hardware. |
 
 ## License
 

@@ -29,8 +29,9 @@ In `#[cfg(test)]` modules next to the code. The high-value targets:
 
 ### Integration tests — daemon behavior, no GPU
 
-In `crates/ord-daemon/tests/`. Drive `ordd` against the **`MockBackend`**
-(`docs/backends.md`) over a real Unix socket:
+Inline in `crates/ord-daemon/src/server.rs` under `#[cfg(all(test, unix))]`.
+Drive `ordd` against the **`MockBackend`** (`docs/backends.md`) over a real
+Unix socket:
 
 - `SaveLast(n)` produces a `ClipSaved` event with a plausible path/duration.
 - `ToggleRecord`, `BufferOn/Off`, `Status` transition state correctly.
@@ -69,7 +70,7 @@ are `#[ignore]` by default (CI has no GPU and no Wayland session) and run
 explicitly:
 
 ```sh
-cargo test -- --ignored --features gpu
+cargo test --features waycap -- --ignored
 ```
 
 This lane is the only place real `waycap-rs` capture runs in tests; everything
@@ -85,10 +86,18 @@ else uses `MockBackend`.
 
 ## What CI runs
 
-`x86_64-linux`: `cargo fmt --check`, `cargo clippy --all-targets --all-features
--D warnings`, `cargo test --all` (GPU tests excluded via `#[ignore]`), then
-`nix flake check`. Store paths are pushed to `grok-insider.cachix.org` so flake
-consumers pull prebuilt closures.
+Three jobs on `x86_64-linux` (`.github/workflows/ci.yml`):
+
+- **`rust`** (every push/PR, fast): `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings` (default features
+  only), `cargo test --workspace` (GPU tests excluded via `#[ignore]`).
+- **`nix-checks`** (every push/PR, devshell): `nix flake check --no-build`,
+  `cargo clippy --all-features -- -D warnings`, and tests for every feature
+  **except `waycap`** (the waycap/cust binaries dlopen `libcuda.so.1` and
+  cannot load on a driverless runner; that lane runs on the dev box).
+- **`build`** (master/tags/dispatch only): `nix build` of every package +
+  `nix flake check`, pushing closures to `grok-insider.cachix.org` so flake
+  consumers pull prebuilt instead of compiling.
 
 ## Coverage expectations
 

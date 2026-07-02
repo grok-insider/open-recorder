@@ -3,10 +3,10 @@
 Status of the plan derived from competitor research (Medal.tv, ShadowPlay/
 NVIDIA App, Outplayed/Overwolf, Steam Game Recording, OBS Replay Buffer,
 AMD ReLive, gpu-screen-recorder) plus the settings-panel and UI-revamp work,
-the settings/editor feedback round, and the **v0.2 ShadowPlay-parity feature
-drop + versioning + editor/player QA** (released v0.2.0–v0.2.2; see the section
-below). Verified by `cargo fmt` / `clippy -D warnings` / tests on both lanes
-(0 failures).
+the settings/editor feedback round, the **v0.2 ShadowPlay-parity feature
+drop + versioning + editor/player QA** (v0.2.0–v0.2.2), and the **v0.3.0
+cross-platform Phase 0** (see the sections below). Verified by `cargo fmt` /
+`clippy -D warnings` / tests on both lanes (0 failures).
 
 **Forward-looking work is tracked in [`continue-plan.md`](../continue-plan.md)**
 (waycap-rs fork bump to activate the capture knobs, live per-app audio capture,
@@ -200,7 +200,8 @@ record of what has shipped.
 Config + validation + IPC + pure logic shipped and tested; the parts that need
 the `0xfell/waycap-rs` fork to *take effect*, real-hardware spikes, or a live
 PipeWire capture engine are tracked in `continue-plan.md` (the canonical
-forward plan). Released and live on the dev box at **v0.2.2 (protocol 4)**.
+forward plan). Released as v0.2.0–v0.2.2; the dev box now runs **v0.3.0
+(protocol 4)**.
 
 - [x] **`ord doctor [--fix]`** — diagnoses + installs the NVIDIA
   `CudaNoStablePerfLimit` application profile that frees `ordd` from the
@@ -236,6 +237,27 @@ forward plan). Released and live on the dev box at **v0.2.2 (protocol 4)**.
   `ORD_DEBUG_LOG`; `ORD_AUTOPLAY` QA aid. Full 30s play-through + trim/export
   (`av1_nvenc`) verified clean on the real RTX 5070 Ti.
 
+### v0.3.0 — cross-platform Phase 0 (released 2026-06-27)
+
+The whole workspace compiles on non-Linux with the mock backend; the
+capture/encode engine remains Linux-only.
+
+- [x] **IPC transport seam** (`ord-common/src/transport.rs`) — Unix domain
+  socket on unix; loopback TCP + a port rendezvous file at the control-socket
+  path elsewhere. One `Stream`/`Listener` seam shared by client and daemon.
+- [x] **Path resolution via the `dirs` crate** — config, state, cache, and
+  video directories resolve correctly on Linux, macOS, and Windows.
+- [x] **cfg-gating** — `DiskFrameStore` is `#[cfg(unix)]` (positioned I/O via
+  `FileExt`); the waycap NVENC backend is gated
+  `#[cfg(all(feature = "waycap", target_os = "linux"))]` with a target-gated
+  dependency, so `--features waycap` off-Linux resolves to nothing.
+- [x] **Identity migration to grok-insider** — repo, cache, and CI moved to
+  `github.com/grok-insider/open-recorder`; the waycap-rs fork intentionally
+  remains at `github.com/0xfell/waycap-rs`.
+- [x] **release-plz bootstrap + first automated release** — the "allow Actions
+  to create PRs" setting is enabled; release-plz opened PRs #2 (bootstrap +
+  AI changelog) and #3 (`publish = false` fix) and cut v0.3.0 through them.
+
 ## Left to do
 
 > Forward-looking work now lives in **`continue-plan.md`** (waycap-rs fork bump,
@@ -250,12 +272,12 @@ forward plan). Released and live on the dev box at **v0.2.2 (protocol 4)**.
   trim/export, `ord doctor`, and the full capture→NVENC→save path are verified
   on the real RTX 5070 Ti; watchdog-across-suspend and live `SetConfig`
   capture-restart remain mock/integration-tested only. The dev box now runs
-  v0.2.2 (protocol 4 — `ordd`/`ord`/`ord-hud`/`ord-ui` all on the same release).
+  v0.3.0 (protocol 4 — `ordd`/`ord`/`ord-hud`/`ord-ui` all on the same release).
 - [x] **Commit + push + CI/cachix dispatch** — done: master green across all
   three CI jobs, closures cached, v0.2.0–v0.2.2 tagged.
-- [ ] **Enable "Allow GitHub Actions to create and approve pull requests"**
-  (Settings → Actions → General) so release-plz can open the release PR. One-time;
-  `CACHIX_AUTH_TOKEN` and the baseline `v*` tags already exist.
+- [x] **Enable "Allow GitHub Actions to create and approve pull requests"**
+  (Settings → Actions → General) — done: release-plz opened the v0.3.0 release
+  PRs (#2/#3) through it.
 - [ ] **On-hardware AppImage validation** — bundle + run the ordd/ord-hud/ord-ui
   AppImages on a non-NixOS NVIDIA box (ordd first: NVENC + driver-path proof;
   ord-ui last: GL vendor-match is the known hazard). Full checklist in
@@ -285,7 +307,7 @@ forward plan). Released and live on the dev box at **v0.2.2 (protocol 4)**.
 - [x] **Multi-segment export** — implemented in the feedback round above
   (editor cuts + `export_segments_with`).
 - [ ] **Share-link upload / clipboard of rendered exports** — parked in
-  `future-features.md`, do not implement without an explicit ask.
+  `continue-plan.md` (share/upload), do not implement without an explicit ask.
 - [ ] **Flathub Flatpak of `ord-ui`** — the OBS-style GUI path (driver-matched
   GL via the `GL.nvidia` extension + PipeWire portal); daemon/CLI/HUD stay out
   of the sandbox by design. Pursue if the `ord-ui` AppImage GL story is fragile

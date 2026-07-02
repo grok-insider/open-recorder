@@ -1,7 +1,5 @@
 # Rust
-/target
 **/target
-Cargo.lock.bak
 
 # Nix
 /result

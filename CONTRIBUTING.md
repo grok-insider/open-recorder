@@ -105,7 +105,10 @@ hand-edit `CHANGELOG.md` — a clear Conventional Commit *is* the changelog entr
 2. release-plz keeps a **release PR** open (`chore: release v…`) that bumps the
    single `[workspace.package].version` (every crate inherits it via
    `version.workspace = true`), refreshes `Cargo.lock`, and regenerates
-   `CHANGELOG.md` from the commits since the last tag.
+   `CHANGELOG.md` from the commits since the last tag. An **AI-changelog step**
+   (`grok-insider/release-changelog-action` in `release.yml`) then rewrites the
+   PR's changelog entry into user-facing notes — one more reason to never
+   hand-edit `CHANGELOG.md`.
 3. **Merge the release PR to ship.** It tags `vX.Y.Z` and creates the GitHub
    Release, which gets:
    - the **static `ord` client** (`x86_64` musl) for PATH installs, and
@@ -118,10 +121,11 @@ hand-edit `CHANGELOG.md` — a clear Conventional Commit *is* the changelog entr
 
 Nothing is published to crates.io.
 
-**One-time setup.** Enable *Settings → Actions → General → "Allow GitHub Actions
-to create and approve pull requests"* (so release-plz can open the release PR).
-The `CACHIX_AUTH_TOKEN` secret is already configured, and the baseline `v*` tags
-already exist, so release-plz computes the next bump from there automatically.
+**Repo setup (done).** *Settings → Actions → General → "Allow GitHub Actions to
+create and approve pull requests"* is enabled — release-plz opened the v0.3.0
+release PRs (#2/#3) through it. Secrets in place: `CACHIX_AUTH_TOKEN` (cachix
+push) and `RELEASE_PLZ_TOKEN` (so the release PR triggers required CI); the
+`v*` tags exist, so release-plz computes the next bump automatically.
 
 See [`docs/releasing.md`](./docs/releasing.md) for the version surfaces (package
 version, binary `--version`, wire `PROTOCOL_VERSION`) and how consumers update.

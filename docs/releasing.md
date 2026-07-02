@@ -41,9 +41,17 @@ Commit](https://www.conventionalcommits.org) drives all three.
 
 Nothing is published to crates.io (`git_only = true`).
 
-**One-time setup:** enable *Settings → Actions → General → "Allow GitHub Actions
-to create and approve pull requests"*. The `CACHIX_AUTH_TOKEN` secret and the
-baseline `v*` tags already exist, so the next bump is computed automatically.
+The pipeline is live: the repo's *"Allow GitHub Actions to create and approve
+pull requests"* setting is enabled, and release-plz cut **v0.3.0** through it
+(release PRs #2/#3). The `CACHIX_AUTH_TOKEN` secret and the `v*` tags exist,
+so each next bump is computed automatically.
+
+**AI-changelog enrichment.** After release-plz opens/updates the release PR,
+`release.yml` runs `grok-insider/release-changelog-action`, which rewrites that
+PR's `CHANGELOG.md` entry with user-facing, AI-written notes (overwriting the
+git-cliff baseline) and commits it back to the PR branch. Humans still never
+hand-edit `CHANGELOG.md` — the raw Conventional Commits and this action produce
+it together.
 
 ## How a consumer updates
 

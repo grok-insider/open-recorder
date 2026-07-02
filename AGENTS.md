@@ -22,7 +22,9 @@ for the full diagnosis. open-recorder uses the capture/encode path that works:
 - **Cross-platform by design, Linux-first.** Platform specifics sit behind two
   traits (`CaptureBackend`, `Overlay`). Linux/Wayland+NVENC ships first; a
   Windows (DXGI→NVENC) backend is a future implementation of the same trait,
-  not a v1 promise.
+  not a v1 promise. Phase 0 shipped in v0.3.0: the whole workspace compiles on
+  non-Linux with the mock backend (transport seam, `dirs`-crate paths,
+  unix/linux cfg-gating); the capture/encode engine remains Linux-only.
 - **License: MIT.**
 
 ## Module layout
@@ -32,9 +34,9 @@ workspace member entry in the root `Cargo.toml`.
 
 | Crate | Owns |
 |-------|------|
-| `crates/ord-common` | Shared types + the bincode IPC wire protocol (commands/events). No I/O. |
+| `crates/ord-common` | Shared types + the bincode IPC wire protocol (commands/events) + the cross-platform IPC transport seam (`transport.rs`: Unix socket on unix, loopback TCP + port rendezvous file elsewhere). No other I/O. |
 | `crates/ord-core`   | The engine: wraps `waycap-rs`, owns the encoded-frame replay store (RAM `RingBuffer` or `DiskFrameStore` via the `FrameStore` seam), the keyframe-aware "save last N seconds" muxer (ffmpeg-next, stream-copy, no re-encode), and the pure per-app audio routing (`audio_route::plan_track`). |
-| `crates/ord-daemon` | `ordd`: runs `ord-core`, supervises the buffer, exposes the Unix-socket control plane, game detection (`hyprctl`), storage policy (templates + prune), the capture watchdog, post-save verification + hook, and the layered-config apply (`SetConfig`). Hotkeys are compositor keybinds invoking `ord` (no evdev). |
+| `crates/ord-daemon` | `ordd`: runs `ord-core`, supervises the buffer, exposes the control plane over the `ord-common` transport seam (Unix socket on unix; loopback TCP + rendezvous file elsewhere), game detection (`hyprctl`), storage policy (templates + prune), the capture watchdog, post-save verification + hook, and the layered-config apply (`SetConfig`). Hotkeys are compositor keybinds invoking `ord` (no evdev). |
 | `crates/ord-cli`    | `ord`: thin client. Talks to the daemon socket (`save --last N`, `mark`, `shot`, `record toggle`, `status`, `buffer on/off`, `config show`, `subscribe`) + local `doctor` (NVIDIA P2 fix), `export`, and `--version`. What compositor keybinds call. |
 | `crates/ord-overlay`| Platform overlay abstraction: the `Overlay` trait + `wlr-layer-shell` (Wayland) implementation + the `ord-hud` binary. X11/Win32 are future implementations of the same trait. |
 | `crates/ord-ui`     | `egui` clip library/manager window: browse, play, trim, export. |
@@ -89,7 +91,7 @@ green. CI has no GPU, so GPU-dependent tests are gated.
 | Tier | Scope | Where |
 |------|-------|-------|
 | **Unit** | Ring-buffer eviction & capacity math; keyframe-seek boundary math for "save last N" (the clip must start on the newest keyframe ≤ N seconds back); IPC encode/decode round-trips; newtype invariants. | `#[cfg(test)]` in each crate |
-| **Integration** | Daemon socket command/event flow driven against a **mock `CaptureBackend`** (deterministic synthetic frames, no GPU). Covers `save`, `record toggle`, `status`, buffer on/off, and error surfacing. | `crates/ord-daemon/tests/` |
+| **Integration** | Daemon socket command/event flow driven against a **mock `CaptureBackend`** (deterministic synthetic frames, no GPU). Covers `save`, `record toggle`, `status`, buffer on/off, and error surfacing. | inline in `crates/ord-daemon/src/server.rs` under `#[cfg(all(test, unix))]` |
 | **Golden** | Saved `.mkv` structure assertions via `ffprobe` (codec, duration ≈ requested, keyframe at start, audio track present). | `crates/ord-core/tests/` |
 | **Bench** | `criterion` benchmarks for ring-buffer push and the save-path mux latency, to catch perf regressions on the hot path. | `crates/ord-core/benches/` |
 | **GPU (real hardware)** | End-to-end capture→encode→save on actual NVENC. `#[ignore]` by default; run on the dev box behind `--features waycap` (in the devshell). | `crates/ord-core/tests/`, marked `#[ignore]` |
@@ -165,100 +167,47 @@ hand-edit `CHANGELOG.md` — release-plz regenerates it. See `CONTRIBUTING.md` a
 
 ## Status
 
-Working. The full pipeline is **verified end-to-end on hardware** (RTX 5070 Ti,
-Hyprland): PipeWire DMA-BUF → NVENC H.264 → encoded ring buffer →
-keyframe-aware save → valid 1440p `.mkv`, ffprobe-validated (see
-`docs/spike-results.md`). Implemented and tested: `ord-common` (newtypes, IPC +
-`Subscribe`, versioned framing, config), `ord-core` (ring buffer, keyframe clip
-selection, engine, audio ring, mock backend, codec-keyed bitstream module, clip
-muxer + streaming recorder; `mux`/`waycap` features build in the devshell),
-`ord-daemon` (`ordd` socket + handler + game detection + event broadcast +
-post-save hook), `ord-cli` (`ord` incl. `subscribe` and `export`), `ord-overlay`
-(trait + HUD model + real wlr-layer-shell surface behind `layershell` +
-`ord-hud`), `ord-ui` (clip library model + egui app behind `gui`), `ord-export`
-(pure plan + runner with NVENC→software fallback). The HUD is verified live on
-Hyprland over fullscreen games. Run `cargo test --all` for the CI set.
+**v0.1** — working, hardware-verified. The full pipeline runs end-to-end on the
+dev box (RTX 5070 Ti, Hyprland): PipeWire DMA-BUF → NVENC → encoded ring buffer
+→ keyframe-aware save → valid 1440p `.mkv`, ffprobe-validated (see
+`docs/spike-results.md`). All seven crates are implemented and tested:
+`ord-common` (newtypes, IPC + `Subscribe`, versioned framing, layered config),
+`ord-core` (ring buffer, keyframe clip selection, engine, audio ring, mock
+backend, codec-keyed bitstream module, clip muxer + streaming recorder),
+`ord-daemon`, `ord-cli`, `ord-overlay` (trait + wlr-layer-shell + `ord-hud`,
+verified live over fullscreen games), `ord-ui` (library + editor), and
+`ord-export`. HEVC/AV1 capture and CBR bitrate control are wired through the
+pinned `0xfell/waycap-rs` rev (when bumping it, update both
+`crates/ord-core/Cargo.toml` and the `outputHashes` entry in `flake.nix`).
 
-The settings/editor feedback round shipped: spinner number inputs + per-row
-captions in settings (aligned label column), a `[overlay] show_status_dot`
-config (HUD dot can be hidden; `SetConfig` broadcasts the new `Config` to
-subscribers, protocol v3), Browse… path pickers (zenity/kdialog), a persistent
-`Subscribe` connection in `ord-ui` (new clips/record state appear live),
-chapter-backed editor markers with snap/jump keys, pointer-anchored wheel
-zoom, frame-accurate paused scrubbing (post-seek keyframe run-up discarded in
-the player), and multi-segment cuts (S split / X toggle; playback skips cut
-pieces; `ord_export::export_segments_with` concatenates kept pieces via
-filter_complex with the NVENC→software fallback).
+**v0.2.0** — the ShadowPlay-parity feature drop: `ord doctor [--fix]` (the
+NVIDIA `CudaNoStablePerfLimit` profile that lifts the CUDA/NVENC P2 downclock),
+capture knobs (`resolution` / `keyframe_interval_ms` / `framerate_mode` /
+`color_range` / `tune`; applied once the waycap-rs fork exposes the setters —
+see the `// fork:` block in `waycap_backend.rs`), disk-backed replay
+(`capture.replay_storage = disk` via `DiskFrameStore` behind the `FrameStore`
+seam), `ord shot`, `capture.target` + `capture.auto_arm`, multi-track +
+per-application audio config (`audio.tracks`, pure routing in
+`audio_route::plan_track`; live PipeWire+Opus capture is the gated follow-on),
+and HDR config (`capture.hdr`, validated to HEVC/AV1; spikes in `docs/hdr.md`).
+Versioning landed with it: `ord`/`ordd --version` print `X.Y.Z [protocol N]`
+and `PROTOCOL_VERSION` bumped 3→4 (`Screenshot`/`ScreenshotSaved`).
 
-HEVC/AV1 capture and CBR bitrate control are wired end-to-end: the pinned
-`0xfell/waycap-rs` rev exposes `hevc_nvenc`/`av1_nvenc` and
-`RateControl::ConstantBitrate`, selected via `capture.codec` /
-`capture.bitrate_kbps` in `config.toml`, with matching `hvcC`/`av1C` extradata
-from the bitstream module. When bumping the waycap-rs rev, update both
-`crates/ord-core/Cargo.toml` and the `outputHashes` entry in `flake.nix`.
+**v0.2.1 / v0.2.2** — the clip-library grid fix (a real wrapping grid instead
+of one off-screen row) and the editor/player QA round: an idle-aware UI
+watchdog (no false `UI STALL` ANRs from a paused editor), audio-clock stall
+recovery (pause instead of a 60fps spin when the clock-driving audio output
+freezes), `ORD_DEBUG_LOG` telemetry, and the `ORD_AUTOPLAY` QA aid. Full
+play-through and trim+export (`av1_nvenc`) verified clean on the RTX 5070 Ti.
 
-The editor-playback runaway (intermittent >100% CPU + GPU churn, slow-motion
-video, crackling audio) is fixed. The preview player's demux pacing and
-master-clock feed are now pure decisions in `ord-ui/src/pace.rs` (unit-tested,
-no GPU): a dry audio clock over a span the demuxer already read past is fed
-bounded silence — never demux-raced (the old unbounded decode-and-drop) and
-never frozen — and at EOF the clock is fed to the container end so an audio
-track shorter than the video plays the tail out and stops/loops cleanly. Loop
-wrap is solely the UI's seek (the decode-thread wrap that skipped clock
-rebasing is gone). Seeks to/past the final frame re-run the tail GOP at EOF to
-show the last frame, with a debounced `needs_frame` settle so a paused editor
-can't repaint at 60fps forever. The realtime cpal callback bulk-drains under a
-short lock (atomic volume, chunked silence pushes), the resampler targets the
-device's real channel count (5.1/7.1 sinks no longer scramble/over-drain), the
-GL path samples bilinear instead of regenerating mip chains per frame, NVDEC→
-software fallback is logged + badged in the transport bar, and library rescans
-defer while the editor is open. Regression smoke tests in
-`ord-ui/tests/player_smoke.rs` (`--ignored`, devshell) cover the
-audio-shorter-than-video tail and end-of-clip seeks.
+**v0.3.0** — cross-platform Phase 0: the whole workspace compiles on non-Linux
+with the mock backend. The IPC transport seam (`ord-common/src/transport.rs`:
+Unix socket on unix; loopback TCP + port rendezvous file elsewhere), path
+resolution via the `dirs` crate, the disk store gated `#[cfg(unix)]`, and the
+waycap NVENC backend gated on `feature = "waycap"` + `target_os = "linux"`
+(target-gated dependency). Project identity migrated to **grok-insider**; the
+waycap-rs fork intentionally remains at `github.com/0xfell/waycap-rs`.
+release-plz is live and cut this release (PRs #2/#3).
 
-The release + packaging round shipped: automated versioning/changelog/tags +
-GitHub Releases via **release-plz** (`release-plz.toml` + `release.yml`), the
-static `ord` musl client and the `ordd`/`ord-hud`/`ord-ui` **AppImages** attached
-to each Release (`nix bundle`; the flake `postFixup` resolves the host NVIDIA
-driver on foreign distros, `apps.*` are bundle entrypoints), plus
-`CONTRIBUTING.md` and a rewritten `docs/releasing.md`. cachix for NixOS consumers
-was already live in `ci.yml`. Remaining (tracked in `continue-plan.md`): enable
-the GitHub "allow Actions to create PRs" setting, and validate the AppImages on
-non-NixOS NVIDIA hardware (ordd first; ord-ui's GL path is the known hazard).
-
-The **v0.2.0 ShadowPlay-parity feature drop** shipped (config + validation +
-plumbing + tests; the parts that need the waycap-rs fork to *take effect* are
-tracked in `continue-plan.md`): `ord doctor [--fix]` installs the NVIDIA
-`CudaNoStablePerfLimit` application profile that frees `ordd` from the CUDA/NVENC
-P2 downclock (the real perf delta vs ShadowPlay; verified against a live driver
-610); capture knobs `resolution` / `keyframe_interval_ms` / `framerate_mode`
-(cfr/vfr/content) / `color_range` / `tune` wired through config + the
-`WaycapBackend` builder (applied once the fork exposes the setters; see the
-`// fork:` block in `waycap_backend.rs`); **disk-backed replay**
-(`capture.replay_storage = disk`, `DiskFrameStore` threaded through a
-runtime-selected `Box<dyn FrameStore>` in the engine/handler/server); `ord shot`
-screenshots the newest GOP to a PNG; `capture.target` (portal/monitor) +
-`capture.auto_arm` (arm the buffer when a game/fullscreen window takes focus);
-multi-track + **per-application audio** config (`audio.tracks`, `AudioSource`
-selectors) with the pure routing in `ord-core/src/audio_route.rs` (live
-PipeWire+Opus capture is the gated follow-on); and HDR config (`capture.hdr`,
-validated to HEVC/AV1; the Main10-encode + KMS-capture spikes are in
-`docs/hdr.md`).
-
-**Versioning** landed with it: `ord`/`ordd --version` print
-`X.Y.Z [protocol N]` (git rev on local `cargo` builds, rev-less on Nix), via
-`ord-common::version` + `crates/ord-common/build.rs`; `PROTOCOL_VERSION` bumped
-3→4 (new `Screenshot` command/`ScreenshotSaved` event); `docs/releasing.md`
-documents the SemVer/tag scheme. **v0.2.1** fixed the clip-library grid (it laid
-every clip in one off-screen row inside a vertical scroll area — now a real
-wrapping grid with a panel-width-derived column count). **v0.2.2** is the
-editor/player QA round: an **idle-aware UI watchdog** (a paused/idle editor no
-longer logs false `UI STALL` ANRs — gated on focus + a 1s heartbeat), **audio-
-clock stall recovery** (if the audio output that drives the clock freezes, the
-player pauses instead of spinning at 60fps on a frozen frame forever — clock-only,
-no wall-clock fallback, so the prior runaway can't return), telemetry that honors
-`ORD_DEBUG_LOG`, and the `ORD_AUTOPLAY` dev/QA aid. Full 30s play-through and
-trim+export (`av1_nvenc`) verified clean on the real RTX 5070 Ti; the editor
-runs at v0.2.2 on the dev box. Outstanding work (waycap-rs fork bump, live
-per-app audio capture, HDR spikes, AccessKit, perf measurement) is in
-`continue-plan.md`.
+Forward work is tracked in `continue-plan.md` (the single roadmap); the shipped
+record is `docs/roadmap-status.md`.

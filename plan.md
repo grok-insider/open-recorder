@@ -1,5 +1,10 @@
 # open-recorder — Plan
 
+> **Historical document.** This is the genesis plan (June 2026). The codebase
+> has shipped through v0.3.0; see `AGENTS.md` for current architecture and
+> `continue-plan.md` for the roadmap. Kept for the durable why/how; specifics
+> below may be superseded.
+
 A native, open-source, Medal.tv / ShadowPlay-style game clipper for Linux
 (NVIDIA-first), designed cross-platform, built in Rust for the highest
 achievable recording performance.
@@ -93,12 +98,17 @@ A Cargo workspace; one crate per concern. Full diagrams in
 ord-common   shared types + bincode IPC protocol (no I/O)
 ord-core     waycap-rs wrapper + encoded-frame RING BUFFER + keyframe-aware
              "save last N seconds" muxer (ffmpeg-next, stream-copy)
-ord-daemon   ordd: runs core, Unix-socket control plane, evdev hotkeys,
+ord-daemon   ordd: runs core, Unix-socket control plane,
              game detection (/proc + hyprctl), notifications
 ord-cli      ord: thin socket client (save --last N, record toggle, status)
 ord-overlay  Overlay trait + wlr-layer-shell / X11 / Win32 impls
 ord-ui       egui: clip library window + click-through HUD
 ```
+
+*(Superseded details: hotkeys shipped as compositor keybinds invoking `ord` —
+no evdev in the daemon; the HUD shipped as the `ord-hud` binary in
+`ord-overlay`, not in `ord-ui`; and an eighth crate, `ord-export` (pure
+ffmpeg-arg export planning + runner), was added.)*
 
 ### The core idea: an encoded-frame ring buffer
 
@@ -121,18 +131,18 @@ protocol in `ord-common`. Compositor keybinds call `ord save --last 30` etc.
 
 ### Global hotkeys
 
-`ordd` reads `/dev/input` via **evdev** (the user is in the `input` group) so the
-clip key fires even when a fullscreen game grabs the keyboard — Medal's edge.
-Compositor binds (`bind = ALT, R, exec, ord save --last 30`) are the simple
-alternative.
+*(Superseded: shipped as compositor keybinds invoking `ord` — e.g.
+`bind = ALT, R, exec, ord save --last 30` — no evdev.)* The original design had
+`ordd` read `/dev/input` via evdev so the clip key fires even when a fullscreen
+game grabs the keyboard; compositor binds proved sufficient and simpler.
 
 ### Encoding defaults
 
-**H.264 by default today** — the shipped capture path (`waycap_backend.rs`)
-records H.264 NVENC, which the ring buffer + stream-copy muxer handle. HEVC
-(best NVENC quality/size on the 5070 Ti, ideal for local editing) and AV1 (5070
-Ti + ffmpeg-full 8.1) are **planned** via a waycap-rs fork — the `Codec` enum
-already carries `Hevc`/`Av1` variants for when capture emits them. `.mkv`
+**H.264 by default** — the shipped capture path (`waycap_backend.rs`) records
+H.264 NVENC, which the ring buffer + stream-copy muxer handle. HEVC (best
+NVENC quality/size on the 5070 Ti, ideal for local editing) and AV1 (5070 Ti +
+ffmpeg-full 8.1) **shipped in v0.2.0** via the `0xfell/waycap-rs` fork
+(`capture.codec`), along with CBR bitrate control — hardware-verified. `.mkv`
 container (crash-safe, editor-friendly). Audio: desktop output + optional mic.
 
 ---
@@ -172,6 +182,8 @@ promise. We ship Linux-first.
 
 ## 5. Phased roadmap
 
+> All phases below shipped by v0.2.2.
+
 1. **Spike (hard gate).** Flake devshell + a throwaway binary running
    `waycap-rs` `CaptureBuilder` → confirm zero-copy DMA-BUF import + NVENC HEVC
    frames arrive on the **NVIDIA 610 open driver**. The whole project depends on
@@ -203,6 +215,10 @@ promise. We ship Linux-first.
 
 ## 6. Risks (named honestly)
 
+> All resolved: the spike passed on the 610 open driver, `cust`/CUDA validated
+> in the devshell, waycap-rs gaps were fixed in the `0xfell` fork, and NVENC is
+> hardware-verified end-to-end.
+
 - **NVIDIA 610 open driver + DMA-BUF / explicit sync.** `waycap-rs` is tested on
   older drivers; 610 is bleeding-edge. This is the top risk and is exactly why
   the Phase-1 spike gates everything. Mitigation: `portal` capture fallback;
@@ -222,11 +238,11 @@ promise. We ship Linux-first.
 |----------|--------|-----|
 | Language | Rust | Performance, safety, single-binary daemon/CLI, matches house stack. |
 | Engine | native `waycap-rs` (Tier B) | Highest performance ceiling; full ownership; zero-copy DMA-BUF→NVENC. |
-| Codec | H.264 today; HEVC/AV1 planned | Shipped path is H.264 NVENC; HEVC/AV1 (best quality/size on the 5070 Ti) come via a waycap-rs fork — the `Codec` enum is ready. |
+| Codec | H.264 default; HEVC/AV1 shipped (v0.2.0) | Shipped path is H.264 NVENC by default; HEVC/AV1 + CBR landed via the `0xfell/waycap-rs` fork (`capture.codec`), hardware-verified. |
 | GUI | `egui` | Mature cross-platform overlay + click-through; one toolkit for HUD + library. |
 | Library overlay | Hyprland special workspace | Reuses existing pattern (Discord/Spotify); no custom code. |
 | HUD overlay | `wlr-layer-shell` (Wayland), X11/Win32 later | Native floating-over-fullscreen; same protocol as waybar/swaync. |
-| Hotkeys | evdev (+ compositor binds) | Works under fullscreen keyboard grab; user is in `input` group. |
+| Hotkeys | compositor keybinds invoking `ord` | (Superseded the evdev plan: no `/dev/input` reading shipped; compositor binds proved sufficient, even under fullscreen.) |
 | License | MIT | Most permissive; matches `open-usage` and `waycap-rs`. |
 | Platforms | Linux-first, cross-platform by design | Engine is Linux-only today; Windows = future `CaptureBackend`. |
 | Versioning / release | release-plz (Conventional Commits) | One workspace version → `vX.Y.Z` tag + GitHub Release + regenerated changelog, no manual bumps; nothing on crates.io (`git_only`). |

@@ -1,11 +1,11 @@
 # continue-plan.md
 
-Outstanding work after `v0.2.2` — the canonical forward plan. Everything here is
-either **gated** on the `0xfell/waycap-rs` fork, needs **real hardware** to
-finish, or was **noted but not changed** during QA. The shipped surface (config,
-validation, IPC, pure logic) is in place and tested; the items below make it
-*take effect* or extend coverage. For what has already shipped, see
-`docs/roadmap-status.md`.
+Outstanding work after **v0.3.0** — the single forward roadmap; the shipped
+record is `docs/roadmap-status.md`. Everything here is either **gated** on the
+`0xfell/waycap-rs` fork, needs **real hardware** to finish, or is in-repo work
+queued behind it. The shipped surface (config, validation, IPC, pure logic,
+cross-platform Phase 0) is in place and tested; the items below make it *take
+effect* or extend coverage.
 
 Status legend: ⛔ blocked on external fork · 🔬 needs real-hardware spike ·
 🟡 in-repo work · 💤 deferred/optional.
@@ -19,7 +19,8 @@ Phase-1 capture knobs and Phase-7 HDR are wired end-to-end through config + the
 `CaptureBuilder` setters yet, so they're recorded + logged, not applied. See the
 `// fork:` `tracing::debug!` block in `crates/ord-core/src/waycap_backend.rs`.
 
-Fork work (in `github.com/0xfell/waycap-rs`), then bump the rev in **both**
+Fork work (in `github.com/0xfell/waycap-rs` — the fork intentionally stays
+there post-migration), then bump the rev in **both**
 `crates/ord-core/Cargo.toml` (the `waycap-rs` git dep) and `flake.nix`
 `outputHashes`, and re-vendor the NAR hashes (per AGENTS.md):
 
@@ -111,19 +112,39 @@ The "ShadowPlay parity" claim is still architectural, not measured.
 
 ## 7. Packaging & release 🟡
 
-`release.yml` (release-plz) + `ci.yml` (3 jobs incl. build→cachix) are wired, and
-v0.2.0–v0.2.2 were cut as manual SemVer tags. Outstanding:
+release-plz is live (it cut v0.3.0 via PRs #2/#3) and `ci.yml`'s build→cachix
+lane runs on every master push. Outstanding:
 
-- [ ] Enable the repo's **"Allow GitHub Actions to create and approve pull
-      requests"** setting so release-plz can open its `chore: release` PRs (until
-      then, bump + tag manually per `docs/releasing.md`).
 - [ ] Validate the **AppImages** (`ordd`/`ord-hud`/`ord-ui`) on **non-NixOS
       NVIDIA** hardware — ordd first; `ord-ui`'s GL path is the known hazard
       (foreign-distro driver resolution via the flake `postFixup`).
-- [ ] Reconcile manual tags with release-plz's version tracking (it may propose
-      the next bump from commits since the last release).
 
-## 8. Misc / polish 💤
+## 8. Cross-platform Phase 1 🟡
+
+Phase 0 (v0.3.0) made the workspace compile everywhere with the mock backend.
+Phase 1 turns the seams into real platform work:
+
+- [ ] **Windows transport decision:** named pipes vs the current loopback
+      TCP + port-rendezvous file (`ord-common/src/transport.rs`). The TCP path
+      works today; named pipes would restore filesystem-permission gating.
+      Decide before any Windows daemon ships.
+- [ ] File follow-up issues for the real capture backends behind
+      `CaptureBackend`: **macOS** (ScreenCaptureKit + VideoToolbox) and
+      **Windows** (WGC/DXGI + NVENC).
+- [ ] Add a CI `cargo check --target x86_64-pc-windows-gnu` lane so the
+      off-Linux build can't silently rot between releases.
+
+## 9. Share / upload 🟡💤
+
+Absorbed from the retired `future-features.md`: a **share-link (upload)** flow —
+upload the clip (or a Discord-sized export) to a host and copy a URL to the
+clipboard. Needs a destination decision (self-hosted vs. a service) and
+auth/secret handling. Clipboard **copy-as-file** (`wl-copy text/uri-list`)
+already shipped in v0.2. Sketched shape when revisited: `share.rs` (upload/link)
+wired as an extra action on each clip card. Do not implement without an
+explicit ask.
+
+## 10. Misc / polish 💤
 
 - [ ] Player stall-recovery threshold (`STALL_PAUSE = 2s` in `player.rs`) is a
       judgment call — revisit once a real audio-device stall is observed in the
@@ -135,6 +156,83 @@ v0.2.0–v0.2.2 were cut as manual SemVer tags. Outstanding:
 
 ---
 
+## Code-audit backlog (2026-07-02)
+
+From a full-workspace audit. Grouped by concern; file:line refs are as of the
+audit.
+
+### Reliability
+
+- [ ] Non-blocking subscriber broadcast (`server.rs:69`) — the pump thread must
+      never block on a slow subscriber.
+- [ ] Bound `Recorder::pending_audio` post-start (`record.rs:159`).
+- [ ] Async/timeboxed disk compaction + injectable threshold
+      (`disk_store.rs:139`; contract in `store.rs:34`).
+- [ ] Drop-until-next-keyframe on forwarder overflow (`waycap_backend.rs:314`).
+- [ ] `apply_config` engine start outside the handler/ctx locks (`server.rs:436`).
+- [ ] `hyprctl` timeout + injectable game probe (`server.rs:153`).
+- [ ] VFR watchdog gate (`framerate_mode = content` must not trip the no-frames
+      watchdog on a static screen).
+- [ ] Atomic overrides write (ordd `main.rs:406`).
+- [ ] Collision-proof `output_path` (same-second saves must not overwrite).
+- [ ] Prune the recordings dir (recordings are exempt today by policy — decide
+      and enforce deliberately).
+- [ ] Transport stale-socket/port-file hygiene (`transport.rs:46`).
+- [ ] Surface disk write-failure counters into `Status`.
+
+### Performance
+
+- [ ] Coalesced `DiskFrameStore::window` reads (one positioned read per span,
+      not per frame).
+- [ ] Back-scan out-of-order inserts (ring/disk/audio) instead of front scans.
+- [ ] `Packet::borrow` instead of `Packet::copy` on the save path.
+- [ ] µs stream time base instead of ms (precision on long buffers).
+- [ ] Incremental library refresh (`app.rs:378`).
+- [ ] `filter_sort` cache (`app.rs:806`).
+- [ ] Frame-buffer pool in the decode path (`player.rs:1255`).
+- [ ] Hoist the settings `overridden()` computation out of the per-frame path.
+
+### UX
+
+- [ ] Sub-second editor time display.
+- [ ] Exports surfaced in the library.
+- [ ] Tab-nav restoration (`editor.rs:257`) + AccessKit on stepper/timeline
+      (pairs with item 4).
+- [ ] Library keyboard navigation.
+- [ ] Persist editor volume/loop.
+- [ ] `ord config set`.
+- [ ] `--json` status output.
+- [ ] `RecordState` stop-path reporting (protocol v5).
+- [ ] Subscribe reconnect (client-side backoff instead of a dead stream).
+- [ ] HiDPI HUD (`layershell.rs:603`).
+
+### Testing
+
+- [ ] Offline `execute()` fallback tests (fake ffmpeg via `ORD_FFMPEG`).
+- [ ] Disk compaction tests.
+- [ ] Editor math extraction into `timeline.rs` + tests.
+- [ ] CLI `parse()` tests.
+- [ ] `ord-hud` `apply()` tests.
+- [ ] Auto-arm integration test via an injected probe.
+- [ ] HEVC sub-layer PTL fixture.
+
+### Hygiene
+
+- [ ] Shared `Rebaser` for `mux.rs`/`record.rs`.
+- [ ] Dedupe the `access_unit()` fixture (duplicated x4).
+- [ ] `MonitorId` adoption or deletion.
+- [ ] `av1C` 10-bit loud failure (no silent 8-bit assumption).
+- [ ] Tick-vs-µs comment drift (`ring.rs:30`, `clip.rs:31`).
+- [ ] Theme-token cleanup (`app.rs:1035`, raw `Color32`s in `editor.rs`).
+
+**In flight as of 2026-07-02:** a working session (Stages 2–7) is fixing a
+first slice of this backlog — starting with the Testing group's offline
+`execute()` fallback tests (fake ffmpeg via `ORD_FFMPEG`, in `ord-export`) and
+continuing through the Reliability/Performance items above. Check `git log`
+before picking an item up; some may already be done.
+
+---
+
 ## Suggested order
 
 1. **waycap-rs fork bump (item 1)** — unlocks all Phase-1 knobs at once, smallest
@@ -142,4 +240,5 @@ v0.2.0–v0.2.2 were cut as manual SemVer tags. Outstanding:
 2. **Audio subsystem (item 2)** — biggest feature gap (separate/per-app tracks).
 3. **AccessKit (item 4)** — unblocks proper UI QA and accessibility together.
 4. **HDR spikes (item 3)** — largest/riskiest; gate on Spike B feasibility.
-5. Perf measurement + test coverage (items 5–6) alongside the above.
+5. Perf measurement + test coverage (items 5–6) and the code-audit backlog
+   alongside the above.

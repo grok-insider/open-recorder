@@ -288,7 +288,7 @@
         };
 
       # Development shell with the native toolchain to build the full workspace
-      # incl. the `waycap` (NVENC) + `mux` (ffmpeg) features and the spike.
+      # incl. the `waycap` (NVENC) + `mux` (ffmpeg) features.
       devShells = forAllSystems (system:
         let
           # NOTE: we deliberately do NOT set config.cudaSupport. NVENC is
@@ -343,7 +343,7 @@
               clang
               llvmPackages.libclang
 
-              # diagnostics used by the spike + golden tests
+              # diagnostics used by the golden + GPU tests
               ffmpeg-full
               libva-utils # vainfo
               cudatoolkit
