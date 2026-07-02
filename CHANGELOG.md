@@ -4,6 +4,68 @@ All notable changes to open-recorder are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-07-02
+
+The full-codebase audit round. **Breaking:** the IPC protocol bumped 4 → 5
+(`RecordState` events now carry the recording's file path) — update `ord` and
+`ordd` together.
+
+### Added
+
+- `ord config set <key> <value>` — change one setting from the CLI (typed
+  against the effective config, persisted as a sparse override).
+- `ord status --json` for waybar/scripts, and `ord subscribe --reconnect`
+  (a closed daemon connection now reports — and optionally retries — instead
+  of exiting silently).
+- Starting/stopping a recording reports the file path (protocol v5).
+- One-sided export trims: `--start` alone runs to the end of the clip,
+  `--end` alone starts at 0.
+- Auto-disarm: a buffer that `capture.auto_arm` armed turns itself off about a
+  minute after the game leaves the foreground.
+- Clip library: exports now appear in their own section, and the grid has
+  keyboard navigation (arrows/Enter/Delete/Ctrl+F) with a focus ring.
+- Editor: sub-second timecodes (`m:ss.mmm`) in the transport and hover bubble,
+  so frame-stepping is visible; volume/loop persist across opens.
+- HiDPI HUD: the overlay renders at the output's buffer scale (no more blur on
+  scale-2 monitors).
+- Disk replay store: spill write failures are counted and observable.
+- CI: a cross-target `cargo check` lane (windows-gnu + apple-darwin) protects
+  the "compiles everywhere with the mock backend" guarantee.
+
+### Changed
+
+- `ClipSaved` reports the actually-buffered duration instead of the configured
+  capacity (saving right after arming no longer claims a full-length clip).
+- The NVENC→software export fallback only triggers on hardware-encoder error
+  signatures — a disk-full error no longer costs a full software re-encode.
+- Export plans map streams explicitly (`-map 0:v:0 -map 0:a:0?`) and relax
+  MP4 strictness when stream-copying Opus.
+- `--help` prints to stdout and exits 0 across `ord` and `ord export`.
+- Library refresh is incremental (only new/changed clips are re-probed), and
+  the filter/sort result is cached between repaints.
+- Every crate is `publish = false` at the manifest level (git-only releases).
+
+### Fixed
+
+- The daemon's capture-drain pump can no longer be stalled by a frozen
+  subscriber (broadcasts go through bounded per-subscriber queues), a portal
+  picker during a settings apply (engines start off every lock), or a hung
+  `hyprctl` (hard 2 s kill timeout).
+- The streaming recorder bounds held-back audio after the header too — a
+  stalled video stream during a recording no longer grows memory unboundedly.
+- The capture forwarder drops until the next keyframe on channel overflow, so
+  the replay buffer never holds an undecodable GOP head.
+- Disk replay compaction is incremental (a bounded slice per push) instead of
+  a synchronous full-file rewrite that could stall capture for seconds; save
+  reads coalesce adjacent payloads into single reads.
+- Export cancellation kills a wedged ffmpeg even when no progress is flowing.
+- Same-second saves get `-1`/`-2` suffixes instead of overwriting; settings
+  overrides persist atomically; pruning covers the recordings directory (with
+  a fresh-file grace) and a `framerate_mode = content` static screen no longer
+  trips the capture watchdog into restart loops.
+- The UI stall watchdog survives poisoned locks (`lock_tolerant`), matching
+  the project-wide rule.
+
 ## [0.3.0] - 2026-06-27
 
 - Added cross-platform support: ordd now builds and runs on macOS and Windows (with a mock capture engine on non-Linux).

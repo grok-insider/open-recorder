@@ -209,7 +209,7 @@ waycap NVENC backend gated on `feature = "waycap"` + `target_os = "linux"`
 waycap-rs fork intentionally remains at `github.com/0xfell/waycap-rs`.
 release-plz is live and cut this release (PRs #2/#3).
 
-**Unreleased (2026-07-02 audit round)** — the full-codebase audit fixes:
+**v0.4.0** — the full-codebase audit round (2026-07-02):
 non-blocking subscriber broadcast + off-lock engine starts in the daemon,
 bounded recorder audio, drop-until-keyframe forwarding, incremental disk
 compaction, scoped/cancellable export fallback, CLI `config set` /
