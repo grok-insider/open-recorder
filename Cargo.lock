@@ -4880,7 +4880,7 @@ dependencies = [
 [[package]]
 name = "waycap-rs"
 version = "3.0.0"
-source = "git+https://github.com/0xfell/waycap-rs.git?rev=2e4e317b893a048be90132adb5eec964acb324fe#2e4e317b893a048be90132adb5eec964acb324fe"
+source = "git+https://github.com/grok-insider/waycap-rs.git?rev=2e4e317b893a048be90132adb5eec964acb324fe#2e4e317b893a048be90132adb5eec964acb324fe"
 dependencies = [
  "bytemuck",
  "crossbeam",

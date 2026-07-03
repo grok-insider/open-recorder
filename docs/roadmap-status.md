@@ -198,7 +198,7 @@ record of what has shipped.
 ### v0.2 — ShadowPlay-parity feature drop, versioning & QA (released v0.2.0–v0.2.2)
 
 Config + validation + IPC + pure logic shipped and tested; the parts that need
-the `0xfell/waycap-rs` fork to *take effect*, real-hardware spikes, or a live
+the `grok-insider/waycap-rs` fork to *take effect*, real-hardware spikes, or a live
 PipeWire capture engine are tracked in `continue-plan.md` (the canonical
 forward plan). Released as v0.2.0–v0.2.2; the dev box now runs **v0.3.0
 (protocol 4)**.
@@ -253,7 +253,7 @@ capture/encode engine remains Linux-only.
   dependency, so `--features waycap` off-Linux resolves to nothing.
 - [x] **Identity migration to grok-insider** — repo, cache, and CI moved to
   `github.com/grok-insider/open-recorder`; the waycap-rs fork intentionally
-  remains at `github.com/0xfell/waycap-rs`.
+  now lives at `github.com/grok-insider/waycap-rs` (the original `0xfell` repo vanished; repointed 2026-07-03).
 - [x] **release-plz bootstrap + first automated release** — the "allow Actions
   to create PRs" setting is enabled; release-plz opened PRs #2 (bootstrap +
   AI changelog) and #3 (`publish = false` fix) and cut v0.3.0 through them.

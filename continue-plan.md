@@ -2,7 +2,7 @@
 
 Outstanding work after **v0.3.0** — the single forward roadmap; the shipped
 record is `docs/roadmap-status.md`. Everything here is either **gated** on the
-`0xfell/waycap-rs` fork, needs **real hardware** to finish, or is in-repo work
+`grok-insider/waycap-rs` fork, needs **real hardware** to finish, or is in-repo work
 queued behind it. The shipped surface (config, validation, IPC, pure logic,
 cross-platform Phase 0) is in place and tested; the items below make it *take
 effect* or extend coverage.
@@ -19,8 +19,10 @@ Phase-1 capture knobs and Phase-7 HDR are wired end-to-end through config + the
 `CaptureBuilder` setters yet, so they're recorded + logged, not applied. See the
 `// fork:` `tracing::debug!` block in `crates/ord-core/src/waycap_backend.rs`.
 
-Fork work (in `github.com/0xfell/waycap-rs` — the fork intentionally stays
-there post-migration), then bump the rev in **both**
+Fork work (in `github.com/grok-insider/waycap-rs` — migrated there 2026-07-03
+after the original `0xfell/waycap-rs` repo vanished and broke every fetch;
+the local source of truth is `~/dev/personal/waycap-rs`), then bump the rev in
+**both**
 `crates/ord-core/Cargo.toml` (the `waycap-rs` git dep) and `flake.nix`
 `outputHashes`, and re-vendor the NAR hashes (per AGENTS.md):
 

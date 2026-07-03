@@ -182,7 +182,7 @@ backend, codec-keyed bitstream module, clip muxer + streaming recorder),
 `ord-daemon`, `ord-cli`, `ord-overlay` (trait + wlr-layer-shell + `ord-hud`,
 verified live over fullscreen games), `ord-ui` (library + editor), and
 `ord-export`. HEVC/AV1 capture and CBR bitrate control are wired through the
-pinned `0xfell/waycap-rs` rev (when bumping it, update both
+pinned `grok-insider/waycap-rs` rev (when bumping it, update both
 `crates/ord-core/Cargo.toml` and the `outputHashes` entry in `flake.nix`).
 
 **v0.2.0** — the ShadowPlay-parity feature drop: `ord doctor [--fix]` (the
@@ -211,7 +211,7 @@ Unix socket on unix; loopback TCP + port rendezvous file elsewhere), path
 resolution via the `dirs` crate, the disk store gated `#[cfg(unix)]`, and the
 waycap NVENC backend gated on `feature = "waycap"` + `target_os = "linux"`
 (target-gated dependency). Project identity migrated to **grok-insider**; the
-waycap-rs fork intentionally remains at `github.com/0xfell/waycap-rs`.
+waycap-rs fork originally stayed at `github.com/0xfell/waycap-rs` — that repo has since vanished, so the fork now lives at `github.com/grok-insider/waycap-rs` (repointed in v0.4.3).
 release-plz is live and cut this release (PRs #2/#3).
 
 **v0.4.0** — the full-codebase audit round (2026-07-02):

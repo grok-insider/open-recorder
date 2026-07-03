@@ -90,7 +90,7 @@ removing every layer of indirection.
 - **Hot path: no panics, no per-frame copies, no allocation churn.**
 - **H.264 default**; HEVC (best NVENC quality/size on the 5070 Ti) and AV1 are
   wired end-to-end (select via `capture.codec`), encoded through the pinned
-  `0xfell/waycap-rs` fork.
+  `grok-insider/waycap-rs` fork.
 - Bench the ring-buffer push and save-path latency (`criterion`) to catch
   regressions.
 

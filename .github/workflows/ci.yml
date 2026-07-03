@@ -14,6 +14,13 @@ concurrency:
   # closure uncached (observed when two master merges landed 10 min apart).
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' && !startsWith(github.ref, 'refs/tags/') }}
 
+# Fetching the git-pinned waycap-rs fork + the crates.io index is flaky on
+# hosted runners (transient resets/auth hiccups): retry, and use the system
+# git CLI for git deps (sturdier than the built-in transport).
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
 jobs:
   # Fast Rust gate on EVERY push/PR: no GPU, no nix, default (pure) features.
   # The per-iteration check.
