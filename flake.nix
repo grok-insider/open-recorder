@@ -258,7 +258,11 @@
             systemd.user.services.ordd = lib.mkIf cfg.daemon.enable {
               Unit = {
                 Description = "open-recorder capture daemon";
-                After = [ "graphical-session.target" ];
+                # Ordering after the portal softens the session-login race
+                # (screencast requests to a not-yet-ready portal fail with
+                # AccessDenied); the daemon's capture supervisor retries the
+                # initial arm anyway, so this is belt, that is braces.
+                After = [ "graphical-session.target" "xdg-desktop-portal.service" ];
                 PartOf = [ "graphical-session.target" ];
               };
               Service = {

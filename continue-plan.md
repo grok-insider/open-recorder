@@ -32,6 +32,15 @@ there post-migration), then bump the rev in **both**
       `capture.resolution` a real downscale (today it's only a container hint).
 - [ ] named-monitor direct capture → make `capture.target = <monitor>` work
       (today any non-`portal` value falls back to the portal).
+- [ ] bound waycap's internal buffering under consumer stall: during a
+      system-wide memory squeeze (observed 2026-07-03: a local nix build
+      swapping the box), waycap's own channels ballooned to ~235 MB in ~5 s
+      of "Could not send video frame ... Channel full" and drew the kernel
+      OOM killer. Our forwarder/ring stay bounded; the growth is inside the
+      fork — cap or drop there too.
+- [ ] a timeout/cancel handle on the portal ScreenCast request — the D-Bus
+      call can hang indefinitely (observed after a portal wedge); ordd's
+      capture supervisor contains the hang, but only the fork can abort it.
 
 After the bump: replace the `// fork:` log block with the real builder calls and
 add a real-hardware `#[ignore]` test per knob (devshell, dev box).

@@ -223,5 +223,14 @@ keyboard nav + exports section, HiDPI HUD, and **`PROTOCOL_VERSION` 4→5**
 (`RecordState` gained the recording's path). CI gained a cross-target
 `cargo check` lane (windows-gnu + apple-darwin).
 
+**v0.4.1 / v0.4.2** — release-pipeline proof (the first automatic patch-line
+releases) and the subscriber-registration race fix (a snapshot reader can no
+longer miss a racing broadcast). **v0.4.3 (capture supervisor)** — daemon
+startup is socket-first and every capture start/restart runs on the dedicated
+supervisor thread (`ord-daemon/src/supervisor.rs`): a hanging/slow/denied
+screen-share portal leaves the daemon reachable-but-degraded (bounded retries
+at login, no dialog re-spam after a user cancel), and watchdog restarts adopt
+the old engine's replay state instead of discarding footage.
+
 Forward work is tracked in `continue-plan.md` (the single roadmap); the shipped
 record is `docs/roadmap-status.md`.

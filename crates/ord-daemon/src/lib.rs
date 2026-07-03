@@ -7,6 +7,7 @@ pub mod handler;
 pub mod hook;
 pub mod server;
 pub mod storage;
+pub mod supervisor;
 
 pub use gamedetect::{clip_stem, detect_foreground, foreground_is_game};
 pub use handler::{Handler, RecordPath};

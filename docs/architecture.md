@@ -79,7 +79,7 @@ Key properties:
 
 | Process | Crate | Role |
 |---------|-------|------|
-| `ordd`  | `ord-daemon` | Long-lived. Owns the capture session + ring buffer, listens on the control transport. Started as a systemd user service. Hotkeys are compositor keybinds invoking `ord`, not daemon code. |
+| `ordd`  | `ord-daemon` | Long-lived. Owns the capture session + ring buffer, listens on the control transport. Started as a systemd user service. Hotkeys are compositor keybinds invoking `ord`, not daemon code. **Startup is socket-first**: the control transport binds before capture starts, and every capture start/restart runs on the *capture supervisor* thread (`supervisor.rs`) — a screen-share portal request can block indefinitely, so it must never run under the handler lock, on the pump thread, or ahead of the socket. A failed initial arm retries on a bounded schedule (login race) and otherwise leaves the daemon reachable-but-degraded; supervisor restarts adopt the old engine's replay state, so recovery never discards buffered footage. |
 | `ord`   | `ord-cli`    | Short-lived. Sends one command to `ordd` and exits. Bound to compositor keys. |
 | GUI     | `ord-ui`     | On-demand. Clip library window (special workspace) with the inline player/editor. Talks to `ordd` over the transport. |
 | `ord-hud` | `ord-overlay` | Long-lived. The click-through wlr-layer-shell HUD; subscribes to daemon events over the transport. |

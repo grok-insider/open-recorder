@@ -467,15 +467,11 @@ fn main() {
     let path = socket_path();
     let (config, base) = load_config();
 
-    let mut engine = make_engine(&config);
-    if let Err(e) = engine.start() {
-        tracing::error!(error = %e, "failed to start capture");
-        std::process::exit(1);
-    }
-
-    let shared_config = Arc::new(Mutex::new(config));
-    let handler = Handler::new(engine, make_record_path(Arc::clone(&shared_config)));
-
+    // The control socket binds BEFORE capture starts: the daemon must always
+    // be reachable (`ord status`, the settings UI) even while the screen-share
+    // portal is slow, not ready yet at session login, or hung. The capture
+    // supervisor inside `serve` arms the buffer asynchronously (with retries);
+    // only a failure to bind is fatal — a daemon that can't serve is useless.
     let listener = match bind(&path) {
         Ok(l) => l,
         Err(e) => {
@@ -483,8 +479,14 @@ fn main() {
             std::process::exit(1);
         }
     };
-
     install_signal_handler(path.clone());
+
+    let shared_config = Arc::new(Mutex::new(config));
+    let engine = {
+        let cfg = lock_tolerant(&shared_config).clone();
+        make_engine(&cfg)
+    };
+    let handler = Handler::new(engine, make_record_path(Arc::clone(&shared_config)));
 
     let ctx = ServerCtx {
         config: Arc::clone(&shared_config),
@@ -496,6 +498,13 @@ fn main() {
         // (suspend/resume kills NVENC; monitor changes end the portal session).
         watchdog: Some(std::time::Duration::from_secs(5)),
         game_probe: Box::new(ord_daemon::foreground_is_game),
+        // The portal is often not ready right at session login: retry the
+        // initial arm every 5 s for ~1 min (non-interactive via the restore
+        // token), then stay reachable-but-degraded until armed manually or by
+        // auto-arm.
+        capture_retry_attempts: 12,
+        capture_retry_delay: std::time::Duration::from_secs(5),
+        arm_wait: std::time::Duration::from_secs(15),
     };
 
     tracing::info!(socket = %path.display(), "ordd listening");

@@ -161,6 +161,20 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
         self.start()
     }
 
+    /// Adopt the replay state — video ring, audio ring, markers, and any
+    /// active recording — from `other`. Used when a *fresh* engine replaces a
+    /// stalled or stopped one (the capture supervisor's restart/arm path) so
+    /// recovery never discards buffered footage or a recording in progress.
+    /// The capture side (backend, stream receivers) stays this engine's own;
+    /// both engines share the capture clock (`CLOCK_MONOTONIC` ticks), so the
+    /// adopted timeline stays continuous with newly captured frames.
+    pub fn adopt_replay_from(&mut self, other: &mut Self) {
+        std::mem::swap(&mut self.ring, &mut other.ring);
+        std::mem::swap(&mut self.audio_ring, &mut other.audio_ring);
+        std::mem::swap(&mut self.markers, &mut other.markers);
+        std::mem::swap(&mut self.recorder, &mut other.recorder);
+    }
+
     /// Resize the replay window (video + audio) to `capacity_seconds`,
     /// evicting immediately when shrinking. Capture keeps running.
     pub fn set_capacity_seconds(&mut self, capacity_seconds: u32) {
@@ -324,6 +338,32 @@ mod tests {
     /// Shorthand for a clip duration in tests.
     fn cd(seconds: u32) -> ClipDuration {
         ClipDuration::new(seconds).unwrap()
+    }
+
+    #[test]
+    fn adopt_replay_preserves_frames_markers_and_capacity() {
+        // Old engine captured 10 s and holds a marker.
+        let mut old = Engine::new(MockBackend::new(60, 600, 60), 60);
+        old.start().unwrap();
+        old.drain_available();
+        assert!(old.mark());
+        let frames = old.buffered_frames();
+        assert!(frames > 0);
+
+        // A fresh engine (empty, produces nothing) adopts the replay state:
+        // buffered footage and markers survive an engine swap, so a watchdog
+        // restart never discards the last N seconds.
+        let mut fresh = Engine::new(MockBackend::new(60, 0, 60), 60);
+        fresh.start().unwrap();
+        fresh.adopt_replay_from(&mut old);
+        assert_eq!(fresh.buffered_frames(), frames);
+        assert_eq!(fresh.marker_count(), 1);
+        assert!(fresh.buffered_seconds() >= 9);
+        assert_eq!(old.buffered_frames(), 0);
+
+        // The adopted buffer is fully usable: a save still selects a clip.
+        let clip = fresh.take_clip(cd(3)).expect("clip from adopted buffer");
+        assert!(clip.frames.first().unwrap().is_keyframe);
     }
 
     #[test]

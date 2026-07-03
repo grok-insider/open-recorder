@@ -95,6 +95,39 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
         self.engine = engine;
     }
 
+    /// Swap in a freshly built (and started) engine, transplanting the replay
+    /// state — ring, audio, markers, active recording — from the old one.
+    /// The capture supervisor's arm/restart path: recovery must never discard
+    /// buffered footage.
+    pub fn install_engine_preserving_replay(&mut self, mut engine: Engine<B, S>) {
+        engine.adopt_replay_from(&mut self.engine);
+        self.replace_engine(engine);
+    }
+
+    /// Stop the current engine ahead of a supervisor restart (quick, never
+    /// touches the portal). The armed *intent* is kept so `is_buffer_enabled`
+    /// stays true while the replacement session starts.
+    pub fn stop_engine_for_restart(&mut self) {
+        if let Err(e) = self.engine.stop() {
+            tracing::debug!(error = %e, "old engine stop before restart");
+        }
+    }
+
+    /// Disarm the replay buffer: stop capture, drop buffered footage, clear
+    /// the armed flag. Idempotent; returns the reply event.
+    pub fn disable_capture(&mut self) -> Event {
+        if self.engine.is_running() {
+            if let Err(e) = self.engine.stop() {
+                return Event::Error {
+                    message: format!("failed to stop capture: {e}"),
+                };
+            }
+            self.engine.clear();
+        }
+        self.buffer_enabled = false;
+        Event::BufferState { enabled: false }
+    }
+
     /// Handle one command, returning the event to send back.
     ///
     /// [`Command::SaveLast`] is intentionally **not** handled here: the server
@@ -108,7 +141,14 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
                 message: "internal: save was not dispatched off-lock".into(),
             },
             Command::ToggleRecord => self.handle_toggle_record(),
-            Command::SetBuffer { enabled } => self.handle_set_buffer(enabled),
+            // SetBuffer is server-dispatched through the capture supervisor:
+            // starting capture can block on the screen-share portal, which
+            // must never happen under the handler lock. Reaching this arm
+            // means a dispatch wiring bug, same as SaveLast.
+            Command::SetBuffer { .. } => Event::Error {
+                message: "internal: buffer toggle was not dispatched to the capture supervisor"
+                    .into(),
+            },
             Command::Status => self.handle_status(),
             // Subscribe is finalized at the server layer (it keeps the connection
             // open and pushes events). The handler replies with an initial status
@@ -186,25 +226,6 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
                 },
             }
         }
-    }
-
-    fn handle_set_buffer(&mut self, enabled: bool) -> Event {
-        if enabled && !self.engine.is_running() {
-            if let Err(e) = self.engine.start() {
-                return Event::Error {
-                    message: format!("failed to start capture: {e}"),
-                };
-            }
-        } else if !enabled && self.engine.is_running() {
-            if let Err(e) = self.engine.stop() {
-                return Event::Error {
-                    message: format!("failed to stop capture: {e}"),
-                };
-            }
-            self.engine.clear();
-        }
-        self.buffer_enabled = enabled;
-        Event::BufferState { enabled }
     }
 
     fn handle_status(&mut self) -> Event {
@@ -318,21 +339,39 @@ mod tests {
     }
 
     #[test]
-    fn set_buffer_off_then_on() {
+    fn set_buffer_is_not_handled_inline() {
+        // Buffer toggles are server-dispatched through the capture supervisor
+        // (a capture start can block on the portal, never under the handler
+        // lock). Reaching `handle` with SetBuffer yields an internal error.
         let mut h = handler_with(60, 120, 60, 60);
-        assert_eq!(
-            h.handle(Command::SetBuffer { enabled: false }),
-            Event::BufferState { enabled: false }
-        );
-        // After disabling, the engine stopped and cleared.
+        assert!(matches!(
+            h.handle(Command::SetBuffer { enabled: true }),
+            Event::Error { .. }
+        ));
+    }
+
+    #[test]
+    fn disable_then_supervisor_style_arm() {
+        let mut h = handler_with(60, 120, 60, 60);
+        assert_eq!(h.disable_capture(), Event::BufferState { enabled: false });
+        // After disabling, the engine stopped, cleared, and disarmed.
         match h.handle(Command::Status) {
             Event::Status { buffer_enabled, .. } => assert!(!buffer_enabled),
             other => panic!("expected Status, got {other:?}"),
         }
-        assert_eq!(
-            h.handle(Command::SetBuffer { enabled: true }),
-            Event::BufferState { enabled: true }
-        );
+        // Disable is idempotent.
+        assert_eq!(h.disable_capture(), Event::BufferState { enabled: false });
+
+        // The supervisor arms by installing a freshly started engine that
+        // adopts the (cleared) replay state; the armed flag re-derives.
+        let mut fresh = Engine::new(MockBackend::new(60, 120, 60), 60);
+        fresh.start().unwrap();
+        h.install_engine_preserving_replay(fresh);
+        assert!(h.is_buffer_enabled());
+        match h.handle(Command::Status) {
+            Event::Status { buffer_enabled, .. } => assert!(buffer_enabled),
+            other => panic!("expected Status, got {other:?}"),
+        }
     }
 
     #[test]

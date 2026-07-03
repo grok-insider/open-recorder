@@ -62,6 +62,15 @@ pub struct ServerCtx<B: CaptureBackend, S: FrameStore = RingBuffer> {
     /// the pump thread calls it lock-free, so it may block briefly (the real
     /// probe has its own hard timeout) without stalling command handling.
     pub game_probe: Box<dyn Fn() -> bool + Send>,
+    /// How many times a failed initial capture arm is retried (the portal is
+    /// often not ready yet right at session login), and how long between
+    /// attempts. Injectable so tests run in milliseconds.
+    pub capture_retry_attempts: u32,
+    pub capture_retry_delay: Duration,
+    /// How long a `SetBuffer`/`SetConfig` request waits for the capture
+    /// supervisor before replying "still starting" (a pending portal dialog
+    /// must not hold a client connection forever).
+    pub arm_wait: Duration,
 }
 
 /// A subscriber: a bounded queue feeding a dedicated writer thread. Broadcasts
@@ -69,12 +78,12 @@ pub struct ServerCtx<B: CaptureBackend, S: FrameStore = RingBuffer> {
 /// full pipe) can never block the broadcaster — in particular the capture-drain
 /// pump thread, whose stall re-creates the unbounded-channel OOM this daemon
 /// already fixed once.
-struct Subscriber {
+pub(crate) struct Subscriber {
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
 
 /// Shared list of subscriber connections that receive pushed events.
-type Subscribers = Arc<Mutex<Vec<Subscriber>>>;
+pub(crate) type Subscribers = Arc<Mutex<Vec<Subscriber>>>;
 
 /// Events are tiny (tens of bytes); 64 queued events of headroom means only a
 /// subscriber that has genuinely stopped reading gets dropped.
@@ -112,7 +121,7 @@ fn add_subscriber(subs: &Subscribers, mut stream: Stream, snapshot: &Event) {
 
 /// Broadcast an event to all live subscribers, dropping any that have closed
 /// or stopped reading (queue full). Never blocks.
-fn broadcast(subs: &Subscribers, event: &Event) {
+pub(crate) fn broadcast(subs: &Subscribers, event: &Event) {
     let payload = match event.encode() {
         Ok(p) => p,
         Err(_) => return,
@@ -161,7 +170,26 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
     // The probe moves onto the pump thread so it never runs under the ctx lock
     // (the real hyprctl probe can take up to its timeout).
     let game_probe = std::mem::replace(&mut ctx.game_probe, Box::new(|| false));
+    let retry_attempts = ctx.capture_retry_attempts;
+    let retry_delay = ctx.capture_retry_delay;
+    let arm_wait = ctx.arm_wait;
     let ctx = Arc::new(Mutex::new(ctx));
+
+    // The capture supervisor is the ONLY place a capture session ever starts:
+    // a start can block indefinitely on the screen-share portal, so it must
+    // never run under a lock, on the pump thread, or ahead of the socket. Arm
+    // the buffer at boot through it (retried — the portal often is not ready
+    // yet right at session login); an already-armed engine makes it a no-op.
+    let supervisor = crate::supervisor::spawn(
+        Arc::clone(&handler),
+        Arc::clone(&ctx),
+        Arc::clone(&subs),
+        retry_delay,
+    );
+    let _ = supervisor.send(crate::supervisor::CaptureRequest::Ensure {
+        reply: None,
+        retries: retry_attempts,
+    });
 
     // Continuously drain captured frames into the (evicting) ring buffer,
     // independent of client activity. The capture forwarder thread produces
@@ -179,8 +207,8 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
     // failure mode every incumbent suffers from.
     {
         let handler = Arc::clone(&handler);
-        let subs = Arc::clone(&subs);
         let ctx = Arc::clone(&ctx);
+        let supervisor = supervisor.clone();
         std::thread::spawn(move || {
             /// Consecutive not-a-game probes (~3 s apart) before an auto-armed
             /// buffer is turned back off — about a minute, so alt-tabs and
@@ -212,22 +240,24 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
                         if game {
                             not_game_probes = 0;
                             if !enabled {
-                                let ev = lock_tolerant(&handler)
-                                    .handle(Command::SetBuffer { enabled: true });
-                                if ev.is_state_change() {
-                                    broadcast(&subs, &ev);
-                                }
+                                // Fire-and-forget: the supervisor starts the
+                                // session off this thread and broadcasts the
+                                // BufferState change itself.
+                                let _ =
+                                    supervisor.send(crate::supervisor::CaptureRequest::Ensure {
+                                        reply: None,
+                                        retries: 0,
+                                    });
                                 auto_armed = true;
                                 last_frames = Instant::now();
                             }
                         } else if enabled && auto_armed {
                             not_game_probes += 1;
                             if not_game_probes >= AUTO_DISARM_PROBES {
-                                let ev = lock_tolerant(&handler)
-                                    .handle(Command::SetBuffer { enabled: false });
-                                if ev.is_state_change() {
-                                    broadcast(&subs, &ev);
-                                }
+                                let _ =
+                                    supervisor.send(crate::supervisor::CaptureRequest::Disable {
+                                        reply: None,
+                                    });
                                 auto_armed = false;
                                 not_game_probes = 0;
                             }
@@ -263,18 +293,15 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
                 }
                 tracing::warn!(
                     stalled_for = ?last_frames.elapsed(),
-                    "no frames from capture; restarting the session"
+                    "no frames from capture; requesting a session restart"
                 );
-                let event = match h.restart_capture() {
-                    Ok(()) => Event::CaptureRestarted,
-                    Err(e) => Event::Error {
-                        message: format!("capture stalled and restart failed: {e}"),
-                    },
-                };
                 drop(h);
+                // The supervisor stops + starts a fresh session (preserving
+                // the replay buffer) off this thread and broadcasts the
+                // outcome; a hung portal can never stall frame draining here.
+                let _ = supervisor.send(crate::supervisor::CaptureRequest::Restart);
                 // Either way, wait a full window before the next attempt.
                 last_frames = Instant::now();
-                broadcast(&subs, &event);
             }
         });
     }
@@ -293,8 +320,17 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
         let writer = Arc::clone(&writer);
         let subs = Arc::clone(&subs);
         let ctx = Arc::clone(&ctx);
+        let supervisor = supervisor.clone();
         std::thread::spawn(move || {
-            if let Err(e) = handle_connection(stream, &handler, &writer, &subs, &ctx) {
+            if let Err(e) = handle_connection(
+                stream,
+                &handler,
+                &writer,
+                &subs,
+                &ctx,
+                &supervisor,
+                arm_wait,
+            ) {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
                     tracing::warn!(error = %e, "connection error");
                 }
@@ -313,6 +349,8 @@ fn handle_connection<B: CaptureBackend, S: FrameStore>(
     writer: &Arc<Mutex<ClipWriter>>,
     subs: &Subscribers,
     ctx: &Arc<Mutex<ServerCtx<B, S>>>,
+    supervisor: &std::sync::mpsc::Sender<crate::supervisor::CaptureRequest<B, S>>,
+    arm_wait: Duration,
 ) -> io::Result<()> {
     loop {
         let bytes = match read_frame(&mut stream) {
@@ -333,6 +371,10 @@ fn handle_connection<B: CaptureBackend, S: FrameStore>(
         };
 
         let is_subscribe = matches!(cmd, Command::Subscribe);
+        // The supervisor broadcasts buffer-state changes itself (it also
+        // serves auto-arm and async completions), so SetBuffer replies must
+        // not be re-broadcast here.
+        let supervisor_owns_broadcast = matches!(cmd, Command::SetBuffer { .. });
 
         let event = match cmd {
             Command::SaveLast { duration } => save_flow(handler, writer, ctx, duration),
@@ -344,7 +386,10 @@ fn handle_connection<B: CaptureBackend, S: FrameStore>(
                     base: Box::new(c.base.clone()),
                 }
             }
-            Command::SetConfig { config } => apply_config(handler, ctx, subs, *config),
+            Command::SetBuffer { enabled } => set_buffer_flow(supervisor, enabled, arm_wait),
+            Command::SetConfig { config } => {
+                apply_config(handler, ctx, subs, supervisor, arm_wait, *config)
+            }
             Command::Screenshot => screenshot_flow(handler, ctx),
             Command::Mark => {
                 let marked = lock_tolerant(handler).mark();
@@ -391,9 +436,40 @@ fn handle_connection<B: CaptureBackend, S: FrameStore>(
         write_event(&mut stream, &event)?;
 
         // State-changing events are pushed to all subscribers too.
-        if event.is_state_change() {
+        if event.is_state_change() && !supervisor_owns_broadcast {
             broadcast(subs, &event);
         }
+    }
+}
+
+/// Arm/disarm the replay buffer through the capture supervisor, waiting a
+/// bounded time for the outcome. Starting capture can block on the
+/// screen-share portal; a pending dialog must produce an actionable reply, not
+/// a hung client (the eventual success is still broadcast to subscribers).
+fn set_buffer_flow<B: CaptureBackend, S: FrameStore>(
+    supervisor: &std::sync::mpsc::Sender<crate::supervisor::CaptureRequest<B, S>>,
+    enabled: bool,
+    arm_wait: Duration,
+) -> Event {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let req = if enabled {
+        crate::supervisor::CaptureRequest::Ensure {
+            reply: Some(tx),
+            retries: 0,
+        }
+    } else {
+        crate::supervisor::CaptureRequest::Disable { reply: Some(tx) }
+    };
+    if supervisor.send(req).is_err() {
+        return Event::Error {
+            message: "internal: the capture supervisor is gone".into(),
+        };
+    }
+    match rx.recv_timeout(arm_wait) {
+        Ok(ev) => ev,
+        Err(_) => Event::Error {
+            message: "capture is still starting (screen-share portal pending?) — watch `ord status` or `ord subscribe`".into(),
+        },
     }
 }
 
@@ -486,6 +562,8 @@ fn apply_config<B: CaptureBackend, S: FrameStore>(
     handler: &Arc<Mutex<Handler<B, S>>>,
     ctx: &Arc<Mutex<ServerCtx<B, S>>>,
     subs: &Subscribers,
+    supervisor: &std::sync::mpsc::Sender<crate::supervisor::CaptureRequest<B, S>>,
+    arm_wait: Duration,
     new: Config,
 ) -> Event {
     if new.capture.fps == 0 || new.capture.fps > 240 {
@@ -569,22 +647,33 @@ fn apply_config<B: CaptureBackend, S: FrameStore>(
         (engine, c.base.clone(), resize)
     };
 
-    if let Some(mut engine) = engine {
-        // Read the arm state briefly, start the new engine off every lock,
-        // then take the handler lock only for the swap. A SetBuffer racing
-        // this window is reconciled by `replace_engine`, which re-derives
-        // buffer_enabled from the engine it installs.
-        if lock_tolerant(handler).is_buffer_enabled() {
-            if let Err(e) = engine.start() {
-                // The old engine keeps running; the persisted overrides will
-                // be retried on the next daemon start.
+    if let Some(engine) = engine {
+        // The supervisor starts the new engine (a portal-touching call that
+        // must never run under a lock or unbounded on this connection) and
+        // swaps it in as a clean cut, broadcasting CaptureRestarted itself.
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        if supervisor
+            .send(crate::supervisor::CaptureRequest::Swap {
+                engine: Box::new(engine),
+                reply: tx,
+            })
+            .is_err()
+        {
+            return Event::Error {
+                message: "internal: the capture supervisor is gone".into(),
+            };
+        }
+        match rx.recv_timeout(arm_wait) {
+            Ok(Event::CaptureRestarted) => {}
+            Ok(err) => return err,
+            Err(_) => {
+                // The settings are persisted and swapped; only the session
+                // restart is still pending behind the portal.
                 return Event::Error {
-                    message: format!("new capture settings failed to start: {e}"),
+                    message: "new capture settings are still applying (screen-share portal pending?) — watch `ord status`".into(),
                 };
             }
         }
-        lock_tolerant(handler).replace_engine(engine);
-        broadcast(subs, &Event::CaptureRestarted);
     } else if resize {
         lock_tolerant(handler).set_capacity(buffer);
     }
@@ -665,6 +754,9 @@ mod tests {
             }))),
             watchdog: None,
             game_probe: Box::new(|| false),
+            capture_retry_attempts: 0,
+            capture_retry_delay: Duration::from_millis(20),
+            arm_wait: Duration::from_secs(5),
         }
     }
 
@@ -1110,6 +1202,334 @@ mod tests {
             },
         );
         assert!(matches!(again, Event::Error { .. }), "{again:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A test backend with a scriptable `start()`: fail the next N attempts
+    /// (with a chosen message), optionally block until released, and count
+    /// every attempt — the supervisor's failure/retry/hang scenarios, minus
+    /// the GPU and the portal.
+    #[derive(Clone)]
+    struct FlakyBackend {
+        inner: MockBackend,
+        fail_remaining: Arc<std::sync::atomic::AtomicU32>,
+        fail_message: String,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+        block_on: Option<Arc<Mutex<std::sync::mpsc::Receiver<()>>>>,
+    }
+
+    impl FlakyBackend {
+        fn plan(frames: u32) -> Self {
+            Self {
+                inner: MockBackend::new(60, frames, 60),
+                fail_remaining: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                fail_message: "D-Bus Portal error: AccessDenied".into(),
+                attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                block_on: None,
+            }
+        }
+    }
+
+    impl ord_core::CaptureBackend for FlakyBackend {
+        fn start(&mut self) -> Result<ord_core::CaptureStreams, ord_core::BackendError> {
+            use std::sync::atomic::Ordering;
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.block_on {
+                let _ = lock_tolerant(gate).recv();
+            }
+            let left = self.fail_remaining.load(Ordering::SeqCst);
+            if left > 0 {
+                self.fail_remaining.store(left - 1, Ordering::SeqCst);
+                return Err(ord_core::BackendError::Init(self.fail_message.clone()));
+            }
+            self.inner.start()
+        }
+        fn stop(&mut self) -> Result<(), ord_core::BackendError> {
+            self.inner.stop()
+        }
+        fn params(&self) -> ord_core::StreamParams {
+            self.inner.params()
+        }
+        fn is_running(&self) -> bool {
+            self.inner.is_running()
+        }
+    }
+
+    /// A server over `FlakyBackend`: the handler's engine starts UNSTARTED
+    /// (the daemon's real boot state) and the factory clones the same plan.
+    fn flaky_ctx(backend: FlakyBackend) -> (Handler<FlakyBackend>, ServerCtx<FlakyBackend>) {
+        let engine = Engine::new(backend.clone(), 60);
+        let handler = Handler::new(
+            engine,
+            Box::new(|| std::env::temp_dir().join("ord-test-rec.mkv")),
+        );
+        let mut ctx = ServerCtx {
+            config: Arc::new(Mutex::new(Config::default())),
+            base: Config::default(),
+            engine_factory: Box::new(move |cfg| {
+                Engine::new(backend.clone(), cfg.capture.buffer_seconds)
+            }),
+            write_overrides: Box::new(|_| Ok(())),
+            shot_writer: Arc::new(Mutex::new(Box::new(|_frames, _params| {
+                Ok(PathBuf::from("/tmp/open-recorder/shot.png"))
+            }))),
+            watchdog: None,
+            game_probe: Box::new(|| false),
+            capture_retry_attempts: 0,
+            capture_retry_delay: Duration::from_millis(20),
+            arm_wait: Duration::from_secs(5),
+        };
+        ctx.arm_wait = Duration::from_millis(400);
+        (handler, ctx)
+    }
+
+    /// The bug that motivated the supervisor: capture cannot start (portal
+    /// denied), yet the daemon must bind, answer Status (degraded), give an
+    /// actionable arm error, and keep answering afterwards — never
+    /// "cannot reach ordd".
+    #[test]
+    fn daemon_stays_reachable_when_capture_cannot_start() {
+        let path = temp_sock("degraded");
+        let listener = bind(&path).unwrap();
+        let backend = FlakyBackend {
+            fail_remaining: Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
+            ..FlakyBackend::plan(600)
+        };
+        let (handler, ctx) = flaky_ctx(backend);
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, handler, mock_writer(), ctx);
+        });
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        match request(&mut client, &Command::Status) {
+            Event::Status { buffer_enabled, .. } => assert!(!buffer_enabled),
+            other => panic!("expected Status, got {other:?}"),
+        }
+        let reply = request(&mut client, &Command::SetBuffer { enabled: true });
+        match reply {
+            Event::Error { message } => {
+                assert!(message.contains("failed to start capture"), "{message}")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // Still alive after the failure.
+        assert!(matches!(
+            request(&mut client, &Command::Status),
+            Event::Status { .. }
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The session-login race: the portal isn't ready for the first attempts,
+    /// then recovers. The supervisor's scheduled retries converge and the arm
+    /// is announced to subscribers.
+    #[test]
+    fn startup_retry_converges_and_broadcasts() {
+        let path = temp_sock("retry");
+        let listener = bind(&path).unwrap();
+        let backend = FlakyBackend {
+            fail_remaining: Arc::new(std::sync::atomic::AtomicU32::new(2)),
+            ..FlakyBackend::plan(600)
+        };
+        let attempts = Arc::clone(&backend.attempts);
+        let (handler, mut ctx) = flaky_ctx(backend);
+        ctx.capture_retry_attempts = 5;
+        ctx.capture_retry_delay = Duration::from_millis(200);
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, handler, mock_writer(), ctx);
+        });
+
+        let mut sub = UnixStream::connect(&path).unwrap();
+        sub.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write_frame(&mut sub, &Command::Subscribe.encode().unwrap()).unwrap();
+        let _snapshot = read_frame(&mut sub).unwrap();
+        loop {
+            let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
+            if pushed == (Event::BufferState { enabled: true }) {
+                break;
+            }
+        }
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A portal picker the user dismissed must NOT be re-asked on a schedule.
+    #[test]
+    fn cancelled_portal_is_not_retried() {
+        let path = temp_sock("cancelled");
+        let listener = bind(&path).unwrap();
+        let backend = FlakyBackend {
+            fail_remaining: Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX)),
+            fail_message: "D-Bus Portal error: Cancelled".into(),
+            ..FlakyBackend::plan(600)
+        };
+        let attempts = Arc::clone(&backend.attempts);
+        let (handler, mut ctx) = flaky_ctx(backend);
+        ctx.capture_retry_attempts = 5;
+        ctx.capture_retry_delay = Duration::from_millis(30);
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, handler, mock_writer(), ctx);
+        });
+
+        // Give any (buggy) retry schedule ample time to fire.
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a cancelled portal request must not be retried automatically"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A start hanging inside the portal must wedge NOTHING but itself: Status
+    /// answers, an arm request gets a bounded "still starting" reply, and once
+    /// the portal releases, the arm completes and is broadcast.
+    #[test]
+    fn blocked_portal_start_does_not_wedge_the_daemon() {
+        let path = temp_sock("blockedstart");
+        let listener = bind(&path).unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let backend = FlakyBackend {
+            block_on: Some(Arc::new(Mutex::new(gate_rx))),
+            ..FlakyBackend::plan(600)
+        };
+        let (handler, ctx) = flaky_ctx(backend);
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, handler, mock_writer(), ctx);
+        });
+
+        let mut sub = UnixStream::connect(&path).unwrap();
+        sub.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write_frame(&mut sub, &Command::Subscribe.encode().unwrap()).unwrap();
+        let _snapshot = read_frame(&mut sub).unwrap();
+
+        // The initial arm is blocked inside `start()`; the control plane must
+        // not care.
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        assert!(matches!(
+            request(&mut client, &Command::Status),
+            Event::Status { .. }
+        ));
+
+        // A second arm queues behind the hang and reports it, bounded.
+        let reply = request(&mut client, &Command::SetBuffer { enabled: true });
+        match reply {
+            Event::Error { message } => assert!(message.contains("still starting"), "{message}"),
+            other => panic!("expected still-starting Error, got {other:?}"),
+        }
+
+        // Release the "portal": both queued arms resolve, the buffer arms,
+        // and subscribers hear about it.
+        gate_tx.send(()).unwrap();
+        gate_tx.send(()).unwrap();
+        loop {
+            let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
+            if pushed == (Event::BufferState { enabled: true }) {
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Disarm racing a pending arm reconciles to OFF (requests are processed
+    /// in order once the blocked start releases).
+    #[test]
+    fn disable_during_pending_start_reconciles_off() {
+        let path = temp_sock("reconcile");
+        let listener = bind(&path).unwrap();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let backend = FlakyBackend {
+            block_on: Some(Arc::new(Mutex::new(gate_rx))),
+            ..FlakyBackend::plan(600)
+        };
+        let (handler, ctx) = flaky_ctx(backend);
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, handler, mock_writer(), ctx);
+        });
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        // Queue a disable behind the blocked initial arm (its bounded reply
+        // times out, which is fine — order is what matters).
+        let _ = request(&mut client, &Command::SetBuffer { enabled: false });
+
+        // Release the portal for the initial arm (and any queued attempts).
+        let _ = gate_tx.send(());
+        let _ = gate_tx.send(());
+
+        // The final state is disarmed: the disable ran after the arm.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match request(&mut client, &Command::Status) {
+                Event::Status {
+                    buffer_enabled: false,
+                    ..
+                } => break,
+                _ if std::time::Instant::now() > deadline => {
+                    panic!("buffer never reconciled to disabled")
+                }
+                _ => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Watchdog recovery must never discard the replay buffer: the fresh
+    /// engine adopts the old rings, so footage from before the stall is still
+    /// saveable after the restart.
+    #[test]
+    fn watchdog_restart_preserves_buffered_replay() {
+        let path = temp_sock("wdpreserve");
+        let listener = bind(&path).unwrap();
+        // The initial engine captures a 600-frame burst; every REPLACEMENT
+        // engine captures nothing (0 frames), so any footage seen after the
+        // restart can only have survived via adoption.
+        let mut engine = Engine::new(MockBackend::new(60, 600, 60), 60);
+        engine.start().unwrap();
+        let handler = Handler::new(
+            engine,
+            Box::new(|| std::env::temp_dir().join("ord-test-rec.mkv")),
+        );
+        let mut ctx = mock_ctx();
+        ctx.engine_factory =
+            Box::new(|cfg| Engine::new(MockBackend::new(60, 0, 60), cfg.capture.buffer_seconds));
+        ctx.watchdog = Some(Duration::from_millis(600));
+        let _server = thread::spawn(move || {
+            let _ = serve(listener, handler, mock_writer(), ctx);
+        });
+
+        let mut sub = UnixStream::connect(&path).unwrap();
+        sub.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write_frame(&mut sub, &Command::Subscribe.encode().unwrap()).unwrap();
+        let _snapshot = read_frame(&mut sub).unwrap();
+        loop {
+            let pushed = Event::decode(&read_frame(&mut sub).unwrap()).unwrap();
+            if pushed == Event::CaptureRestarted {
+                break;
+            }
+        }
+
+        let mut client = UnixStream::connect(&path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        match request(&mut client, &Command::Status) {
+            Event::Status {
+                buffered_frames, ..
+            } => assert!(
+                buffered_frames > 0,
+                "replay buffer was discarded by the watchdog restart"
+            ),
+            other => panic!("expected Status, got {other:?}"),
+        }
         let _ = std::fs::remove_file(&path);
     }
 
