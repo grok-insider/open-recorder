@@ -128,9 +128,13 @@ fn run<B, S>(
                 match engine.start() {
                     Ok(()) => {
                         lock_tolerant(&handler).install_engine_preserving_replay(engine);
+                        // Broadcast BEFORE replying: the requester continues
+                        // (and may broadcast follow-ups) the moment the reply
+                        // lands, and subscribers must see the state change
+                        // first — both go through the same subs-lock FIFO.
                         let ev = Event::BufferState { enabled: true };
-                        send(reply.as_ref(), ev.clone());
                         broadcast(&subs, &ev);
+                        send(reply.as_ref(), ev);
                         tracing::info!("capture armed");
                     }
                     Err(e) => {
@@ -161,10 +165,10 @@ fn run<B, S>(
             }
             CaptureRequest::Disable { reply } => {
                 let ev = lock_tolerant(&handler).disable_capture();
-                send(reply.as_ref(), ev.clone());
                 if ev.is_state_change() {
                     broadcast(&subs, &ev);
                 }
+                send(reply.as_ref(), ev);
             }
             CaptureRequest::Restart => {
                 {
@@ -204,10 +208,13 @@ fn run<B, S>(
                     }
                 }
                 // A settings change is a clean cut: buffered footage from the
-                // old encoder is dropped with it.
+                // old encoder is dropped with it. Broadcast BEFORE replying so
+                // subscribers see CaptureRestarted ahead of any follow-up the
+                // (now unblocked) requester broadcasts — e.g. apply_config's
+                // Config push.
                 lock_tolerant(&handler).replace_engine(*engine);
-                let _ = reply.try_send(Event::CaptureRestarted);
                 broadcast(&subs, &Event::CaptureRestarted);
+                let _ = reply.try_send(Event::CaptureRestarted);
             }
         }
     }
