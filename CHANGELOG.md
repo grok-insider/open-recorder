@@ -4,6 +4,12 @@ All notable changes to open-recorder are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2026-07-04
+
+- Fixed a critical bug where a hung portal dialog during capture start could make ordd unreachable; capture startup now retries automatically and never blocks the control socket.
+- Fixed a race condition where subscribers could receive events out of order after a capture restart.
+- Fixed build failures caused by a missing dependency repository (0xfell/waycap-rs).
+
 ## [0.4.2] - 2026-07-02
 
 - Fixed subscriber registration no longer loses a racing broadcast, ensuring HUD and `ord subscribe` never miss state change events.
