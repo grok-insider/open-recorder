@@ -4,6 +4,10 @@ All notable changes to open-recorder are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-08
+
+- Added customizable pressed-key keycaps to the overlay HUD, allowing you to see which keys are pressed with distinct visual indicators.
+
 ## [0.4.3] - 2026-07-04
 
 - Fixed a critical bug where a hung portal dialog during capture start could make ordd unreachable; capture startup now retries automatically and never blocks the control socket.
