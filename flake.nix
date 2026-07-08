@@ -63,6 +63,9 @@
             mesa
             dbus
             libxkbcommon
+            libinput
+            libevdev
+            udev
             alsa-lib # cpal audio output for the ord-ui editor preview
           ];
 
@@ -145,7 +148,7 @@
           ord-hud = mkPkg {
             pname = "ord-hud";
             crate = "ord-overlay";
-            features = [ "layershell" ];
+            features = [ "layershell" "pressed-keys" ];
             native = true;
             mainProgram = "ord-hud";
             description = "open-recorder wlr-layer-shell HUD";
@@ -226,7 +229,20 @@
                 };
                 markers.auto_save_seconds = 30;
                 hooks.on_clip_saved = "~/bin/clip-hook";
-                overlay.show_status_dot = true;
+                overlay = {
+                  show_status_dot = true;
+                  pressed_keys = {
+                    enabled = false;
+                    position = "bottom_center";
+                    x_ppm = 500;
+                    y_ppm = 900;
+                    scale_percent = 100;
+                    opacity_percent = 92;
+                    rotation_degrees = 0;
+                    timeout_ms = 900;
+                    max_keys = 6;
+                  };
+                };
               };
               description = ''
                 Declarative `~/.config/open-recorder/config.toml`. When null (the
@@ -241,7 +257,7 @@
                 clear_on_save), `audio` (desktop, mic, tracks — per-app), `storage`
                 (clips_dir, recordings_dir, template, max_gib, max_age_days),
                 `markers` (auto_save_seconds), `hooks` (on_clip_saved), `overlay`
-                (show_status_dot), `export` (codec, container).
+                (show_status_dot, pressed_keys), `export` (codec, container).
               '';
             };
           };
@@ -319,6 +335,9 @@
             mesa
             dbus           # portal screencast (libdbus-sys)
             libxkbcommon   # smithay-client-toolkit (layer-shell HUD)
+            libinput       # pressed-key HUD input reader
+            libevdev       # libinput dependency exposed for pkg-config builds
+            udev           # libinput udev backend
             alsa-lib       # cpal audio output (ord-ui editor preview)
           ];
 

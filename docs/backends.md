@@ -59,6 +59,10 @@ without a GPU or a live Wayland session. It emits a scripted frame sequence
 (controlled keyframe cadence, PTS) so ring-buffer and save-boundary tests are
 deterministic.
 
+Pressed-key display is deliberately not a `CaptureBackend`: `ord-hud` owns the
+optional raw input reader and renders the keys as an overlay surface, so the
+capture/encode path still only sees already-composited pixels from PipeWire.
+
 ## `Overlay` — on-screen HUD surface
 
 A transparent, always-on-top, click-through surface for HUD feedback. The clip

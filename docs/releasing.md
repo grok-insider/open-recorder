@@ -13,7 +13,7 @@ the *Manual Version Bump* workflow.
 |---|---|---|
 | **Package version** | `[workspace.package] version` in `Cargo.toml` | Every crate inherits it (`version.workspace = true`). The flake reads it (`flake.nix`: `version = importTOML ./Cargo.toml`), so package + store-path names track it automatically. |
 | **Binary `--version`** | `ord --version`, `ordd --version` | Prints `X.Y.Z [protocol N]`, plus the short git rev `(abc1234)` for local `cargo` builds. Nix builds omit the rev (no `.git` in the flake source) so they stay reproducible. Implemented in `ord-common` (`version.rs` + `build.rs`). |
-| **Wire protocol** | `PROTOCOL_VERSION` in `ord-common/src/frame.rs` | Bumped on any incompatible `Command`/`Event` change. The framing layer rejects peer skew loudly (a stale `ord`/`ordd`/`ord-hud`), so `ord` and `ordd` from different releases refuse to talk instead of mis-decoding. |
+| **Wire protocol** | `PROTOCOL_VERSION` in `ord-common/src/frame.rs` | Bumped on any incompatible `Command`/`Event` or nested bincode payload change. The framing layer rejects peer skew loudly (a stale `ord`/`ordd`/`ord-hud`), so `ord` and `ordd` from different releases refuse to talk instead of mis-decoding. |
 
 ## Cutting a release (the automated patch line)
 
@@ -21,8 +21,9 @@ You do **not** bump the version, edit `CHANGELOG.md`, or tag by hand — a clear
 [Conventional Commit](https://www.conventionalcommits.org) drives all three.
 
 1. Land `feat:`/`fix:`/… PRs on `master` as usual. If `Command`/`Event` shapes
-   changed incompatibly, bump `PROTOCOL_VERSION` (`ord-common/src/frame.rs`) in
-   that same commit — and prefer shipping it via a manual **minor** bump (below).
+   or nested bincode-carried types such as `Config` changed incompatibly, bump
+   `PROTOCOL_VERSION` (`ord-common/src/frame.rs`) in that same commit — and
+   prefer shipping it via a manual **minor** bump (below).
 2. The **`release-pr` job** (`.github/workflows/release.yml` — our own job, see
    "Why not `release-plz release-pr`") keeps a release PR open
    (`chore: release vX.Y.Z+1`) whenever `feat`/`fix` commits have landed since

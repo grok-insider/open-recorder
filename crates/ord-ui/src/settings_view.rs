@@ -11,7 +11,7 @@
 use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
-use ord_common::config::{CaptureCodec, Container, ExportCodec, Quality};
+use ord_common::config::{CaptureCodec, Container, ExportCodec, PressedKeysPosition, Quality};
 use ord_common::Config;
 
 use crate::settings::{ApplyTier, SettingsModel};
@@ -739,6 +739,47 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
             ui.checkbox(&mut model.draft.overlay.show_status_dot, "");
         },
     );
+    row(
+        ui,
+        &overridden,
+        "overlay.pressed_keys.enabled",
+        "Show pressed keys",
+        "Render the current keyboard shortcut in the recorded demo. Off by \
+         default because enabling it reads raw keyboard input.",
+        |ui| {
+            ui.checkbox(&mut model.draft.overlay.pressed_keys.enabled, "");
+        },
+    );
+    pressed_keys_layout_editor(ui, &overridden, model);
+    row(
+        ui,
+        &overridden,
+        "overlay.pressed_keys.timeout_ms",
+        "Key visibility",
+        "How long the last shortcut remains visible after the keys are released.",
+        |ui| {
+            stepper_u32(
+                ui,
+                "pressed-keys-timeout",
+                &mut model.draft.overlay.pressed_keys.timeout_ms,
+                250..=5000,
+                250,
+                "ms",
+            );
+        },
+    );
+    row(
+        ui,
+        &overridden,
+        "overlay.pressed_keys.max_keys",
+        "Max keys shown",
+        "Caps very large chords so the strip stays compact.",
+        |ui| {
+            let mut max = model.draft.overlay.pressed_keys.max_keys as u32;
+            stepper_u32(ui, "pressed-keys-max", &mut max, 1..=8, 1, "keys");
+            model.draft.overlay.pressed_keys.max_keys = max as u8;
+        },
+    );
 
     theme::section(ui, "Storage");
     row(
@@ -915,10 +956,341 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
     browse
 }
 
+fn pressed_keys_layout_editor(ui: &mut egui::Ui, overridden: &[String], model: &mut SettingsModel) {
+    let paths = [
+        "overlay.pressed_keys.position",
+        "overlay.pressed_keys.x_ppm",
+        "overlay.pressed_keys.y_ppm",
+        "overlay.pressed_keys.scale_percent",
+        "overlay.pressed_keys.opacity_percent",
+        "overlay.pressed_keys.rotation_degrees",
+    ];
+    let any_override = paths
+        .iter()
+        .any(|path| overridden.iter().any(|p| p == path));
+
+    ui.horizontal(|ui| {
+        let (dot, resp) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+        if any_override {
+            ui.painter().circle_filled(dot.center(), 2.2, theme::KIN);
+            resp.on_hover_text("Overrides the base config");
+        }
+        ui.allocate_ui_with_layout(
+            egui::vec2(LABEL_W, 22.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(
+                    egui::RichText::new("Keycap layout")
+                        .size(theme::TEXT_BODY)
+                        .color(theme::INK_2),
+                );
+            },
+        );
+        ui.vertical(|ui| {
+            let keys = &mut model.draft.overlay.pressed_keys;
+            pressed_keys_preview(ui, keys);
+            ui.add_space(theme::SP_2);
+            ui.horizontal_wrapped(|ui| {
+                for p in [
+                    PressedKeysPosition::BottomCenter,
+                    PressedKeysPosition::BottomLeft,
+                    PressedKeysPosition::BottomRight,
+                    PressedKeysPosition::TopCenter,
+                ] {
+                    if ui
+                        .selectable_label(keys.position == p, pressed_keys_position_label(p))
+                        .clicked()
+                    {
+                        keys.position = p;
+                        let (x, y) = pressed_keys_preset_ppm(p);
+                        keys.x_ppm = x;
+                        keys.y_ppm = y;
+                    }
+                }
+                if ui.button("Reset").clicked() {
+                    let defaults = ord_common::PressedKeysConfig::default();
+                    keys.position = defaults.position;
+                    keys.x_ppm = defaults.x_ppm;
+                    keys.y_ppm = defaults.y_ppm;
+                    keys.scale_percent = defaults.scale_percent;
+                    keys.opacity_percent = defaults.opacity_percent;
+                    keys.rotation_degrees = defaults.rotation_degrees;
+                }
+            });
+            let mut scale = keys.scale_percent as i32;
+            transform_slider_i32(ui, "Size", &mut scale, 50..=250, "%");
+            keys.scale_percent = scale as u16;
+            let mut opacity = keys.opacity_percent as i32;
+            transform_slider_i32(ui, "Opacity", &mut opacity, 35..=100, "%");
+            keys.opacity_percent = opacity as u8;
+            let mut rotation = keys.rotation_degrees as i32;
+            transform_slider_i32(ui, "Rotation", &mut rotation, -30..=30, "deg");
+            keys.rotation_degrees = rotation as i16;
+        });
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(CAPTION_INDENT);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Drag the preview to choose a custom on-screen position. Applies live.",
+                )
+                .size(theme::TEXT_MICRO)
+                .color(theme::INK_3),
+            )
+            .wrap(),
+        );
+    });
+    ui.add_space(theme::SP_2);
+}
+
+fn transform_slider_i32(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut i32,
+    range: std::ops::RangeInclusive<i32>,
+    suffix: &str,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = theme::SP_2;
+        ui.label(
+            egui::RichText::new(label)
+                .size(theme::TEXT_LABEL)
+                .color(theme::INK_2),
+        );
+        ui.add(
+            egui::Slider::new(value, range)
+                .suffix(suffix)
+                .show_value(true)
+                .text("")
+                .clamping(egui::SliderClamping::Always),
+        );
+    });
+}
+
+fn pressed_keys_preview(ui: &mut egui::Ui, keys: &mut ord_common::PressedKeysConfig) {
+    let width = ui.available_width().clamp(280.0, 460.0);
+    let size = egui::vec2(width, width * 9.0 / 16.0);
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    if (resp.clicked() || resp.dragged()) && resp.interact_pointer_pos().is_some() {
+        if let Some(pos) = resp.interact_pointer_pos() {
+            keys.position = PressedKeysPosition::Custom;
+            keys.x_ppm =
+                (((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0) * 1000.0).round() as u16;
+            keys.y_ppm =
+                (((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0) * 1000.0).round() as u16;
+        }
+    }
+
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, theme::RADIUS_CARD, theme::THUMB_BG);
+    painter.rect_stroke(
+        rect,
+        theme::RADIUS_CARD,
+        egui::Stroke::new(1.0, theme::HAIRLINE),
+    );
+    let band = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.bottom() - rect.height() * 0.28),
+        rect.right_bottom(),
+    );
+    painter.rect_filled(band, 0.0, egui::Color32::from_black_alpha(50));
+    draw_preview_keycaps(ui, rect, keys);
+}
+
+fn draw_preview_keycaps(ui: &mut egui::Ui, rect: egui::Rect, keys: &ord_common::PressedKeysConfig) {
+    let labels = ["Ctrl", "Shift", "R"];
+    let preview_unit = rect.width() / 1280.0 * (keys.scale_percent.clamp(50, 250) as f32 / 100.0);
+    let key_h = 58.0 * preview_unit;
+    let gap = 10.0 * preview_unit;
+    let font_id = egui::FontId::monospace((22.0 * preview_unit).max(8.0));
+    let text_color = egui::Color32::from_rgb(244, 246, 249);
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|label| {
+            let text_w = ui.fonts(|f| {
+                f.layout_no_wrap(label.to_string(), font_id.clone(), text_color)
+                    .size()
+                    .x
+            });
+            (text_w + 40.0 * preview_unit).max(72.0 * preview_unit)
+        })
+        .collect();
+    let row_w = widths.iter().sum::<f32>() + gap * labels.len().saturating_sub(1) as f32;
+    let angle = (keys.rotation_degrees.clamp(-30, 30) as f32).to_radians();
+    let center = preview_key_center(keys, rect, row_w, key_h, preview_unit, angle);
+    let opacity = keys.opacity_percent.clamp(35, 100) as f32 / 100.0;
+
+    let mut x = -row_w / 2.0;
+    for (label, key_w) in labels.iter().zip(widths.iter()) {
+        let local =
+            egui::Rect::from_min_size(egui::pos2(x, -key_h / 2.0), egui::vec2(*key_w, key_h));
+        draw_rotated_preview_key(ui, local, center, angle, opacity, preview_unit);
+        let galley = ui.fonts(|f| f.layout_no_wrap(label.to_string(), font_id.clone(), text_color));
+        let local_text = egui::pos2(
+            local.center().x - galley.size().x / 2.0,
+            local.center().y - galley.size().y / 2.0,
+        );
+        let pos = rotate_preview_point(local_text, center, angle);
+        ui.painter().add(
+            egui::epaint::TextShape::new(pos, galley, text_color)
+                .with_angle(angle)
+                .with_opacity_factor(opacity),
+        );
+        x += *key_w + gap;
+    }
+}
+
+fn preview_key_center(
+    keys: &ord_common::PressedKeysConfig,
+    rect: egui::Rect,
+    row_w: f32,
+    row_h: f32,
+    unit: f32,
+    angle: f32,
+) -> egui::Pos2 {
+    let margin = 54.0 * unit;
+    let mut center = match keys.position {
+        PressedKeysPosition::BottomCenter => {
+            egui::pos2(rect.center().x, rect.bottom() - margin - row_h / 2.0)
+        }
+        PressedKeysPosition::BottomLeft => egui::pos2(
+            rect.left() + margin + row_w / 2.0,
+            rect.bottom() - margin - row_h / 2.0,
+        ),
+        PressedKeysPosition::BottomRight => egui::pos2(
+            rect.right() - margin - row_w / 2.0,
+            rect.bottom() - margin - row_h / 2.0,
+        ),
+        PressedKeysPosition::TopCenter => {
+            egui::pos2(rect.center().x, rect.top() + margin + row_h / 2.0)
+        }
+        PressedKeysPosition::Custom => egui::pos2(
+            rect.left() + rect.width() * keys.x_ppm.min(1000) as f32 / 1000.0,
+            rect.top() + rect.height() * keys.y_ppm.min(1000) as f32 / 1000.0,
+        ),
+    };
+    let (sin, cos) = angle.sin_cos();
+    let half_w = (cos.abs() * row_w + sin.abs() * row_h) / 2.0 + 18.0 * unit;
+    let half_h = (sin.abs() * row_w + cos.abs() * row_h) / 2.0 + 18.0 * unit;
+    center.x = center.x.clamp(
+        rect.left() + half_w.min(rect.width() / 2.0),
+        rect.right() - half_w.min(rect.width() / 2.0),
+    );
+    center.y = center.y.clamp(
+        rect.top() + half_h.min(rect.height() / 2.0),
+        rect.bottom() - half_h.min(rect.height() / 2.0),
+    );
+    center
+}
+
+fn draw_rotated_preview_key(
+    ui: &mut egui::Ui,
+    local: egui::Rect,
+    center: egui::Pos2,
+    angle: f32,
+    opacity: f32,
+    unit: f32,
+) {
+    let points = rotated_preview_rect(local, center, angle);
+    let shadow_points: Vec<egui::Pos2> = points
+        .iter()
+        .map(|p| egui::pos2(p.x, p.y + 4.0 * unit))
+        .collect();
+    ui.painter().add(egui::Shape::convex_polygon(
+        shadow_points,
+        alpha(egui::Color32::BLACK, 0.36 * opacity),
+        egui::Stroke::NONE,
+    ));
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        alpha(egui::Color32::from_rgb(63, 67, 70), opacity),
+        egui::Stroke::new(1.0, alpha(egui::Color32::WHITE, 0.16 * opacity)),
+    ));
+}
+
+fn rotated_preview_rect(local: egui::Rect, center: egui::Pos2, angle: f32) -> Vec<egui::Pos2> {
+    vec![
+        rotate_preview_point(local.left_top(), center, angle),
+        rotate_preview_point(local.right_top(), center, angle),
+        rotate_preview_point(local.right_bottom(), center, angle),
+        rotate_preview_point(local.left_bottom(), center, angle),
+    ]
+}
+
+fn rotate_preview_point(local: egui::Pos2, center: egui::Pos2, angle: f32) -> egui::Pos2 {
+    let (sin, cos) = angle.sin_cos();
+    egui::pos2(
+        center.x + cos * local.x - sin * local.y,
+        center.y + sin * local.x + cos * local.y,
+    )
+}
+
+fn pressed_keys_preset_ppm(position: PressedKeysPosition) -> (u16, u16) {
+    match position {
+        PressedKeysPosition::BottomCenter => (500, 900),
+        PressedKeysPosition::BottomLeft => (160, 900),
+        PressedKeysPosition::BottomRight => (840, 900),
+        PressedKeysPosition::TopCenter => (500, 100),
+        PressedKeysPosition::Custom => (500, 900),
+    }
+}
+
+fn alpha(color: egui::Color32, factor: f32) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(
+        color.r(),
+        color.g(),
+        color.b(),
+        (color.a() as f32 * factor.clamp(0.0, 1.0)).round() as u8,
+    )
+}
+
 fn codec_label(c: CaptureCodec) -> &'static str {
     match c {
         CaptureCodec::H264 => "H.264 (compatible)",
         CaptureCodec::Hevc => "HEVC",
         CaptureCodec::Av1 => "AV1 (best compression)",
+    }
+}
+
+fn pressed_keys_position_label(p: PressedKeysPosition) -> &'static str {
+    match p {
+        PressedKeysPosition::BottomCenter => "Bottom center",
+        PressedKeysPosition::BottomLeft => "Bottom left",
+        PressedKeysPosition::BottomRight => "Bottom right",
+        PressedKeysPosition::TopCenter => "Top center",
+        PressedKeysPosition::Custom => "Custom",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pressed_key_presets_map_to_normalized_centers() {
+        assert_eq!(
+            pressed_keys_preset_ppm(PressedKeysPosition::BottomCenter),
+            (500, 900)
+        );
+        assert_eq!(
+            pressed_keys_preset_ppm(PressedKeysPosition::BottomLeft),
+            (160, 900)
+        );
+        assert_eq!(
+            pressed_keys_preset_ppm(PressedKeysPosition::BottomRight),
+            (840, 900)
+        );
+        assert_eq!(
+            pressed_keys_preset_ppm(PressedKeysPosition::TopCenter),
+            (500, 100)
+        );
+    }
+
+    #[test]
+    fn custom_position_has_label() {
+        assert_eq!(
+            pressed_keys_position_label(PressedKeysPosition::Custom),
+            "Custom"
+        );
     }
 }

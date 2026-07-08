@@ -15,6 +15,8 @@ smithay-client-toolkit = { version = "0.19", optional = true }
 wayland-client = { version = "0.31", optional = true }
 # Pure-Rust glyph rasterizer for the HUD text (no system fonts / no GPU).
 fontdue = { version = "0.9", optional = true }
+input = { version = "0.10", optional = true, features = ["udev"] }
+libc = { version = "0.2", optional = true }
 
 [[bin]]
 name = "ord-hud"
@@ -27,6 +29,7 @@ required-features = ["layershell"]
 # the trait + HUD model build and test without Wayland.
 default = []
 layershell = ["dep:smithay-client-toolkit", "dep:wayland-client", "dep:fontdue"]
+pressed-keys = ["dep:input", "dep:libc"]
 
 [lints]
 workspace = true

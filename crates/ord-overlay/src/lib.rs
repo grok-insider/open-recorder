@@ -11,11 +11,13 @@
 
 pub mod apply;
 pub mod hud;
+#[cfg(all(feature = "pressed-keys", target_os = "linux"))]
+pub mod key_source;
 #[cfg(feature = "layershell")]
 pub mod layershell;
 
 pub use apply::apply;
-pub use hud::{Hud, Toast, ToastKind};
+pub use hud::{Hud, PressedKeyEvent, PressedKeysLayout, Toast, ToastKind};
 #[cfg(feature = "layershell")]
 pub use layershell::LayerShellOverlay;
 

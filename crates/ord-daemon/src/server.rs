@@ -604,6 +604,36 @@ fn apply_config<B: CaptureBackend, S: FrameStore>(
             message: "capture.buffer_seconds must be at least 1".into(),
         };
     };
+    if !(250..=5000).contains(&new.overlay.pressed_keys.timeout_ms) {
+        return Event::Error {
+            message: "overlay.pressed_keys.timeout_ms must be between 250 and 5000".into(),
+        };
+    }
+    if !(1..=8).contains(&new.overlay.pressed_keys.max_keys) {
+        return Event::Error {
+            message: "overlay.pressed_keys.max_keys must be between 1 and 8".into(),
+        };
+    }
+    if new.overlay.pressed_keys.x_ppm > 1000 || new.overlay.pressed_keys.y_ppm > 1000 {
+        return Event::Error {
+            message: "overlay.pressed_keys x_ppm/y_ppm must be between 0 and 1000".into(),
+        };
+    }
+    if !(50..=250).contains(&new.overlay.pressed_keys.scale_percent) {
+        return Event::Error {
+            message: "overlay.pressed_keys.scale_percent must be between 50 and 250".into(),
+        };
+    }
+    if !(35..=100).contains(&new.overlay.pressed_keys.opacity_percent) {
+        return Event::Error {
+            message: "overlay.pressed_keys.opacity_percent must be between 35 and 100".into(),
+        };
+    }
+    if !(-30..=30).contains(&new.overlay.pressed_keys.rotation_degrees) {
+        return Event::Error {
+            message: "overlay.pressed_keys.rotation_degrees must be between -30 and 30".into(),
+        };
+    }
 
     // Persist + swap under the ctx lock, and *build* (never start) the
     // replacement engine there too — construction is cheap. The lock drops
@@ -1080,6 +1110,74 @@ mod tests {
         let mut bad = Config::default();
         bad.capture.hdr = true;
         bad.capture.codec = ord_common::config::CaptureCodec::H264;
+        assert!(matches!(
+            request(
+                &mut client,
+                &Command::SetConfig {
+                    config: Box::new(bad)
+                }
+            ),
+            Event::Error { .. }
+        ));
+
+        // Pressed-key overlay bounds are live-tier but still validated.
+        let mut bad = Config::default();
+        bad.overlay.pressed_keys.timeout_ms = 100;
+        assert!(matches!(
+            request(
+                &mut client,
+                &Command::SetConfig {
+                    config: Box::new(bad)
+                }
+            ),
+            Event::Error { .. }
+        ));
+        let mut bad = Config::default();
+        bad.overlay.pressed_keys.max_keys = 0;
+        assert!(matches!(
+            request(
+                &mut client,
+                &Command::SetConfig {
+                    config: Box::new(bad)
+                }
+            ),
+            Event::Error { .. }
+        ));
+        let mut bad = Config::default();
+        bad.overlay.pressed_keys.x_ppm = 1001;
+        assert!(matches!(
+            request(
+                &mut client,
+                &Command::SetConfig {
+                    config: Box::new(bad)
+                }
+            ),
+            Event::Error { .. }
+        ));
+        let mut bad = Config::default();
+        bad.overlay.pressed_keys.scale_percent = 40;
+        assert!(matches!(
+            request(
+                &mut client,
+                &Command::SetConfig {
+                    config: Box::new(bad)
+                }
+            ),
+            Event::Error { .. }
+        ));
+        let mut bad = Config::default();
+        bad.overlay.pressed_keys.opacity_percent = 20;
+        assert!(matches!(
+            request(
+                &mut client,
+                &Command::SetConfig {
+                    config: Box::new(bad)
+                }
+            ),
+            Event::Error { .. }
+        ));
+        let mut bad = Config::default();
+        bad.overlay.pressed_keys.rotation_degrees = 45;
         assert!(matches!(
             request(
                 &mut client,

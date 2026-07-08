@@ -342,14 +342,70 @@ pub struct OverlayConfig {
     /// Show the persistent status dot in the screen corner (red = buffer
     /// armed, grey = daemon offline). Toasts are unaffected. Applies live.
     pub show_status_dot: bool,
+    /// Show pressed keyboard shortcuts in the recorded demo. Off by default:
+    /// enabling this reads raw keyboard events from `/dev/input`, which is
+    /// intentionally a privileged input-capture permission on Wayland.
+    pub pressed_keys: PressedKeysConfig,
 }
 
 impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             show_status_dot: true,
+            pressed_keys: PressedKeysConfig::default(),
         }
     }
+}
+
+/// On-screen pressed-key display rendered by `ord-hud`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PressedKeysConfig {
+    /// Whether raw keyboard events are read and shown in the HUD.
+    pub enabled: bool,
+    /// Screen edge/corner preset, or `custom` for normalized free placement.
+    pub position: PressedKeysPosition,
+    /// Custom center X position in parts-per-thousand of the output width.
+    pub x_ppm: u16,
+    /// Custom center Y position in parts-per-thousand of the output height.
+    pub y_ppm: u16,
+    /// Keycap layout scale as a percentage.
+    pub scale_percent: u16,
+    /// Keycap layout opacity as a percentage.
+    pub opacity_percent: u8,
+    /// 2D rotation in degrees.
+    pub rotation_degrees: i16,
+    /// How long the last chord remains visible after key release.
+    pub timeout_ms: u32,
+    /// Maximum number of key labels shown in one chord.
+    pub max_keys: u8,
+}
+
+impl Default for PressedKeysConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            position: PressedKeysPosition::BottomCenter,
+            x_ppm: 500,
+            y_ppm: 900,
+            scale_percent: 100,
+            opacity_percent: 92,
+            rotation_degrees: 0,
+            timeout_ms: 900,
+            max_keys: 6,
+        }
+    }
+}
+
+/// Where the pressed-key layout is placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PressedKeysPosition {
+    BottomCenter,
+    BottomLeft,
+    BottomRight,
+    TopCenter,
+    Custom,
 }
 
 /// Audio capture settings.
@@ -624,6 +680,18 @@ mod tests {
         assert_eq!(c.storage.max_gib, None);
         assert_eq!(c.markers.auto_save_seconds, None);
         assert!(c.overlay.show_status_dot);
+        assert!(!c.overlay.pressed_keys.enabled);
+        assert_eq!(
+            c.overlay.pressed_keys.position,
+            PressedKeysPosition::BottomCenter
+        );
+        assert_eq!(c.overlay.pressed_keys.x_ppm, 500);
+        assert_eq!(c.overlay.pressed_keys.y_ppm, 900);
+        assert_eq!(c.overlay.pressed_keys.scale_percent, 100);
+        assert_eq!(c.overlay.pressed_keys.opacity_percent, 92);
+        assert_eq!(c.overlay.pressed_keys.rotation_degrees, 0);
+        assert_eq!(c.overlay.pressed_keys.timeout_ms, 900);
+        assert_eq!(c.overlay.pressed_keys.max_keys, 6);
     }
 
     #[test]
@@ -779,6 +847,17 @@ mod tests {
             },
             overlay: OverlayConfig {
                 show_status_dot: false,
+                pressed_keys: PressedKeysConfig {
+                    enabled: true,
+                    position: PressedKeysPosition::Custom,
+                    x_ppm: 420,
+                    y_ppm: 760,
+                    scale_percent: 135,
+                    opacity_percent: 86,
+                    rotation_degrees: -8,
+                    timeout_ms: 1250,
+                    max_keys: 4,
+                },
             },
         };
         let toml = c.to_toml_string().unwrap();
@@ -787,12 +866,49 @@ mod tests {
 
     #[test]
     fn overlay_section_parses_and_diffs() {
-        let c = Config::from_toml_str("[overlay]\nshow_status_dot = false").unwrap();
+        let c = Config::from_toml_str(
+            r#"
+            [overlay]
+            show_status_dot = false
+
+            [overlay.pressed_keys]
+            enabled = true
+            position = "custom"
+            x_ppm = 420
+            y_ppm = 760
+            scale_percent = 135
+            opacity_percent = 86
+            rotation_degrees = -8
+            timeout_ms = 1200
+            max_keys = 5
+            "#,
+        )
+        .unwrap();
         assert!(!c.overlay.show_status_dot);
+        assert!(c.overlay.pressed_keys.enabled);
+        assert_eq!(c.overlay.pressed_keys.position, PressedKeysPosition::Custom);
+        assert_eq!(c.overlay.pressed_keys.x_ppm, 420);
+        assert_eq!(c.overlay.pressed_keys.y_ppm, 760);
+        assert_eq!(c.overlay.pressed_keys.scale_percent, 135);
+        assert_eq!(c.overlay.pressed_keys.opacity_percent, 86);
+        assert_eq!(c.overlay.pressed_keys.rotation_degrees, -8);
+        assert_eq!(c.overlay.pressed_keys.timeout_ms, 1200);
+        assert_eq!(c.overlay.pressed_keys.max_keys, 5);
         let base = Config::default();
         assert_eq!(
             c.overridden_fields(&base),
-            vec!["overlay.show_status_dot".to_string()]
+            vec![
+                "overlay.pressed_keys.enabled".to_string(),
+                "overlay.pressed_keys.max_keys".to_string(),
+                "overlay.pressed_keys.opacity_percent".to_string(),
+                "overlay.pressed_keys.position".to_string(),
+                "overlay.pressed_keys.rotation_degrees".to_string(),
+                "overlay.pressed_keys.scale_percent".to_string(),
+                "overlay.pressed_keys.timeout_ms".to_string(),
+                "overlay.pressed_keys.x_ppm".to_string(),
+                "overlay.pressed_keys.y_ppm".to_string(),
+                "overlay.show_status_dot".to_string()
+            ]
         );
     }
 

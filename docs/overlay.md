@@ -45,6 +45,14 @@ real overlay surface, and here the platform split is unavoidable:
 
 These live behind the `Overlay` trait in `ord-overlay` (see `docs/backends.md`).
 
+The pressed-key demo overlay is part of the same HUD process, not the recorder
+engine. When `[overlay.pressed_keys].enabled = true`, `ord-hud` reads raw Linux
+keyboard events and draws individual IBM Plex Mono keycaps on a click-through,
+output-sized layer-shell surface so PipeWire captures them naturally. The
+position can be one of the presets or a custom normalized point edited in
+`ord-ui` Settings, with live size, opacity, and 2D rotation controls. It is off
+by default because raw input access is effectively key-capture permission.
+
 ## GUI toolkit: egui
 
 One toolkit for both surfaces. Chosen over `iced` because:

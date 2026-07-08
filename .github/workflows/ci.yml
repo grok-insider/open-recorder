@@ -105,7 +105,7 @@ jobs:
       # on a driverless runner. The waycap test lane runs on the dev box
       # (`cargo test --features waycap -- --ignored`, per AGENTS.md).
       - name: test all features except waycap (devshell)
-        run: nix develop -c cargo test --workspace --features "ord-core/mux,ord-daemon/mux,ord-overlay/layershell,ord-ui/gui"
+        run: nix develop -c cargo test --workspace --features "ord-core/mux,ord-daemon/mux,ord-overlay/layershell,ord-overlay/pressed-keys,ord-ui/gui"
 
   # The nix build + cachix push runs on every master push (plus tags and manual
   # dispatch), so the cache always holds the current master closure and NixOS

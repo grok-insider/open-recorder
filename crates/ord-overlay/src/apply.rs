@@ -55,7 +55,7 @@ pub fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {
         }
         // Pushed on every settings apply: the overlay section governs us.
         Event::Config { effective, .. } => {
-            hud.set_show_status_dot(effective.overlay.show_status_dot);
+            hud.apply_overlay_config(&effective.overlay);
         }
     }
 }
@@ -174,6 +174,23 @@ mod tests {
         );
         assert!(!hud.show_status_dot);
         assert!(hud.toasts().is_empty());
+    }
+
+    #[test]
+    fn config_governs_pressed_keys() {
+        let mut hud = Hud::default();
+        assert!(!hud.pressed_keys_enabled());
+        let mut effective = Config::default();
+        effective.overlay.pressed_keys.enabled = true;
+        apply(
+            &mut hud,
+            &Event::Config {
+                effective: Box::new(effective),
+                base: Box::new(Config::default()),
+            },
+            0,
+        );
+        assert!(hud.pressed_keys_enabled());
     }
 
     #[test]

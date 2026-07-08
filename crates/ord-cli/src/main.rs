@@ -485,15 +485,25 @@ mod tests {
     #[test]
     fn set_dotted_keeps_types() {
         let mut doc: toml::Value = toml::from_str(
-            "[capture]\nfps = 60\nauto_arm = false\ntarget = \"portal\"\n[storage]\n",
+            "[capture]\nfps = 60\nauto_arm = false\ntarget = \"portal\"\n[storage]\n[overlay]\n[overlay.pressed_keys]\nenabled = false\nscale_percent = 100\n",
         )
         .unwrap();
         set_dotted(&mut doc, "capture.fps", "30").unwrap();
         set_dotted(&mut doc, "capture.auto_arm", "true").unwrap();
         set_dotted(&mut doc, "capture.target", "DP-1").unwrap();
+        set_dotted(&mut doc, "overlay.pressed_keys.enabled", "true").unwrap();
+        set_dotted(&mut doc, "overlay.pressed_keys.scale_percent", "135").unwrap();
         assert_eq!(doc["capture"]["fps"].as_integer(), Some(30));
         assert_eq!(doc["capture"]["auto_arm"].as_bool(), Some(true));
         assert_eq!(doc["capture"]["target"].as_str(), Some("DP-1"));
+        assert_eq!(
+            doc["overlay"]["pressed_keys"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            doc["overlay"]["pressed_keys"]["scale_percent"].as_integer(),
+            Some(135)
+        );
 
         // Type mismatches are rejected with the key in the message.
         assert!(set_dotted(&mut doc, "capture.fps", "fast").is_err());

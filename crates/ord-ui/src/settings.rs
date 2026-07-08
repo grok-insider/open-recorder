@@ -82,6 +82,25 @@ impl SettingsModel {
                 out.push("Auto-save on mark needs at least 1 second.".into());
             }
         }
+        let keys = &self.draft.overlay.pressed_keys;
+        if !(250..=5000).contains(&keys.timeout_ms) {
+            out.push("Pressed-key visibility must be between 250 and 5000 ms.".into());
+        }
+        if !(1..=8).contains(&keys.max_keys) {
+            out.push("Pressed-key max keys must be between 1 and 8.".into());
+        }
+        if keys.x_ppm > 1000 || keys.y_ppm > 1000 {
+            out.push("Pressed-key position must stay inside the preview.".into());
+        }
+        if !(50..=250).contains(&keys.scale_percent) {
+            out.push("Pressed-key size must be between 50% and 250%.".into());
+        }
+        if !(35..=100).contains(&keys.opacity_percent) {
+            out.push("Pressed-key opacity must be between 35% and 100%.".into());
+        }
+        if !(-30..=30).contains(&keys.rotation_degrees) {
+            out.push("Pressed-key rotation must be between -30 and 30 degrees.".into());
+        }
         out
     }
 
@@ -137,6 +156,9 @@ mod tests {
         let mut m = model();
         m.draft.storage.max_gib = Some(25);
         m.draft.hooks.on_clip_saved = Some("/bin/true".into());
+        m.draft.overlay.pressed_keys.enabled = true;
+        m.draft.overlay.pressed_keys.scale_percent = 135;
+        m.draft.overlay.pressed_keys.rotation_degrees = -8;
         assert!(m.is_dirty());
         assert_eq!(m.apply_tier(), ApplyTier::Live);
     }
@@ -164,8 +186,14 @@ mod tests {
         m.draft.capture.bitrate_kbps = Some(50);
         m.draft.storage.template = "  ".into();
         m.draft.markers.auto_save_seconds = Some(0);
+        m.draft.overlay.pressed_keys.timeout_ms = 100;
+        m.draft.overlay.pressed_keys.max_keys = 0;
+        m.draft.overlay.pressed_keys.x_ppm = 1200;
+        m.draft.overlay.pressed_keys.scale_percent = 40;
+        m.draft.overlay.pressed_keys.opacity_percent = 20;
+        m.draft.overlay.pressed_keys.rotation_degrees = 45;
         let problems = m.problems();
-        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert_eq!(problems.len(), 10, "{problems:?}");
     }
 
     #[test]

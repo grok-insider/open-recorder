@@ -5,16 +5,16 @@
 //! The magic + version make a peer skew (e.g. a stale `ord` binary in `$PATH`
 //! talking to a newer `ordd`) fail **loudly** at the framing layer instead of
 //! silently mis-decoding shifted bincode enum discriminants. Bump
-//! [`PROTOCOL_VERSION`] whenever the `Command`/`Event` shapes change
-//! incompatibly.
+//! [`PROTOCOL_VERSION`] whenever the `Command`/`Event` shapes or any nested
+//! bincode payload they carry change incompatibly.
 
 use std::io::{self, Read, Write};
 
-/// Wire protocol version. Bump on any incompatible `Command`/`Event` change.
+/// Wire protocol version. Bump on any incompatible control-payload change.
 ///
-/// v4 (0.2.0): added `Command::Screenshot` + `Event::ScreenshotSaved`, the
-/// per-track audio / capture-knob config fields, and `replay_storage`.
-pub const PROTOCOL_VERSION: u8 = 5;
+/// v7: added `overlay.pressed_keys` layout transform fields, which cross the
+/// wire in `Event::Config` and `Command::SetConfig`.
+pub const PROTOCOL_VERSION: u8 = 7;
 
 /// Frame magic identifying an open-recorder control message.
 const MAGIC: [u8; 3] = *b"ORD";

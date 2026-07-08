@@ -32,8 +32,9 @@ use smithay_client_toolkit::{
 use std::collections::HashMap;
 
 use fontdue::{Font, Metrics};
+use ord_common::config::PressedKeysPosition;
 
-use crate::hud::{Hud, ToastKind};
+use crate::hud::{Hud, PressedKeysLayout, ToastKind};
 use crate::{Overlay, OverlayError};
 
 /// A rasterized glyph (constant font size), cached so a visible toast blits the
@@ -45,9 +46,11 @@ struct Glyph {
 
 /// Glyph bitmap cache keyed by character (the font size is fixed at [`FONT_PX`]).
 type GlyphCache = HashMap<char, Glyph>;
+type KeyGlyphCache = HashMap<(u32, char), Glyph>;
 
 /// Embedded UI font for the toast text (OFL, see `assets/fonts/LICENSES.md`).
 const FONT_DATA: &[u8] = include_bytes!("../assets/fonts/IBMPlexSans-Regular.ttf");
+const KEY_FONT_DATA: &[u8] = include_bytes!("../../ord-ui/assets/fonts/IBMPlexMono-Regular.ttf");
 
 // Layout. The surface is a transparent canvas anchored top-right; cards are
 // right-aligned within it, with `SHADOW` px of transparent margin for the soft
@@ -60,6 +63,17 @@ const CARD_MAX_W: u32 = 420;
 const CARD_MIN_W: u32 = 168;
 const SURFACE_W: u32 = CARD_MAX_W + SHADOW * 2;
 const SURFACE_H: u32 = SHADOW * 2 + (CARD_H + CARD_GAP) * MAX_ROWS;
+
+const KEY_SURFACE_FALLBACK_W: u32 = 1280;
+const KEY_SURFACE_FALLBACK_H: u32 = 720;
+const KEYCAP_H: f32 = 58.0;
+const KEYCAP_MIN_W: f32 = 72.0;
+const KEYCAP_PAD_X: f32 = 20.0;
+const KEYCAP_GAP: f32 = 10.0;
+const KEYCAP_RADIUS: f32 = 10.0;
+const KEY_FONT_PX: f32 = 22.0;
+const KEY_SAFE_MARGIN: f32 = 54.0;
+const KEY_SHADOW: f32 = 18.0;
 
 const CARD_RADIUS: f32 = 12.0;
 const FONT_PX: f32 = 15.0;
@@ -76,6 +90,9 @@ const SLIDE_PX: f32 = 18.0;
 const CARD_BG: (f32, f32, f32) = (28.0, 29.0, 36.0); // #1C1D24
 const TEXT_RGB: (f32, f32, f32) = (236.0, 237.0, 241.0); // #ECEDF1
 const CARD_ALPHA: f32 = 0.94;
+const KEY_TOP_RGB: (f32, f32, f32) = (89.0, 94.0, 97.0);
+const KEY_BOTTOM_RGB: (f32, f32, f32) = (44.0, 47.0, 50.0);
+const KEY_TEXT_RGB: (f32, f32, f32) = (244.0, 246.0, 249.0);
 
 /// A live wlr-layer-shell HUD surface.
 pub struct LayerShellOverlay {
@@ -133,16 +150,23 @@ struct State {
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
+    key_pool: SlotPool,
+    key_layer: LayerSurface,
     conn: Connection,
     font: Font,
+    key_font: Font,
     glyph_cache: GlyphCache,
+    key_glyph_cache: KeyGlyphCache,
     width: u32,
     height: u32,
+    key_width: u32,
+    key_height: u32,
     /// Integer output scale (wl_surface preferred buffer scale). The shm
     /// buffer is allocated at `logical × scale` and all rasterization runs in
     /// physical pixels, so the HUD stays crisp on HiDPI outputs.
     scale: i32,
     configured: bool,
+    key_configured: bool,
 }
 
 impl State {
@@ -181,11 +205,32 @@ impl State {
 
         layer.commit();
 
+        let key_layer = layer_shell.create_layer_surface(
+            &qh,
+            compositor.create_surface(&qh),
+            Layer::Overlay,
+            Some("open-recorder-keys"),
+            None,
+        );
+        key_layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        key_layer.set_size(0, 0);
+        key_layer.set_margin(0, 0, 0, 0);
+        key_layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        key_layer.wl_surface().set_input_region(Some(&empty_region));
+        key_layer.commit();
+
         let pool = SlotPool::new((width * height * 4) as usize, &shm)
             .map_err(|e| format!("slot pool: {e}"))?;
+        let key_pool = SlotPool::new(
+            (KEY_SURFACE_FALLBACK_W * KEY_SURFACE_FALLBACK_H * 4) as usize,
+            &shm,
+        )
+        .map_err(|e| format!("key slot pool: {e}"))?;
 
         let font = Font::from_bytes(FONT_DATA, fontdue::FontSettings::default())
             .map_err(|e| format!("font load: {e}"))?;
+        let key_font = Font::from_bytes(KEY_FONT_DATA, fontdue::FontSettings::default())
+            .map_err(|e| format!("key font load: {e}"))?;
 
         let mut state = State {
             registry_state: RegistryState::new(&globals),
@@ -193,13 +238,20 @@ impl State {
             shm,
             pool,
             layer,
+            key_pool,
+            key_layer,
             conn: conn.clone(),
             font,
+            key_font,
             glyph_cache: GlyphCache::new(),
+            key_glyph_cache: KeyGlyphCache::new(),
             width,
             height,
+            key_width: KEY_SURFACE_FALLBACK_W,
+            key_height: KEY_SURFACE_FALLBACK_H,
             scale: 1,
             configured: false,
+            key_configured: false,
         };
 
         // Pump until the surface is configured so it's ready to draw.
@@ -207,11 +259,11 @@ impl State {
             event_queue
                 .blocking_dispatch(&mut state)
                 .map_err(|e| e.to_string())?;
-            if state.configured {
+            if state.configured && state.key_configured {
                 break;
             }
         }
-        if !state.configured {
+        if !state.configured || !state.key_configured {
             return Err("layer surface was not configured".into());
         }
         Ok((state, event_queue))
@@ -238,7 +290,6 @@ impl State {
                 }
             }
         }
-
         // The buffer is physical-size; every coordinate below is physical.
         let (w, h) = physical_size(self.width, self.height, scale);
         let stride = (w * 4) as i32;
@@ -316,6 +367,64 @@ impl State {
         surface.damage_buffer(0, 0, w as i32, h as i32);
         if let Err(e) = buffer.attach_to(surface) {
             eprintln!("ord-overlay: attach failed: {e}");
+            return;
+        }
+        surface.commit();
+        let _ = self.conn.flush();
+
+        self.draw_keys(hud);
+    }
+
+    fn draw_keys(&mut self, hud: &Hud) {
+        if !self.key_configured {
+            return;
+        }
+
+        let scale = self.scale.max(1);
+        let s = scale as f32;
+        let layout = hud.pressed_keys_layout();
+        let font_px = key_font_px(layout, s);
+        let font_key = font_px.round().max(1.0) as u32;
+        for label in hud.pressed_key_labels() {
+            for ch in label.chars() {
+                self.key_glyph_cache
+                    .entry((font_key, ch))
+                    .or_insert_with(|| {
+                        let (metrics, bitmap) = self.key_font.rasterize(ch, font_px);
+                        Glyph { metrics, bitmap }
+                    });
+            }
+        }
+
+        let (w, h) = physical_size(self.key_width, self.key_height, scale);
+        let stride = (w * 4) as i32;
+        let (buffer, canvas) =
+            match self
+                .key_pool
+                .create_buffer(w as i32, h as i32, stride, wl_shm::Format::Argb8888)
+            {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+        canvas.fill(0);
+
+        if !hud.pressed_key_labels().is_empty() {
+            draw_keycaps(
+                canvas,
+                w,
+                h,
+                &self.key_glyph_cache,
+                hud.pressed_key_labels(),
+                layout,
+                s,
+            );
+        }
+
+        let surface = self.key_layer.wl_surface();
+        surface.set_buffer_scale(scale);
+        surface.damage_buffer(0, 0, w as i32, h as i32);
+        if let Err(e) = buffer.attach_to(surface) {
+            eprintln!("ord-overlay: key attach failed: {e}");
             return;
         }
         surface.commit();
@@ -478,6 +587,261 @@ fn draw_card(
     draw_text(
         canvas, width, height, cache, text, tx, baseline, TEXT_RGB, alpha,
     );
+}
+
+fn key_font_px(layout: PressedKeysLayout, s: f32) -> f32 {
+    KEY_FONT_PX * s * key_layout_scale(layout)
+}
+
+fn key_layout_scale(layout: PressedKeysLayout) -> f32 {
+    layout.scale_percent.clamp(50, 250) as f32 / 100.0
+}
+
+fn key_opacity(layout: PressedKeysLayout) -> f32 {
+    layout.opacity_percent.clamp(35, 100) as f32 / 100.0
+}
+
+fn measure_key_text(cache: &KeyGlyphCache, label: &str, font_key: u32) -> f32 {
+    label
+        .chars()
+        .map(|c| {
+            cache
+                .get(&(font_key, c))
+                .map_or(0.0, |g| g.metrics.advance_width)
+        })
+        .sum()
+}
+
+fn key_row_width(labels: &[String], widths: &[f32], gap: f32) -> f32 {
+    widths.iter().sum::<f32>() + gap * labels.len().saturating_sub(1) as f32
+}
+
+fn key_layout_center(
+    layout: PressedKeysLayout,
+    width: u32,
+    height: u32,
+    row_w: f32,
+    row_h: f32,
+    unit: f32,
+) -> (f32, f32) {
+    let w = width as f32;
+    let h = height as f32;
+    let margin = KEY_SAFE_MARGIN * unit;
+    match layout.position {
+        PressedKeysPosition::BottomCenter => (w / 2.0, h - margin - row_h / 2.0),
+        PressedKeysPosition::BottomLeft => (margin + row_w / 2.0, h - margin - row_h / 2.0),
+        PressedKeysPosition::BottomRight => (w - margin - row_w / 2.0, h - margin - row_h / 2.0),
+        PressedKeysPosition::TopCenter => (w / 2.0, margin + row_h / 2.0),
+        PressedKeysPosition::Custom => (
+            w * layout.x_ppm.min(1000) as f32 / 1000.0,
+            h * layout.y_ppm.min(1000) as f32 / 1000.0,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clamp_key_center(
+    cx: f32,
+    cy: f32,
+    width: u32,
+    height: u32,
+    row_w: f32,
+    row_h: f32,
+    angle: f32,
+    unit: f32,
+) -> (f32, f32) {
+    let (sin, cos) = angle.sin_cos();
+    let half_w = (cos.abs() * row_w + sin.abs() * row_h) / 2.0 + KEY_SHADOW * unit;
+    let half_h = (sin.abs() * row_w + cos.abs() * row_h) / 2.0 + KEY_SHADOW * unit;
+    let w = width as f32;
+    let h = height as f32;
+    let min_x = half_w.min(w / 2.0);
+    let max_x = (w - half_w).max(min_x);
+    let min_y = half_h.min(h / 2.0);
+    let max_y = (h - half_h).max(min_y);
+    (cx.clamp(min_x, max_x), cy.clamp(min_y, max_y))
+}
+
+fn rotated_local(
+    px: f32,
+    py: f32,
+    cx: f32,
+    cy: f32,
+    row_w: f32,
+    row_h: f32,
+    angle: f32,
+) -> (f32, f32) {
+    let (sin, cos) = angle.sin_cos();
+    let dx = px - cx;
+    let dy = py - cy;
+    (
+        cos * dx + sin * dy + row_w / 2.0,
+        -sin * dx + cos * dy + row_h / 2.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rotated_screen(
+    lx: f32,
+    ly: f32,
+    cx: f32,
+    cy: f32,
+    row_w: f32,
+    row_h: f32,
+    angle: f32,
+) -> (f32, f32) {
+    let (sin, cos) = angle.sin_cos();
+    let dx = lx - row_w / 2.0;
+    let dy = ly - row_h / 2.0;
+    (cx + cos * dx - sin * dy, cy + sin * dx + cos * dy)
+}
+
+fn draw_keycaps(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    cache: &KeyGlyphCache,
+    labels: &[String],
+    layout: PressedKeysLayout,
+    s: f32,
+) {
+    let unit = s * key_layout_scale(layout);
+    let font_key = key_font_px(layout, s).round().max(1.0) as u32;
+    let gap = KEYCAP_GAP * unit;
+    let key_h = KEYCAP_H * unit;
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|label| {
+            (measure_key_text(cache, label, font_key) + KEYCAP_PAD_X * 2.0 * unit)
+                .max(KEYCAP_MIN_W * unit)
+        })
+        .collect();
+    let row_w = key_row_width(labels, &widths, gap);
+    let row_h = key_h;
+    let angle = (layout.rotation_degrees.clamp(-30, 30) as f32).to_radians();
+    let (cx, cy) = key_layout_center(layout, width, height, row_w, row_h, unit);
+    let (cx, cy) = clamp_key_center(cx, cy, width, height, row_w, row_h, angle, unit);
+
+    let (sin, cos) = angle.sin_cos();
+    let bbox_w = cos.abs() * row_w + sin.abs() * row_h + KEY_SHADOW * unit * 2.0;
+    let bbox_h = sin.abs() * row_w + cos.abs() * row_h + KEY_SHADOW * unit * 2.0;
+    let xs = (cx - bbox_w / 2.0).floor().max(0.0) as u32;
+    let xe = ((cx + bbox_w / 2.0).ceil() as u32).min(width);
+    let ys = (cy - bbox_h / 2.0).floor().max(0.0) as u32;
+    let ye = ((cy + bbox_h / 2.0).ceil() as u32).min(height);
+    let radius = KEYCAP_RADIUS * unit;
+    let feather = 14.0 * unit;
+    let opacity = key_opacity(layout);
+    for py in ys..ye {
+        for px in xs..xe {
+            let fx = px as f32 + 0.5;
+            let fy = py as f32 + 0.5;
+            let idx = ((py * width + px) * 4) as usize;
+            let (lx, ly) = rotated_local(fx, fy, cx, cy, row_w, row_h, angle);
+            let mut x = 0.0;
+            for w in &widths {
+                let kcx = x + *w / 2.0;
+                let kcy = row_h / 2.0;
+                let ds = sd_round_box(lx, ly, kcx, kcy + 5.0 * unit, *w / 2.0, key_h / 2.0, radius);
+                if ds > 0.0 && ds < feather {
+                    let t = 1.0 - ds / feather;
+                    blend(canvas, idx, 0.0, 0.0, 0.0, 0.40 * t * t * opacity);
+                }
+                let d = sd_round_box(lx, ly, kcx, kcy, *w / 2.0, key_h / 2.0, radius);
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let shade = (ly / key_h).clamp(0.0, 1.0);
+                    let r = KEY_TOP_RGB.0 * (1.0 - shade) + KEY_BOTTOM_RGB.0 * shade;
+                    let g = KEY_TOP_RGB.1 * (1.0 - shade) + KEY_BOTTOM_RGB.1 * shade;
+                    let b = KEY_TOP_RGB.2 * (1.0 - shade) + KEY_BOTTOM_RGB.2 * shade;
+                    blend(canvas, idx, r, g, b, cov * opacity);
+                    let ring = (1.0 - (d + 1.1 * unit).abs()).clamp(0.0, 1.0);
+                    if ring > 0.0 {
+                        blend(canvas, idx, 255.0, 255.0, 255.0, 0.10 * ring * opacity);
+                    }
+                    let top_line = (1.0 - (ly - 6.0 * unit).abs()).clamp(0.0, 1.0);
+                    if top_line > 0.0 && lx > x + radius && lx < x + *w - radius {
+                        blend(canvas, idx, 255.0, 255.0, 255.0, 0.08 * top_line * opacity);
+                    }
+                }
+                x += *w + gap;
+            }
+        }
+    }
+
+    let mut x = 0.0;
+    for (label, key_w) in labels.iter().zip(widths.iter()) {
+        let text_w = measure_key_text(cache, label, font_key);
+        let tx = x + (*key_w - text_w) / 2.0;
+        let baseline = row_h / 2.0 + key_font_px(layout, s) * 0.34;
+        draw_rotated_key_text(
+            canvas, width, height, cache, font_key, label, tx, baseline, cx, cy, row_w, row_h,
+            angle, opacity,
+        );
+        x += *key_w + gap;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_rotated_key_text(
+    canvas: &mut [u8],
+    width: u32,
+    height: u32,
+    cache: &KeyGlyphCache,
+    font_key: u32,
+    text: &str,
+    x: f32,
+    baseline: f32,
+    cx: f32,
+    cy: f32,
+    row_w: f32,
+    row_h: f32,
+    angle: f32,
+    alpha: f32,
+) {
+    let mut pen = x;
+    for ch in text.chars() {
+        let Some(glyph) = cache.get(&(font_key, ch)) else {
+            continue;
+        };
+        let m = &glyph.metrics;
+        if m.width > 0 && m.height > 0 {
+            let gx = pen + m.xmin as f32;
+            let gy = baseline - m.height as f32 - m.ymin as f32;
+            for row in 0..m.height {
+                for col in 0..m.width {
+                    let cov = glyph.bitmap[row * m.width + col] as f32 / 255.0;
+                    if cov <= 0.0 {
+                        continue;
+                    }
+                    let (sx, sy) = rotated_screen(
+                        gx + col as f32,
+                        gy + row as f32,
+                        cx,
+                        cy,
+                        row_w,
+                        row_h,
+                        angle,
+                    );
+                    let px = sx.round() as i32;
+                    let py = sy.round() as i32;
+                    if px < 0 || py < 0 || px as u32 >= width || py as u32 >= height {
+                        continue;
+                    }
+                    let idx = ((py as u32 * width + px as u32) * 4) as usize;
+                    blend(
+                        canvas,
+                        idx,
+                        KEY_TEXT_RGB.0,
+                        KEY_TEXT_RGB.1,
+                        KEY_TEXT_RGB.2,
+                        cov * alpha,
+                    );
+                }
+            }
+        }
+        pen += m.advance_width;
+    }
 }
 
 /// Draw a small anti-aliased filled dot with a faint halo (the buffer
@@ -654,14 +1018,18 @@ impl CompositorHandler for State {
         surface: &wl_surface::WlSurface,
         new_factor: i32,
     ) {
-        if surface != self.layer.wl_surface() || new_factor < 1 || new_factor == self.scale {
+        let known_surface =
+            surface == self.layer.wl_surface() || surface == self.key_layer.wl_surface();
+        if !known_surface || new_factor < 1 || new_factor == self.scale {
             return;
         }
         self.scale = new_factor;
         // Glyphs are rasterized at the physical pixel size, so a scale change
         // invalidates every cached bitmap.
         self.glyph_cache.clear();
+        self.key_glyph_cache.clear();
         self.layer.wl_surface().set_buffer_scale(new_factor);
+        self.key_layer.wl_surface().set_buffer_scale(new_factor);
     }
     fn transform_changed(
         &mut self,
@@ -700,24 +1068,38 @@ impl OutputHandler for State {
 }
 
 impl LayerShellHandler for State {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.configured = false;
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if layer.wl_surface() == self.layer.wl_surface() {
+            self.configured = false;
+        } else if layer.wl_surface() == self.key_layer.wl_surface() {
+            self.key_configured = false;
+        }
     }
     fn configure(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        if configure.new_size.0 != 0 {
-            self.width = configure.new_size.0;
+        if layer.wl_surface() == self.layer.wl_surface() {
+            if configure.new_size.0 != 0 {
+                self.width = configure.new_size.0;
+            }
+            if configure.new_size.1 != 0 {
+                self.height = configure.new_size.1;
+            }
+            self.configured = true;
+        } else if layer.wl_surface() == self.key_layer.wl_surface() {
+            if configure.new_size.0 != 0 {
+                self.key_width = configure.new_size.0;
+            }
+            if configure.new_size.1 != 0 {
+                self.key_height = configure.new_size.1;
+            }
+            self.key_configured = true;
         }
-        if configure.new_size.1 != 0 {
-            self.height = configure.new_size.1;
-        }
-        self.configured = true;
     }
 }
 
@@ -856,5 +1238,37 @@ mod tests {
         // Degenerate scales clamp to 1 instead of zeroing the buffer.
         assert_eq!(physical_size(420, 100, 0), (420, 100));
         assert_eq!(physical_size(420, 100, -2), (420, 100));
+    }
+
+    #[test]
+    fn pressed_key_layout_scale_and_opacity_are_clamped() {
+        let mut layout = PressedKeysLayout {
+            position: PressedKeysPosition::Custom,
+            x_ppm: 500,
+            y_ppm: 500,
+            scale_percent: 20,
+            opacity_percent: 10,
+            rotation_degrees: 0,
+        };
+        assert_eq!(key_layout_scale(layout), 0.5);
+        assert_eq!(key_opacity(layout), 0.35);
+        layout.scale_percent = 300;
+        layout.opacity_percent = 120;
+        assert_eq!(key_layout_scale(layout), 2.5);
+        assert_eq!(key_opacity(layout), 1.0);
+    }
+
+    #[test]
+    fn pressed_key_custom_center_uses_normalized_coordinates() {
+        let layout = PressedKeysLayout {
+            position: PressedKeysPosition::Custom,
+            x_ppm: 250,
+            y_ppm: 750,
+            scale_percent: 100,
+            opacity_percent: 92,
+            rotation_degrees: 0,
+        };
+        let (x, y) = key_layout_center(layout, 1000, 800, 100.0, 50.0, 1.0);
+        assert_eq!((x, y), (250.0, 600.0));
     }
 }

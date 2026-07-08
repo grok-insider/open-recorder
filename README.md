@@ -146,6 +146,7 @@ ord status [--json]     # buffer/recording state + buffered seconds (JSON for wa
 ord buffer on|off       # arm / pause the replay buffer
 ord config show         # print the effective daemon configuration
 ord config set <k> <v>  # change one setting, e.g. `ord config set capture.fps 30`
+ord config set overlay.pressed_keys.enabled true   # show pressed keys in demos
 ord subscribe           # stream daemon events (--reconnect to survive restarts)
 ord doctor --fix        # install the NVIDIA P2-downclock fix (see below)
 ord export <in> [out]   # transcode/trim a clip — see `ord export --help`
@@ -194,8 +195,15 @@ at runtime — in-app/daemon changes persist as a sparse diff in
 | `[storage]` | `clips_dir`, `recordings_dir`, `template`, `max_gib`, `max_age_days` |
 | `[markers]` | `auto_save_seconds` |
 | `[hooks]` | `on_clip_saved` (run a command after each save) |
-| `[overlay]` | `show_status_dot` |
+| `[overlay]` | `show_status_dot`; `pressed_keys.enabled` (false), `pressed_keys.position` (`bottom_center`), `pressed_keys.x_ppm`/`y_ppm` (500/900), `pressed_keys.scale_percent` (100), `pressed_keys.opacity_percent` (92), `pressed_keys.rotation_degrees` (0), `pressed_keys.timeout_ms` (900), `pressed_keys.max_keys` (6) |
 | `[export]` | `codec`, `container` (defaults for `ord export`) |
+
+`overlay.pressed_keys.enabled = true` makes `ord-hud` read raw keyboard events
+from `/dev/input` and render individual IBM Plex Mono keycaps into the
+recording. The layout is editable in `ord-ui` Settings: drag the preview for a
+custom position and adjust size, opacity, and 2D rotation. This is intentionally
+off by default; grant input-device read permission only if you want this demo
+aid.
 
 ## Why
 

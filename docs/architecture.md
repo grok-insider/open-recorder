@@ -113,7 +113,10 @@ first run. Sections (`ord-common/src/config.rs`):
 - `[storage]` (`StorageConfig`) — clips/recordings dirs (default
   `~/Videos/open-recorder`), filename template, auto-prune limits.
 - `[markers]` (`MarkersConfig`) — `auto_save_seconds`.
-- `[overlay]` (`OverlayConfig`) — `show_status_dot`.
+- `[overlay]` (`OverlayConfig`) — `show_status_dot`, plus optional
+  `pressed_keys` keycap demo overlay and layout/transform settings.
+  Pressed-key capture is owned by `ord-hud`, off by default, and never crosses
+  the daemon IPC as raw input.
 - `[hooks]` (`HooksConfig`) — `on_clip_saved`.
 - `[export]` (`ExportConfig`) — `ord export` defaults.
 
