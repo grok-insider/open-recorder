@@ -90,3 +90,31 @@ pub fn ensure_thumbnail(clip_path: &Path) -> Option<PathBuf> {
 pub fn exports_dir(clips_dir: &Path) -> PathBuf {
     clips_dir.join("exports")
 }
+
+/// Decode mono PCM via ffmpeg and return `n_peaks` normalized peak values for
+/// the whole clip. Empty when the file has no audio or ffmpeg fails.
+pub fn extract_audio_peaks(clip_path: &Path, n_peaks: usize) -> Vec<f32> {
+    if n_peaks == 0 {
+        return Vec::new();
+    }
+    // 8 kHz mono is plenty for a scrub waveform and keeps the decode small
+    // (a 5-minute clip is ~2.4 MB of f32).
+    let out = Command::new(ord_export::ffmpeg_bin())
+        .args(["-v", "error", "-i"])
+        .arg(clip_path)
+        .args(["-vn", "-ac", "1", "-ar", "8000", "-f", "f32le", "-"])
+        .output()
+        .ok();
+    let Some(out) = out else {
+        return Vec::new();
+    };
+    if !out.status.success() || out.stdout.is_empty() {
+        return Vec::new();
+    }
+    let samples: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    crate::waveform::peaks_from_samples(&samples, n_peaks)
+}

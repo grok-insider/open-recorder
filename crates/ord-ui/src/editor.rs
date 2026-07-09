@@ -2,10 +2,11 @@
 //!
 //! An inline A/V editor built on [`Player`]: a video preview with real
 //! play/pause/loop + audio, a draggable in/out timeline with a time ruler,
-//! filmstrip, markers (the clip's `ord mark` chapters load automatically) and
-//! multi-segment cuts (split at the playhead, toggle pieces off — playback and
-//! export skip them), keyboard shortcuts, and an "Export selection" that hands
-//! the result to `ord-export`.
+//! zoom-adaptive filmstrip, audio waveform, markers (the clip's `ord mark`
+//! chapters load automatically) and multi-segment cuts (split at the playhead,
+//! toggle pieces off — playback and export skip them), keyboard shortcuts,
+//! click-to-type numeric times, and an "Export selection" that hands the
+//! result to `ord-export`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -15,15 +16,28 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use ord_export::{Preset, Trim};
 
-use crate::format::{human_duration, human_duration_ms};
+use crate::format::{human_duration, human_duration_ms, parse_duration};
 use crate::player::{DecKind, Player, PreviewFrame};
 use crate::prefs::{self, EditorPrefs};
 use crate::project::EditorProject;
 use crate::timeline::{self, DragTarget, Segments, View};
 
-const FILMSTRIP_TILES: usize = 14;
+/// Tiles across the *visible* view (regenerated on zoom/pan).
+const FILMSTRIP_TILES: usize = 16;
+/// Peak buckets for the whole-clip waveform (drawn under the filmstrip).
+const WAVEFORM_PEAKS: usize = 512;
+/// Wait this long after the last zoom/pan change before re-extracting tiles.
+const FILMSTRIP_DEBOUNCE: Duration = Duration::from_millis(180);
 /// Snap radius (px) for markers under the in/out/playhead drags and clicks.
 const SNAP_PX: f32 = 6.0;
+
+/// Which numeric time field is open for typing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeField {
+    In,
+    Out,
+    Playhead,
+}
 
 /// What the editor wants the app to do after a frame.
 pub enum EditorAction {
@@ -60,8 +74,21 @@ pub struct EditorState {
     drag: Option<DragTarget>,
     /// Pre-drag snapshot for a cut-line drag (one undo entry per drag).
     drag_undo: Option<Segments>,
-    strip_rx: Receiver<(usize, egui::ColorImage)>,
+    /// `(generation, tile_index, image)` — stale generations are dropped.
+    strip_rx: Receiver<(u64, usize, egui::ColorImage)>,
     strip: Vec<Option<egui::TextureHandle>>,
+    /// Generation of the in-flight / current filmstrip job.
+    strip_gen: u64,
+    /// `(start, span)` the current tiles cover (source seconds).
+    strip_cover: (f64, f64),
+    /// Desired cover after zoom/pan; drained after [`FILMSTRIP_DEBOUNCE`].
+    strip_pending: Option<(f64, f64)>,
+    strip_pending_at: Instant,
+    wave_rx: Receiver<Vec<f32>>,
+    /// Normalized peak envelope for the whole clip (`None` until decoded).
+    wave: Option<Vec<f32>>,
+    /// Click-to-type In / Out / playhead (`m:ss.mmm`).
+    time_edit: Option<(TimeField, String)>,
     debug: bool,
     dbg_log_at: Instant,
     /// In-flight export progress from the library shell (`None` = idle).
@@ -79,7 +106,9 @@ impl EditorState {
             player.play();
         }
         let project = EditorProject::new(player.duration(), saved.volume);
-        let strip_rx = spawn_filmstrip(&clip, player.duration(), ctx.clone());
+        let dur = player.duration().max(1e-6);
+        let strip_rx = spawn_filmstrip(&clip, 1, 0.0, dur, FILMSTRIP_TILES, ctx.clone());
+        let wave_rx = spawn_waveform(&clip, WAVEFORM_PEAKS, ctx.clone());
         let chapters_rx = spawn_chapters(&clip, ctx.clone());
         Ok(Self {
             clip,
@@ -91,6 +120,13 @@ impl EditorState {
             drag_undo: None,
             strip_rx,
             strip: vec![None; FILMSTRIP_TILES],
+            strip_gen: 1,
+            strip_cover: (0.0, dur),
+            strip_pending: None,
+            strip_pending_at: Instant::now(),
+            wave_rx,
+            wave: None,
+            time_edit: None,
             debug: crate::tuning::debug_overlay(),
             dbg_log_at: Instant::now(),
             export_progress: None,
@@ -137,11 +173,25 @@ impl EditorState {
 
     /// Render the editor; returns the action the user took (if any).
     pub fn ui(&mut self, ctx: &egui::Context, wd: &crate::diag::Watchdog) -> EditorAction {
-        // Pull in any decoded filmstrip tiles.
-        while let Ok((i, img)) = self.strip_rx.try_recv() {
+        // Pull in any decoded filmstrip tiles (drop stale generations).
+        while let Ok((gen, i, img)) = self.strip_rx.try_recv() {
+            if gen != self.strip_gen {
+                continue;
+            }
             if let Some(slot) = self.strip.get_mut(i) {
-                *slot =
-                    Some(ctx.load_texture(format!("strip-{i}"), img, egui::TextureOptions::LINEAR));
+                *slot = Some(ctx.load_texture(
+                    format!("strip-{gen}-{i}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        // Waveform peaks (whole-clip, once).
+        if self.wave.is_none() {
+            if let Ok(peaks) = self.wave_rx.try_recv() {
+                if !peaks.is_empty() {
+                    self.wave = Some(peaks);
+                }
             }
         }
         // The clip's chapters (`ord mark` bookmarks) arrive as markers.
@@ -232,9 +282,17 @@ impl EditorState {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) -> EditorAction {
-        // The editor owns the keyboard — it has no text fields. Drop any
-        // lingering widget focus (a clicked button/slider keeps egui focus)
-        // so Space can never double-trigger the last-clicked control.
+        // While a numeric time field is open, leave focus alone so typing works;
+        // Escape cancels the edit without applying.
+        if self.time_edit.is_some() {
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.time_edit = None;
+            }
+            return EditorAction::None;
+        }
+        // The editor owns the keyboard outside text entry. Drop any lingering
+        // widget focus (a clicked button/slider keeps egui focus) so Space can
+        // never double-trigger the last-clicked control.
         ctx.memory_mut(|m| {
             if let Some(focused) = m.focused() {
                 m.surrender_focus(focused);
@@ -571,12 +629,6 @@ impl EditorState {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let pos = self.player.position();
-                ui.monospace(format!(
-                    "{} / {}",
-                    human_duration_ms(pos),
-                    human_duration_ms(self.player.duration())
-                ));
                 // NVDEC fell back to CPU decoding: say so, instead of leaving
                 // "the editor is sometimes heavy" undiagnosable (F3 has detail).
                 if self.player.decoder_kind() == DecKind::Software {
@@ -590,6 +642,9 @@ impl EditorState {
                          preview decodes on the CPU and may use noticeably more of it.",
                     );
                 }
+                ui.monospace(human_duration_ms(self.player.duration()));
+                ui.label(egui::RichText::new("/").color(ui.visuals().weak_text_color()));
+                self.time_field_ui(ui, TimeField::Playhead, self.player.position());
             });
         });
     }
@@ -736,8 +791,11 @@ impl EditorState {
     fn timeline_ui(&mut self, ui: &mut egui::Ui) {
         let accent = crate::theme::AI;
         let dur = self.player.duration().max(1e-6);
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 84.0), egui::Sense::hover());
+        // Taller track: filmstrip on top, waveform strip along the bottom.
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 100.0),
+            egui::Sense::hover(),
+        );
 
         // Mouse wheel over the timeline: plain scroll ZOOMS, anchored at the
         // pointer (the moment under the cursor stays put); Shift+wheel or a
@@ -780,11 +838,30 @@ impl EditorState {
         }
 
         let view = View::new(dur, self.project.zoom, self.project.scroll);
+        self.maybe_regen_filmstrip(&view, ui.ctx());
         let ruler =
             egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 16.0));
         let track = egui::Rect::from_min_max(
             egui::pos2(rect.left() + 4.0, rect.top() + 18.0),
             egui::pos2(rect.right() - 4.0, rect.bottom() - 4.0),
+        );
+        // Filmstrip takes the upper band; waveform sits in a thin strip under it.
+        let wave_h = if self.wave.as_ref().is_some_and(|w| !w.is_empty()) {
+            22.0_f32
+        } else {
+            0.0
+        };
+        let film_track = if wave_h > 0.0 {
+            egui::Rect::from_min_max(
+                track.left_top(),
+                egui::pos2(track.right(), track.bottom() - wave_h),
+            )
+        } else {
+            track
+        };
+        let wave_track = egui::Rect::from_min_max(
+            egui::pos2(track.left(), track.bottom() - wave_h),
+            track.right_bottom(),
         );
         let painter = ui.painter_at(rect);
 
@@ -796,8 +873,10 @@ impl EditorState {
         // Track background.
         painter.rect_filled(track, 4.0, crate::theme::RAISED);
 
-        // Filmstrip tiles spread across the (whole-clip) track, clipped to view.
-        self.paint_filmstrip(&painter, track, &view, dur);
+        // Filmstrip tiles for the current LOD window (or last cover while regen
+        // is in flight), painted into the upper band.
+        self.paint_filmstrip(&painter, film_track, &view);
+        self.paint_waveform(&painter, wave_track, &view, dur);
 
         // Selection highlight + dimmed outside.
         let cl = |x: f32| x.clamp(track.left(), track.right());
@@ -1122,15 +1201,57 @@ impl EditorState {
         }
     }
 
-    fn paint_filmstrip(&self, painter: &egui::Painter, track: egui::Rect, view: &View, dur: f64) {
-        let n = self.strip.len();
-        if n == 0 {
+    /// Schedule a filmstrip rebuild when the visible window drifts from the
+    /// tiles currently on screen. Debounced so continuous zoom/pan does not
+    /// spawn a decode storm.
+    fn maybe_regen_filmstrip(&mut self, view: &View, ctx: &egui::Context) {
+        let desired = (view.start, view.span);
+        let (cs, cv) = self.strip_cover;
+        // ~half a tile of drift (or any span change) is enough to re-LOD.
+        let tile = cv / FILMSTRIP_TILES as f64;
+        let drifted = (desired.0 - cs).abs() > tile * 0.5
+            || (desired.1 - cv).abs() > cv * 0.08
+            || (desired.1 - cv).abs() > 0.05;
+        if drifted {
+            // First drift in a burst starts the timer; further drags just
+            // update the target so we extract the *final* window once.
+            if self.strip_pending.is_none() {
+                self.strip_pending_at = Instant::now();
+            }
+            self.strip_pending = Some(desired);
+        }
+        let Some((start, span)) = self.strip_pending else {
+            return;
+        };
+        if self.strip_pending_at.elapsed() < FILMSTRIP_DEBOUNCE {
+            // Keep the UI alive so the debounce fires without a further event.
+            ctx.request_repaint_after(FILMSTRIP_DEBOUNCE);
             return;
         }
-        let tile_dur = dur / n as f64;
+        self.strip_pending = None;
+        self.strip_gen = self.strip_gen.wrapping_add(1);
+        self.strip_cover = (start, span.max(1e-6));
+        self.strip = vec![None; FILMSTRIP_TILES];
+        self.strip_rx = spawn_filmstrip(
+            &self.clip,
+            self.strip_gen,
+            start,
+            span.max(1e-6),
+            FILMSTRIP_TILES,
+            ctx.clone(),
+        );
+    }
+
+    fn paint_filmstrip(&self, painter: &egui::Painter, track: egui::Rect, view: &View) {
+        let n = self.strip.len();
+        if n == 0 || track.height() < 2.0 {
+            return;
+        }
+        let (cover_start, cover_span) = self.strip_cover;
+        let tile_dur = cover_span / n as f64;
         for (i, slot) in self.strip.iter().enumerate() {
             let Some(tex) = slot else { continue };
-            let t0 = i as f64 * tile_dur;
+            let t0 = cover_start + i as f64 * tile_dur;
             let x0 = track.left() + view.frac_of(t0) * track.width();
             let x1 = track.left() + view.frac_of(t0 + tile_dur) * track.width();
             if x1 < track.left() || x0 > track.right() {
@@ -1140,11 +1261,54 @@ impl EditorState {
                 egui::pos2(x0.max(track.left()), track.top()),
                 egui::pos2(x1.min(track.right()), track.bottom()),
             );
+            if r.width() < 0.5 {
+                continue;
+            }
             painter.image(
                 tex.id(),
                 r,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 crate::theme::FILMSTRIP_TINT,
+            );
+        }
+    }
+
+    /// Paint the whole-clip peak envelope into `band`, clipped to the view.
+    /// One vertical bar per peak (not a filled polygon — envelopes are not
+    /// convex, and bars stay readable when zoomed).
+    fn paint_waveform(&self, painter: &egui::Painter, band: egui::Rect, view: &View, dur: f64) {
+        let Some(peaks) = self.wave.as_ref() else {
+            return;
+        };
+        if peaks.is_empty() || band.height() < 2.0 || dur <= 0.0 {
+            return;
+        }
+        let n = peaks.len();
+        let mid_y = band.center().y;
+        let half = (band.height() * 0.45).max(1.0);
+        let color = crate::theme::WAVEFORM.linear_multiply(0.90);
+        // Only walk peaks that can land in the visible window (plus a little
+        // padding so edge bars aren't clipped mid-bar).
+        let t0 = view.start - view.span * 0.02;
+        let t1 = view.start + view.span * 1.02;
+        let i0 = ((t0 / dur) * n as f64).floor().max(0.0) as usize;
+        let i1 = (((t1 / dur) * n as f64).ceil() as usize).min(n);
+        // Bar width from the denser of peak spacing and one pixel.
+        let bar_w = (band.width() * (view.span / dur) as f32 / n as f32).clamp(1.0, 4.0);
+        for (i, &peak) in peaks.iter().enumerate().take(i1).skip(i0) {
+            let t = (i as f64 + 0.5) * dur / n as f64;
+            let x = band.left() + view.frac_of(t) * band.width();
+            if x < band.left() - bar_w || x > band.right() + bar_w {
+                continue;
+            }
+            let h = peak.clamp(0.0, 1.0) * half;
+            if h < 0.5 {
+                continue;
+            }
+            painter.rect_filled(
+                egui::Rect::from_center_size(egui::pos2(x, mid_y), egui::vec2(bar_w, h * 2.0)),
+                0.0,
+                color,
             );
         }
     }
@@ -1183,6 +1347,61 @@ impl EditorState {
         }
     }
 
+    /// Click-to-type numeric time (`m:ss.mmm` / plain seconds). Enter commits,
+    /// Escape (handled in [`Self::keyboard`]) or focus loss without a parse
+    /// cancels; a valid parse applies and seeks.
+    fn time_field_ui(&mut self, ui: &mut egui::Ui, field: TimeField, value: f64) {
+        let editing = self.time_edit.as_ref().map(|(f, _)| *f) == Some(field);
+        if editing {
+            let buf = self
+                .time_edit
+                .as_ref()
+                .map(|(_, s)| s.clone())
+                .unwrap_or_default();
+            let mut edit = buf;
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut edit)
+                    .desired_width(78.0)
+                    .font(egui::TextStyle::Monospace)
+                    .hint_text("m:ss.mmm"),
+            );
+            // Grab keyboard on the first paint of the edit field.
+            if !resp.has_focus() && !resp.lost_focus() {
+                resp.request_focus();
+            }
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if resp.lost_focus() || enter {
+                if let Some(t) = parse_duration(edit.trim()) {
+                    match field {
+                        TimeField::In => {
+                            self.project.timeline.set_in(t);
+                            self.seek_to(self.project.timeline.in_point());
+                        }
+                        TimeField::Out => {
+                            self.project.timeline.set_out(t);
+                            self.seek_to(self.project.timeline.out_point());
+                        }
+                        TimeField::Playhead => self.seek_to(t),
+                    }
+                }
+                self.time_edit = None;
+            } else {
+                self.time_edit = Some((field, edit));
+            }
+        } else {
+            let label = human_duration_ms(value);
+            let resp = ui
+                .add(
+                    egui::Label::new(egui::RichText::new(label).monospace())
+                        .sense(egui::Sense::click()),
+                )
+                .on_hover_text("Click to type a time (m:ss.mmm or seconds)");
+            if resp.clicked() {
+                self.time_edit = Some((field, human_duration_ms(value)));
+            }
+        }
+    }
+
     fn export_ui(&mut self, ui: &mut egui::Ui, action: &mut EditorAction) {
         let cuts_active = !self.project.segments.is_trivial();
         let kept = self.project.segments.kept_duration(
@@ -1192,10 +1411,12 @@ impl EditorState {
         ui.horizontal(|ui| {
             let weak = ui.visuals().weak_text_color();
             ui.label(egui::RichText::new("In").color(weak));
-            ui.monospace(human_duration(self.project.timeline.in_point()));
+            let in_t = self.project.timeline.in_point();
+            self.time_field_ui(ui, TimeField::In, in_t);
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Out").color(weak));
-            ui.monospace(human_duration(self.project.timeline.out_point()));
+            let out_t = self.project.timeline.out_point();
+            self.time_field_ui(ui, TimeField::Out, out_t);
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(if cuts_active { "Kept" } else { "Selection" }).color(weak),
@@ -1385,26 +1606,48 @@ fn spawn_chapters(clip: &std::path::Path, ctx: egui::Context) -> Receiver<Vec<f6
     rx
 }
 
-/// Decode `count` evenly-spaced thumbnails for the timeline filmstrip off-thread.
+/// Decode `n_tiles` evenly-spaced thumbnails covering `[start, start+span]`
+/// off-thread. Each message is `(generation, tile_index, image)` so a newer
+/// zoom/pan job can supersede an in-flight one.
 fn spawn_filmstrip(
     clip: &std::path::Path,
-    duration: f64,
+    gen: u64,
+    start: f64,
+    span: f64,
+    n_tiles: usize,
     ctx: egui::Context,
-) -> Receiver<(usize, egui::ColorImage)> {
+) -> Receiver<(u64, usize, egui::ColorImage)> {
     let (tx, rx) = channel();
     let clip = clip.to_path_buf();
     std::thread::spawn(move || {
-        if duration <= 0.0 {
+        if span <= 0.0 || n_tiles == 0 {
             return;
         }
-        for i in 0..FILMSTRIP_TILES {
-            let t = (i as f64 + 0.5) * duration / FILMSTRIP_TILES as f64;
+        for i in 0..n_tiles {
+            let t = start + (i as f64 + 0.5) * span / n_tiles as f64;
             if let Some(img) = extract_thumb(&clip, t, 160) {
-                if tx.send((i, img)).is_err() {
+                if tx.send((gen, i, img)).is_err() {
                     break;
                 }
                 ctx.request_repaint();
             }
+        }
+    });
+    rx
+}
+
+/// Decode a whole-clip peak envelope off-thread for the timeline waveform.
+fn spawn_waveform(
+    clip: &std::path::Path,
+    n_peaks: usize,
+    ctx: egui::Context,
+) -> Receiver<Vec<f32>> {
+    let (tx, rx) = channel();
+    let clip = clip.to_path_buf();
+    std::thread::spawn(move || {
+        let peaks = crate::meta::extract_audio_peaks(&clip, n_peaks);
+        if !peaks.is_empty() && tx.send(peaks).is_ok() {
+            ctx.request_repaint();
         }
     });
     rx

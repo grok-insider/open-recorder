@@ -14,6 +14,7 @@ pub mod pace;
 pub mod project;
 pub mod settings;
 pub mod timeline;
+pub mod waveform;
 
 pub use library::{parse_clip, scan_dir, sort_newest_first, Clip};
 pub use settings::{ApplyTier, SettingsModel};

@@ -72,6 +72,9 @@ pub const SCRIM_CUT: Color32 = Color32::from_black_alpha(190);
 pub const SCRIM_LABEL: Color32 = Color32::from_black_alpha(170);
 /// Hover time-bubble background.
 pub const BUBBLE_BG: Color32 = Color32::from_black_alpha(200);
+/// Audio waveform fill under the filmstrip (muted indigo so it stays secondary
+/// to the vermilion trim handles and gold markers).
+pub const WAVEFORM: Color32 = Color32::from_rgb(94, 111, 163);
 
 /// Faint white lift over the hovered timeline piece (compositing, so it can't
 /// be a const — `from_white_alpha` is gamma-corrected at runtime).

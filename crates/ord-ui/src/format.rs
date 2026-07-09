@@ -47,6 +47,57 @@ pub fn human_duration_ms(secs: f64) -> String {
     }
 }
 
+/// Parse a duration typed by the user. Accepts:
+/// - plain seconds (`12`, `12.5`, `0.033`)
+/// - `m:ss` / `m:ss.mmm`
+/// - `h:mm:ss` / `h:mm:ss.mmm`
+///
+/// Whitespace is ignored. Returns `None` for empty/invalid input or negative
+/// values (the editor clamps to the clip later).
+pub fn parse_duration(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Plain number first (no colon) — avoids treating "1.5" as m:ss.
+    if !s.contains(':') {
+        let v: f64 = s.parse().ok()?;
+        return v.is_finite().then_some(v).filter(|&v| v >= 0.0);
+    }
+    let mut parts = s.split(':');
+    let a = parts.next()?.trim();
+    let b = parts.next()?.trim();
+    let c = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let parse_nonneg = |p: &str| -> Option<f64> {
+        let v: f64 = p.parse().ok()?;
+        v.is_finite().then_some(v).filter(|&v| v >= 0.0)
+    };
+    match c {
+        None => {
+            // m:ss[.mmm]
+            let m = parse_nonneg(a)?;
+            let sec = parse_nonneg(b)?;
+            if sec >= 60.0 {
+                return None;
+            }
+            Some(m * 60.0 + sec)
+        }
+        Some(c) => {
+            // h:mm:ss[.mmm]
+            let h = parse_nonneg(a)?;
+            let m = parse_nonneg(b)?;
+            let sec = parse_nonneg(c.trim())?;
+            if m >= 60.0 || sec >= 60.0 {
+                return None;
+            }
+            Some(h * 3600.0 + m * 60.0 + sec)
+        }
+    }
+}
+
 /// Format an epoch-seconds timestamp relative to `now`, e.g. `3 min ago`.
 /// Returns `—` for a missing (zero) timestamp.
 pub fn relative_time(epoch: u64, now: u64) -> String {
@@ -106,6 +157,27 @@ mod tests {
         assert_eq!(human_duration_ms(-1.0), "—");
         assert_eq!(human_duration_ms(f64::NAN), "—");
         assert_eq!(human_duration_ms(f64::INFINITY), "—");
+    }
+
+    #[test]
+    fn parse_durations() {
+        assert!((parse_duration("12").unwrap() - 12.0).abs() < 1e-9);
+        assert!((parse_duration("12.5").unwrap() - 12.5).abs() < 1e-9);
+        assert!((parse_duration("0.033").unwrap() - 0.033).abs() < 1e-9);
+        assert!((parse_duration("1:23").unwrap() - 83.0).abs() < 1e-9);
+        assert!((parse_duration("1:23.500").unwrap() - 83.5).abs() < 1e-9);
+        assert!((parse_duration("0:05.240").unwrap() - 5.24).abs() < 1e-9);
+        assert!((parse_duration("1:01:01").unwrap() - 3661.0).abs() < 1e-9);
+        assert!((parse_duration("1:01:01.500").unwrap() - 3661.5).abs() < 1e-9);
+        assert!((parse_duration("  2:00  ").unwrap() - 120.0).abs() < 1e-9);
+        // Round-trip with the frame-accurate formatter.
+        let t = 72.007;
+        assert!((parse_duration(&human_duration_ms(t)).unwrap() - t).abs() < 1e-6);
+        assert!(parse_duration("").is_none());
+        assert!(parse_duration("-1").is_none());
+        assert!(parse_duration("1:60").is_none());
+        assert!(parse_duration("1:2:3:4").is_none());
+        assert!(parse_duration("nope").is_none());
     }
 
     #[test]
