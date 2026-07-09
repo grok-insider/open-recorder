@@ -21,7 +21,7 @@ Phase-1 capture knobs and Phase-7 HDR are wired end-to-end through config + the
 
 Fork work (in `github.com/grok-insider/waycap-rs` — migrated there 2026-07-03
 after the original `0xfell/waycap-rs` repo vanished and broke every fetch;
-the local source of truth is `~/dev/personal/waycap-rs`), then bump the rev in
+the local source of truth is `~/dev/opensource/waycap-rs`), then bump the rev in
 **both**
 `crates/ord-core/Cargo.toml` (the `waycap-rs` git dep) and `flake.nix`
 `outputHashes`, and re-vendor the NAR hashes (per AGENTS.md):
