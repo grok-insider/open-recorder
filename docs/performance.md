@@ -94,6 +94,55 @@ removing every layer of indirection.
 - Bench the ring-buffer push and save-path latency (`criterion`) to catch
   regressions.
 
+## Measuring regressions (criterion)
+
+The two latency-critical operations AGENTS.md calls out are benched in
+`crates/ord-core/benches/`:
+
+| Bench | File | Guards |
+|-------|------|--------|
+| `ring_push/push_30s_60fps` | `hotpath.rs` | Encoded ring push cost for a full 30 s @ 60 fps window |
+| `take_clip/last_30s_16kib_frames` | `hotpath.rs` | Save-path clip selection (`Bytes` refcount vs deep copy) |
+| `mux/write_clip_30s_av` | `mux_latency.rs` | Stream-copy mux latency for synthetic 30 s A/V |
+
+Run (devshell):
+
+```sh
+cargo bench -p ord-core --bench hotpath -- --save-baseline phase5
+cargo bench -p ord-core --bench mux_latency --features mux -- --save-baseline phase5
+# After a hot-path change:
+cargo bench -p ord-core --bench hotpath -- --baseline phase5
+```
+
+Representative numbers from a phase-5 refresh on the dev box (sample sizes reduced
+for CI-like turnaround; re-run with default samples before trusting a regression
+call): `ring_push` ≈ 18 µs, `take_clip` ≈ 25 µs for the synthetic 30 s window.
+
+Results land under `target/criterion/`. Treat a sustained >10% regression on
+`take_clip` or `ring_push` as a stop-ship for the change that caused it.
+
+Optional player decode sustain (needs ffmpeg + display path):
+
+```sh
+cargo test -p ord-ui --features gui --test bench -- --ignored --nocapture
+```
+
+## Measuring capture overhead (dev box)
+
+The "near-zero overhead" claim is architectural until measured. On a gaming box:
+
+1. Start a repeatable GPU-bound scene (same game, same map, fixed camera if
+   possible). Record average FPS for ~60 s with **buffer off**.
+2. Arm the buffer (`ord buffer on` / UI toggle). Record average FPS for ~60 s
+   under the same scene.
+3. In parallel, sample GPU/encoder: `nvidia-smi dmon -s u` (or `pmon`) and note
+   ENC/GPU utilization with buffer off vs on.
+4. Optional: compare power/clock with vs without `ord doctor --fix` (P2
+   CUDA/NVENC profile).
+
+Record the delta (FPS %, ENC util) in a PR or commit note when claiming
+parity. Do not invent numbers — re-measure after encoder/knob changes.
+
 ## Verified toolchain on the dev box
 
 `libpipewire-0.3`, `libcuda.so.1`, `libnvidia-encode.so.1`, ffmpeg libs present;
