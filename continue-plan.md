@@ -19,10 +19,11 @@ Phase-1 capture knobs and Phase-7 HDR are wired end-to-end through config + the
 `CaptureBuilder` setters yet, so they're recorded + logged, not applied. See the
 `// fork:` `tracing::debug!` block in `crates/ord-core/src/waycap_backend.rs`.
 
-Fork work (in `github.com/grok-insider/waycap-rs` — migrated there 2026-07-03
-after the original `0xfell/waycap-rs` repo vanished and broke every fetch;
-the local source of truth is `~/dev/opensource/waycap-rs`), then bump the rev in
-**both**
+Fork work (in `github.com/grok-insider/waycap-rs` — a **GitHub fork of**
+`Adonca2203/waycap-rs`, so upstream improvements can be merged via Sync fork /
+`git fetch upstream`; authors on our commits are `grok-insider`. Local clone:
+`~/dev/opensource/waycap-rs`. Remotes: `origin` = our fork, `upstream` = Adonca).
+When bumping the rev, update **both**
 `crates/ord-core/Cargo.toml` (the `waycap-rs` git dep) and `flake.nix`
 `outputHashes`, and re-vendor the NAR hashes (per AGENTS.md):
 

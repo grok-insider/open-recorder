@@ -211,7 +211,10 @@ Unix socket on unix; loopback TCP + port rendezvous file elsewhere), path
 resolution via the `dirs` crate, the disk store gated `#[cfg(unix)]`, and the
 waycap NVENC backend gated on `feature = "waycap"` + `target_os = "linux"`
 (target-gated dependency). Project identity migrated to **grok-insider**; the
-waycap-rs fork originally stayed at `github.com/0xfell/waycap-rs` — that repo has since vanished, so the fork now lives at `github.com/grok-insider/waycap-rs` (repointed in v0.4.3).
+waycap-rs is pinned at `github.com/grok-insider/waycap-rs` — a **GitHub fork of**
+`Adonca2203/waycap-rs` (local clone: `~/dev/opensource/waycap-rs`). The earlier
+`0xfell/waycap-rs` host vanished; history was migrated under grok-insider and
+re-parented as a real fork so upstream improvements can be synced.
 release-plz is live and cut this release (PRs #2/#3).
 
 **v0.4.0** — the full-codebase audit round (2026-07-02):
