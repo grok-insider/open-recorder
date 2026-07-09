@@ -1618,7 +1618,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2373,7 +2373,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4001,7 +4001,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4388,7 +4388,7 @@ dependencies = [
  "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4891,7 +4891,7 @@ dependencies = [
 [[package]]
 name = "waycap-rs"
 version = "3.0.0"
-source = "git+https://github.com/grok-insider/waycap-rs.git?rev=1a12961ed16b8abaa9482065a4fa6815e2554a62#1a12961ed16b8abaa9482065a4fa6815e2554a62"
+source = "git+https://github.com/grok-insider/waycap-rs.git?rev=c55a361a0d569eb73f695a5fe0bd901adae414af#c55a361a0d569eb73f695a5fe0bd901adae414af"
 dependencies = [
  "bytemuck",
  "crossbeam",
