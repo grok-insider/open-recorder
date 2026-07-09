@@ -316,8 +316,11 @@ fn make_writer(config: Arc<Mutex<Config>>) -> ClipWriter {
         // "saved an empty/corrupt file" failure mode at the moment it happens
         // instead of when the user opens the clip later.
         if let Err(e) = ord_core::verify_clip(&path) {
+            // Don't leave a broken clip in the library for the user to find
+            // later — same cleanup policy as a failed export.
+            let _ = std::fs::remove_file(&path);
             return Err(format!(
-                "clip written to {} but failed verification: {e}",
+                "clip written to {} but failed verification (removed): {e}",
                 path.display()
             ));
         }
@@ -386,7 +389,8 @@ fn make_engine(
             .iter()
             .any(|s| matches!(s, ord_common::config::AudioSource::DefaultInput))
     });
-    let mut backend = WaycapBackend::new(map_quality(config.capture.quality), config.capture.fps)
+    let fps = effective_capture_fps(config);
+    let mut backend = WaycapBackend::new(map_quality(config.capture.quality), fps)
         .with_codec(map_codec(config.capture.codec))
         .with_bitrate_kbps(config.capture.bitrate_kbps)
         .with_keyframe_interval_ms(config.capture.keyframe_interval_ms)
@@ -400,6 +404,13 @@ fn make_engine(
         .with_restore_token_path(restore_token_path());
     if let Some(res) = config.capture.resolution {
         backend = backend.with_dimensions(res.width, res.height);
+    } else if let Some((w, h)) = ord_daemon::outputs::resolve_native_hint(
+        &ord_daemon::outputs::list_outputs(),
+        &config.capture.target,
+    ) {
+        // Named-monitor native: use the probed mode as a container hint until
+        // the portal session (or fork) reports the real negotiated size.
+        backend = backend.with_dimensions(w, h);
     }
     let ticks = backend.params().time_base_den;
     Engine::with_store(
@@ -419,12 +430,31 @@ fn restore_token_path() -> PathBuf {
         .join("open-recorder/portal-restore-token")
 }
 
+/// Resolve the encode target FPS: fixed config value, or monitor refresh when
+/// `fps_mode = auto` (OBS-style match display).
+fn effective_capture_fps(config: &Config) -> u32 {
+    use ord_common::FpsMode;
+    match config.capture.fps_mode {
+        FpsMode::Fixed => config.capture.fps.clamp(1, 240),
+        FpsMode::Auto => {
+            let outs = ord_daemon::outputs::list_outputs();
+            let fps = ord_daemon::outputs::resolve_auto_fps(&outs, &config.capture.target);
+            tracing::info!(
+                fps,
+                target = %config.capture.target,
+                "capture fps_mode=auto resolved from monitor probe"
+            );
+            fps
+        }
+    }
+}
+
 #[cfg(not(all(feature = "waycap", target_os = "linux")))]
 fn make_engine(config: &Config) -> Engine<ord_core::MockBackend, Box<dyn FrameStore>> {
     // Dev daemon (and every non-Linux build): a long mock capture so the
     // socket/CLI can be exercised. Honors the configured replay storage (RAM or
     // disk) so that path is exercisable without a GPU.
-    let fps = config.capture.fps;
+    let fps = effective_capture_fps(config);
     let buffer = config.capture.buffer_seconds;
     let backend = ord_core::MockBackend::new(fps, fps * buffer, fps);
     let ticks = backend.params().time_base_den;

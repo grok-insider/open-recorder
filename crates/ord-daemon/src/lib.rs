@@ -5,6 +5,7 @@
 pub mod gamedetect;
 pub mod handler;
 pub mod hook;
+pub mod outputs;
 pub mod server;
 pub mod storage;
 pub mod supervisor;

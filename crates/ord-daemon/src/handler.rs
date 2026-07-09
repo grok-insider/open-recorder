@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use ord_common::{BufferSeconds, ClipDuration, Command, Event};
 use ord_core::{
-    CaptureBackend, ClipError, EncodedFrame, Engine, FrameStore, PreparedClip, RingBuffer,
-    StreamParams,
+    CaptureBackend, ClipError, EncodedFrame, Engine, FrameStore, PreparedClip, RecordingFault,
+    RingBuffer, StreamParams,
 };
 
 /// Resolves where a new full-length recording should be written (game-named,
@@ -50,15 +50,64 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
     }
 
     /// Ingest any frames the backend has produced. Call before handling a save so
-    /// the buffer is current.
+    /// the buffer is current. After pumping, call [`take_recording_fault`] so a
+    /// mid-stream recording abort is not left unreported.
     pub fn pump(&mut self) -> usize {
         self.engine.drain_available()
+    }
+
+    /// Take a pending recording fault (write failure → finalized file).
+    pub fn take_recording_fault(&mut self) -> Option<RecordingFault> {
+        self.engine.take_recording_fault()
     }
 
     /// Whether the replay buffer is meant to be live (the watchdog only
     /// recovers a stalled capture when the user wants it running).
     pub fn is_buffer_enabled(&self) -> bool {
         self.buffer_enabled
+    }
+
+    /// Whether capture is actually running (as opposed to merely *armed*).
+    pub fn is_capturing(&self) -> bool {
+        self.engine.is_running()
+    }
+
+    /// Finalize any active full-length recording because capture is about to
+    /// be replaced (encoder settings change is a clean cut). Returns the
+    /// event(s) the caller must broadcast so HUD/CLI learn the recording ended.
+    pub fn cut_active_recording(&mut self) -> Vec<Event> {
+        let Some(result) = self.engine.stop_recording() else {
+            return Vec::new();
+        };
+        match result {
+            Ok(path) => vec![Event::RecordState {
+                recording: false,
+                path: Some(path.to_string_lossy().into_owned()),
+            }],
+            Err(e) => vec![
+                Event::Error {
+                    message: format!("recording failed to finalize on capture restart: {e}"),
+                },
+                Event::RecordState {
+                    recording: false,
+                    path: None,
+                },
+            ],
+        }
+    }
+
+    /// Map a [`RecordingFault`] into the events clients need to see.
+    pub fn events_for_recording_fault(fault: RecordingFault) -> Vec<Event> {
+        let path = fault.path.map(|p| p.to_string_lossy().into_owned());
+        vec![
+            Event::Error {
+                message: fault.cause,
+            },
+            Event::RecordState {
+                recording: false,
+                path,
+            },
+        ]
     }
 
     /// Place a marker at the newest buffered frame (drains first so "now" is
@@ -85,36 +134,82 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
         self.engine.restart().map_err(|e| e.to_string())
     }
 
-    /// Swap in a freshly built engine (encoder settings changed). The caller
-    /// starts the new engine if capture should be live; buffered footage from
-    /// the old engine is dropped with it (a capture restart is a clean cut).
-    pub fn replace_engine(&mut self, engine: Engine<B, S>) {
+    /// Install `engine` and return the previous one. Neither engine is
+    /// stopped here — the capture supervisor stops the returned engine
+    /// **off the handler lock** so a hung PipeWire/NVENC teardown cannot
+    /// freeze the control plane. `armed` is the post-install buffer intent.
+    ///
+    /// Any active recording on the outgoing engine must already have been
+    /// finalized via [`cut_active_recording`] (or moved via
+    /// [`adopt_replay_from`](Engine::adopt_replay_from)).
+    pub fn exchange_engine(&mut self, engine: Engine<B, S>, armed: bool) -> Engine<B, S> {
+        if self.engine.is_recording() {
+            // Defensive: never drop an open muxer with the outgoing engine.
+            let _ = self.cut_active_recording();
+        }
         self.buffer = BufferSeconds::new(engine.capacity_seconds())
             .unwrap_or_else(|| BufferSeconds::new(1).expect("1 is non-zero"));
-        self.buffer_enabled = engine.is_running();
-        self.engine = engine;
+        self.buffer_enabled = armed;
+        std::mem::replace(&mut self.engine, engine)
+    }
+
+    /// Swap in a freshly built engine (encoder settings changed). Buffered
+    /// footage from the old engine is dropped (clean cut). Stops the old
+    /// capture **before** drop; prefer the supervisor's off-lock exchange
+    /// path for long teardowns.
+    pub fn replace_engine(&mut self, engine: Engine<B, S>) {
+        let armed = engine.is_running();
+        let mut old = self.exchange_engine(engine, armed);
+        if let Err(e) = old.stop() {
+            tracing::debug!(error = %e, "old engine stop before replace");
+        }
     }
 
     /// Swap in a freshly built (and started) engine, transplanting the replay
     /// state — ring, audio, markers, active recording — from the old one.
     /// The capture supervisor's arm/restart path: recovery must never discard
-    /// buffered footage.
-    pub fn install_engine_preserving_replay(&mut self, mut engine: Engine<B, S>) {
+    /// buffered footage. Returns the outgoing (stopped/empty) engine so the
+    /// supervisor can finish teardown off-lock if needed.
+    pub fn install_engine_preserving_replay(&mut self, mut engine: Engine<B, S>) -> Engine<B, S> {
         engine.adopt_replay_from(&mut self.engine);
-        self.replace_engine(engine);
+        // Armed intent stays true on this path (restart/arm recovery).
+        self.exchange_engine(engine, true)
     }
 
     /// Stop the current engine ahead of a supervisor restart (quick, never
     /// touches the portal). The armed *intent* is kept so `is_buffer_enabled`
     /// stays true while the replacement session starts.
+    ///
+    /// Prefer the supervisor's off-lock stop (exchange + stop outside the
+    /// handler mutex) when the backend teardown may hang.
     pub fn stop_engine_for_restart(&mut self) {
         if let Err(e) = self.engine.stop() {
             tracing::debug!(error = %e, "old engine stop before restart");
         }
     }
 
+    /// Take the engine out for an off-lock stop, leaving `placeholder` installed
+    /// so the control plane stays responsive. Preserves armed intent.
+    pub fn detach_engine_for_stop(&mut self, placeholder: Engine<B, S>) -> Engine<B, S> {
+        let armed = self.buffer_enabled;
+        self.exchange_engine(placeholder, armed)
+    }
+
+    /// Disarm the replay buffer under the handler lock **without** stopping
+    /// capture: the supervisor stops the returned engine off-lock. Clears
+    /// buffered footage on the detached engine. Returns `(old_engine, reply)`.
+    pub fn disable_capture_detach(&mut self, placeholder: Engine<B, S>) -> (Engine<B, S>, Event) {
+        self.buffer_enabled = false;
+        let mut old = self.exchange_engine(placeholder, false);
+        old.clear();
+        (old, Event::BufferState { enabled: false })
+    }
+
     /// Disarm the replay buffer: stop capture, drop buffered footage, clear
     /// the armed flag. Idempotent; returns the reply event.
+    ///
+    /// Prefer [`disable_capture_detach`] from the supervisor so stop runs
+    /// off-lock; this remains for tests and simple call sites.
     pub fn disable_capture(&mut self) -> Event {
         if self.engine.is_running() {
             if let Err(e) = self.engine.stop() {
@@ -160,7 +255,8 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
             Command::GetConfig
             | Command::SetConfig { .. }
             | Command::Mark
-            | Command::Screenshot => Event::Error {
+            | Command::Screenshot
+            | Command::ListOutputs => Event::Error {
                 message: "internal: command was not dispatched by the server".into(),
             },
         }
@@ -366,7 +462,7 @@ mod tests {
         // adopts the (cleared) replay state; the armed flag re-derives.
         let mut fresh = Engine::new(MockBackend::new(60, 120, 60), 60);
         fresh.start().unwrap();
-        h.install_engine_preserving_replay(fresh);
+        let _stale = h.install_engine_preserving_replay(fresh);
         assert!(h.is_buffer_enabled());
         match h.handle(Command::Status) {
             Event::Status { buffer_enabled, .. } => assert!(buffer_enabled),
@@ -394,5 +490,52 @@ mod tests {
             }
             other => panic!("expected Status, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "mux")]
+    #[test]
+    fn cut_active_recording_finalizes_and_reports() {
+        let mut h = handler_with(60, 10, 1, 60);
+        assert!(matches!(
+            h.handle(Command::ToggleRecord),
+            Event::RecordState {
+                recording: true,
+                path: Some(_)
+            }
+        ));
+        let events = h.cut_active_recording();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            Event::RecordState {
+                recording: false,
+                path: Some(_)
+            }
+        ));
+        match h.handle(Command::Status) {
+            Event::Status { recording, .. } => assert!(!recording),
+            other => panic!("expected Status, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_for_recording_fault_are_error_then_record_state() {
+        let fault = RecordingFault {
+            cause: "recording video write failed: test".into(),
+            path: Some(PathBuf::from("/tmp/clip.mkv")),
+        };
+        let events = Handler::<MockBackend>::events_for_recording_fault(fault);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            Event::Error { message } if message.contains("video write failed")
+        ));
+        assert!(matches!(
+            &events[1],
+            Event::RecordState {
+                recording: false,
+                path: Some(p)
+            } if p == "/tmp/clip.mkv"
+        ));
     }
 }

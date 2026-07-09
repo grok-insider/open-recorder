@@ -146,6 +146,7 @@ ord status [--json]     # buffer/recording state + buffered seconds (JSON for wa
 ord buffer on|off       # arm / pause the replay buffer
 ord config show         # print the effective daemon configuration
 ord config set <k> <v>  # change one setting, e.g. `ord config set capture.fps 30`
+ord outputs             # list displays (name, mode, refresh) via the daemon
 ord config set overlay.pressed_keys.enabled true   # show pressed keys in demos
 ord subscribe           # stream daemon events (--reconnect to survive restarts)
 ord doctor --fix        # install the NVIDIA P2-downclock fix (see below)
@@ -190,7 +191,7 @@ at runtime — in-app/daemon changes persist as a sparse diff in
 
 | Section | Keys (defaults) |
 |---------|-----------------|
-| `[capture]` | `fps` (60), `buffer_seconds` (60), `quality` (high), `codec` (h264; hevc/av1 need RTX 40/50), `bitrate_kbps`, `resolution`, `keyframe_interval_ms` (2000), `framerate_mode` (cfr), `color_range` (limited), `tune` (performance), `replay_storage` (ram\|disk), `target` (portal), `auto_arm` (false), `hdr` (false), `clear_on_save` (false) |
+| `[capture]` | `fps` (60), `fps_mode` (`fixed`\|`auto` — match monitor refresh), `buffer_seconds` (60), `quality` (high), `codec` (h264; hevc/av1 need RTX 40/50), `bitrate_kbps`, `resolution` (omit = native), `keyframe_interval_ms` (2000), `framerate_mode` (cfr), `color_range` (limited), `tune` (performance), `replay_storage` (ram\|disk), `target` (portal or e.g. `DP-1`), `auto_arm` (false), `hdr` (false), `clear_on_save` (false) |
 | `[audio]` | `desktop`, `mic`, `tracks` (per-application audio sources) |
 | `[storage]` | `clips_dir`, `recordings_dir`, `template`, `max_gib`, `max_age_days` |
 | `[markers]` | `auto_save_seconds` |

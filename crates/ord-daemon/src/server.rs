@@ -185,7 +185,12 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
         Arc::clone(&ctx),
         Arc::clone(&subs),
         retry_delay,
-    );
+    )
+    .map_err(|e| {
+        ServerError::Io(io::Error::other(format!(
+            "failed to spawn capture supervisor: {e}"
+        )))
+    })?;
     let _ = supervisor.send(crate::supervisor::CaptureRequest::Ensure {
         reply: None,
         retries: retry_attempts,
@@ -208,6 +213,7 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
     {
         let handler = Arc::clone(&handler);
         let ctx = Arc::clone(&ctx);
+        let subs = Arc::clone(&subs);
         let supervisor = supervisor.clone();
         std::thread::spawn(move || {
             /// Consecutive not-a-game probes (~3 s apart) before an auto-armed
@@ -242,12 +248,18 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
                             if !enabled {
                                 // Fire-and-forget: the supervisor starts the
                                 // session off this thread and broadcasts the
-                                // BufferState change itself.
-                                let _ =
-                                    supervisor.send(crate::supervisor::CaptureRequest::Ensure {
-                                        reply: None,
-                                        retries: 0,
-                                    });
+                                // BufferState change itself. Only queue when
+                                // the supervisor is idle — re-sending Ensure
+                                // every 3s while a portal dialog is open would
+                                // stack dialogs after cancel/fail.
+                                if !crate::supervisor::is_busy() {
+                                    let _ = supervisor.send(
+                                        crate::supervisor::CaptureRequest::Ensure {
+                                            reply: None,
+                                            retries: 0,
+                                        },
+                                    );
+                                }
                                 auto_armed = true;
                                 last_frames = Instant::now();
                             }
@@ -271,8 +283,19 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
                 }
 
                 let mut h = lock_tolerant(&handler);
-                if h.pump() > 0 {
+                let pumped = h.pump();
+                let rec_fault = h.take_recording_fault();
+                if pumped > 0 {
                     last_frames = Instant::now();
+                }
+                if let Some(fault) = rec_fault {
+                    drop(h);
+                    for ev in Handler::<B, S>::events_for_recording_fault(fault) {
+                        broadcast(&subs, &ev);
+                    }
+                    continue;
+                }
+                if pumped > 0 {
                     continue;
                 }
                 let Some(timeout) = watchdog else { continue };
@@ -391,6 +414,9 @@ fn handle_connection<B: CaptureBackend, S: FrameStore>(
                 apply_config(handler, ctx, subs, supervisor, arm_wait, *config)
             }
             Command::Screenshot => screenshot_flow(handler, ctx),
+            Command::ListOutputs => Event::Outputs {
+                outputs: crate::outputs::list_outputs(),
+            },
             Command::Mark => {
                 let marked = lock_tolerant(handler).mark();
                 if !marked {
@@ -660,6 +686,7 @@ fn apply_config<B: CaptureBackend, S: FrameStore>(
         *lock_tolerant(&c.config) = new.clone();
 
         let capture_restart = old.capture.fps != new.capture.fps
+            || old.capture.fps_mode != new.capture.fps_mode
             || old.capture.quality != new.capture.quality
             || old.capture.codec != new.capture.codec
             || old.capture.bitrate_kbps != new.capture.bitrate_kbps

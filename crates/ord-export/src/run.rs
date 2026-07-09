@@ -211,8 +211,14 @@ fn run_ffmpeg(
         .spawn()
         .map_err(|e| ExportError::Spawn(e.to_string()))?;
 
-    let stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExportError::Spawn("ffmpeg stdout was not piped".into()))?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| ExportError::Spawn("ffmpeg stderr was not piped".into()))?;
     // Drain stderr on a thread so a full stderr pipe can't deadlock the export.
     let stderr_thread = std::thread::spawn(move || {
         let mut s = String::new();

@@ -18,6 +18,20 @@ use crate::record::Recorder;
 use crate::ring::{EncodedFrame, RingBuffer};
 use crate::store::FrameStore;
 
+/// A mid-stream recording that had to be finalized after a write failure.
+///
+/// The engine never drops an open muxer without calling [`Recorder::finish`]:
+/// that writes the container trailer so the file is at least partially
+/// playable. The daemon surfaces this as `Event::Error` + `RecordState`.
+#[derive(Debug, Clone)]
+pub struct RecordingFault {
+    /// Why the recording was aborted (the original write error).
+    pub cause: String,
+    /// Path when `finish` succeeded (file may be short / incomplete). `None`
+    /// when finalize itself failed or never produced a path.
+    pub path: Option<PathBuf>,
+}
+
 /// A clip ready to be muxed: ordered encoded video frames (first is a keyframe),
 /// the audio frames covering the same window (may be empty), and the stream
 /// params they were captured with.
@@ -61,6 +75,9 @@ pub struct Engine<B: CaptureBackend, S: FrameStore = RingBuffer> {
     /// Active full-length recording, if any. Frames are tee'd here from
     /// `drain_available` in addition to the replay ring.
     recorder: Option<Recorder>,
+    /// Set when a write error forced a finalize mid-stream; the daemon pump
+    /// takes this and broadcasts. Cleared by [`Engine::take_recording_fault`].
+    recording_fault: Option<RecordingFault>,
     /// Marker positions ("clip that" bookmarks) in the video pts tick base,
     /// oldest first. Pruned alongside the ring's eviction window.
     markers: Vec<i64>,
@@ -92,6 +109,7 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
             rx: None,
             audio_rx: None,
             recorder: None,
+            recording_fault: None,
             markers: Vec::new(),
         }
     }
@@ -131,6 +149,27 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
     /// Whether a full-length recording is currently active.
     pub fn is_recording(&self) -> bool {
         self.recorder.is_some()
+    }
+
+    /// Take a pending recording fault produced by a mid-stream write failure.
+    /// The daemon pump must drain this after every [`drain_available`] so
+    /// clients learn the recording stopped.
+    pub fn take_recording_fault(&mut self) -> Option<RecordingFault> {
+        self.recording_fault.take()
+    }
+
+    /// Finalize `rec` after a write error and stash a [`RecordingFault`] for
+    /// the daemon. Never leaves an open muxer without a trailer attempt.
+    fn abort_recording(&mut self, rec: Recorder, cause: String) {
+        tracing::error!(error = %cause, "recording aborted; finalizing file");
+        let path = match rec.finish() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::error!(error = %e, "recording finalize after write failure also failed");
+                None
+            }
+        };
+        self.recording_fault = Some(RecordingFault { cause, path });
     }
 
     /// Start capture; frames begin flowing into the ring buffers on
@@ -208,16 +247,21 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
 
     /// Pull all currently-available video+audio frames from the backend into the
     /// ring buffers. Returns how many video frames were ingested. Non-blocking.
+    ///
+    /// A mid-stream recording write failure finalizes the file and stashes a
+    /// [`RecordingFault`] — call [`take_recording_fault`] after this returns.
     pub fn drain_available(&mut self) -> usize {
         if let Some(arx) = self.audio_rx.as_ref() {
             // Collect first so the recorder (which needs `&mut self`) can be fed
             // without holding the receiver borrow.
             let frames: Vec<EncodedAudioFrame> = arx.try_iter().collect();
             for frame in frames {
-                if let Some(rec) = self.recorder.as_mut() {
-                    if let Err(e) = rec.push_audio(&frame) {
-                        tracing::error!(error = %e, "recording audio write failed; stopping recording");
-                        self.recorder = None;
+                if let Some(mut rec) = self.recorder.take() {
+                    match rec.push_audio(&frame) {
+                        Ok(()) => self.recorder = Some(rec),
+                        Err(e) => {
+                            self.abort_recording(rec, format!("recording audio write failed: {e}"))
+                        }
                     }
                 }
                 self.audio_ring.push(frame);
@@ -229,10 +273,12 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
         };
         let n = frames.len();
         for frame in frames {
-            if let Some(rec) = self.recorder.as_mut() {
-                if let Err(e) = rec.push_video(&frame) {
-                    tracing::error!(error = %e, "recording video write failed; stopping recording");
-                    self.recorder = None;
+            if let Some(mut rec) = self.recorder.take() {
+                match rec.push_video(&frame) {
+                    Ok(()) => self.recorder = Some(rec),
+                    Err(e) => {
+                        self.abort_recording(rec, format!("recording video write failed: {e}"))
+                    }
                 }
             }
             self.ring.push(frame);
@@ -528,5 +574,43 @@ mod tests {
         assert!(!eng.is_running());
         // Buffer still holds frames -> clip still works.
         assert!(eng.take_clip(cd(1)).is_ok());
+    }
+
+    #[cfg(feature = "mux")]
+    #[test]
+    fn recording_write_failure_finalizes_and_surfaces_fault() {
+        // Mock frames are not valid H.264, so the first keyframe's extradata
+        // build fails. The engine must finalize (not drop) the open muxer and
+        // leave a RecordingFault for the daemon to broadcast.
+        let mut eng = Engine::new(MockBackend::new(60, 120, 60), 60);
+        eng.start().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "ord-rec-fault-{}-{}.mkv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        eng.start_recording(path).unwrap();
+        assert!(eng.is_recording());
+        eng.drain_available();
+        assert!(
+            !eng.is_recording(),
+            "write failure must clear the active recorder"
+        );
+        let fault = eng
+            .take_recording_fault()
+            .expect("write failure must surface a RecordingFault");
+        assert!(
+            fault.cause.contains("video write failed"),
+            "cause was: {}",
+            fault.cause
+        );
+        // A second take is empty (one-shot).
+        assert!(eng.take_recording_fault().is_none());
+        if let Some(p) = fault.path {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

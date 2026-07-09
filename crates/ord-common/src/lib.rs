@@ -16,11 +16,11 @@ pub mod version;
 pub use client::{connect, Client, ClientError};
 pub use config::{
     default_config_path, overrides_path, AudioConfig, CaptureCodec, CaptureConfig, Config,
-    ConfigError, Container, ExportCodec, ExportConfig, HooksConfig, MarkersConfig,
+    ConfigError, Container, ExportCodec, ExportConfig, FpsMode, HooksConfig, MarkersConfig,
     PressedKeysConfig, PressedKeysPosition, Quality, StorageConfig,
 };
 pub use frame::{read_frame, write_frame, MAX_FRAME, PROTOCOL_VERSION};
-pub use ipc::{Command, Event, ProtocolError};
+pub use ipc::{Command, Event, OutputInfo, ProtocolError};
 pub use newtypes::{BufferSeconds, ClipDuration};
 pub use sync::lock_tolerant;
 

@@ -7,6 +7,28 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::newtypes::ClipDuration;
 
+/// A connected display as reported by the compositor probe (Hyprland
+/// `hyprctl monitors` today). Shared by daemon, CLI, and settings UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputInfo {
+    /// Connector name, e.g. `DP-1` / `HDMI-A-1`.
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    /// Refresh rate in milli-Hz (Hyprland style): 144003 → 144.003 Hz.
+    pub refresh_mhz: u32,
+    /// Whether this output currently has focus (best-effort).
+    pub focused: bool,
+}
+
+impl OutputInfo {
+    /// Integer FPS nearest to this output's refresh, clamped to `1..=240`.
+    pub fn refresh_fps(&self) -> u32 {
+        let fps = (self.refresh_mhz.saturating_add(500)) / 1000;
+        fps.clamp(1, 240)
+    }
+}
+
 /// A request sent from a client (CLI/GUI) to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
@@ -36,6 +58,9 @@ pub enum Command {
     /// Grab a still image of the most recent buffered frame (decodes the newest
     /// GOP and writes a PNG). The replay buffer must be armed.
     Screenshot,
+    /// Enumerate connected displays (name, mode, refresh) for settings UI and
+    /// auto FPS resolution. Probe-only; never touches capture.
+    ListOutputs,
 }
 
 /// A message sent from the daemon to clients.
@@ -80,6 +105,9 @@ pub enum Event {
     CaptureRestarted,
     /// A screenshot was written to disk.
     ScreenshotSaved { path: String },
+    /// Reply to [`Command::ListOutputs`]: connected displays (may be empty when
+    /// the compositor probe is unavailable).
+    Outputs { outputs: Vec<OutputInfo> },
 }
 
 /// Errors encoding/decoding protocol frames.
@@ -150,6 +178,7 @@ mod tests {
             Command::GetConfig,
             Command::Mark,
             Command::Screenshot,
+            Command::ListOutputs,
             Command::SetConfig {
                 config: Box::new(Config::default()),
             },
@@ -192,6 +221,15 @@ mod tests {
             Event::ScreenshotSaved {
                 path: "/home/friend/Videos/open-recorder/shot.png".to_string(),
             },
+            Event::Outputs {
+                outputs: vec![OutputInfo {
+                    name: "DP-1".into(),
+                    width: 2560,
+                    height: 1440,
+                    refresh_mhz: 165_002,
+                    focused: true,
+                }],
+            },
         ];
         for ev in cases {
             let bytes = ev.encode().unwrap();
@@ -204,12 +242,29 @@ mod tests {
     fn broadcast_filter_covers_new_events() {
         assert!(Event::Marked { auto_saving: false }.is_state_change());
         assert!(Event::CaptureRestarted.is_state_change());
-        // Config replies are point-to-point, never broadcast.
+        // Config / Outputs replies are point-to-point, never broadcast.
         assert!(!Event::Config {
             effective: Box::new(Config::default()),
             base: Box::new(Config::default()),
         }
         .is_state_change());
+        assert!(!Event::Outputs { outputs: vec![] }.is_state_change());
+    }
+
+    #[test]
+    fn refresh_fps_rounds_and_clamps() {
+        let o = |mhz| OutputInfo {
+            name: "x".into(),
+            width: 1,
+            height: 1,
+            refresh_mhz: mhz,
+            focused: false,
+        };
+        assert_eq!(o(59_940).refresh_fps(), 60);
+        assert_eq!(o(144_003).refresh_fps(), 144);
+        assert_eq!(o(165_002).refresh_fps(), 165);
+        assert_eq!(o(0).refresh_fps(), 1);
+        assert_eq!(o(500_000).refresh_fps(), 240);
     }
 
     #[test]

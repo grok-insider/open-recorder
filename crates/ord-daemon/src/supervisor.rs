@@ -24,6 +24,7 @@
 //! later capture requests queue behind the hang until the daemon restarts —
 //! strictly better than the old "daemon running but unreachable".
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -33,6 +34,16 @@ use ord_core::{CaptureBackend, Engine, FrameStore};
 
 use crate::handler::Handler;
 use crate::server::{broadcast, ServerCtx, Subscribers};
+
+/// True while the supervisor is processing a capture request (including a
+/// blocking portal start). The auto-arm pump consults this so it does not
+/// stack Ensure requests / portal dialogs every 3 s.
+static BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Whether the supervisor is mid-request (portal start, stop, swap, …).
+pub(crate) fn is_busy() -> bool {
+    BUSY.load(Ordering::Acquire)
+}
 
 /// A capture-lifecycle request. Replies are best-effort: the requester may
 /// have stopped waiting (bounded timeout), so sends into `reply` are allowed
@@ -59,13 +70,14 @@ pub enum CaptureRequest<B: CaptureBackend, S: FrameStore> {
 }
 
 /// Spawn the supervisor worker. Returns the request sender; the worker exits
-/// when every sender is dropped.
+/// when every sender is dropped. Errors if the OS refuses the thread (rare,
+/// but a silent `.ok()` left the daemon degraded with no capture ever).
 pub(crate) fn spawn<B, S>(
     handler: Arc<Mutex<Handler<B, S>>>,
     ctx: Arc<Mutex<ServerCtx<B, S>>>,
     subs: Subscribers,
     retry_delay: Duration,
-) -> Sender<CaptureRequest<B, S>>
+) -> Result<Sender<CaptureRequest<B, S>>, std::io::Error>
 where
     B: CaptureBackend + 'static,
     S: FrameStore + 'static,
@@ -73,9 +85,8 @@ where
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("ord-capture-supervisor".into())
-        .spawn(move || run(rx, handler, ctx, subs, retry_delay))
-        .ok();
-    tx
+        .spawn(move || run(rx, handler, ctx, subs, retry_delay))?;
+    Ok(tx)
 }
 
 fn run<B, S>(
@@ -118,104 +129,155 @@ fn run<B, S>(
             },
         };
 
-        match req {
-            CaptureRequest::Ensure { reply, retries } => {
-                if lock_tolerant(&handler).is_buffer_enabled() {
-                    send(reply.as_ref(), Event::BufferState { enabled: true });
-                    continue;
+        BUSY.store(true, Ordering::Release);
+        process_request(req, &handler, &ctx, &subs, &mut pending_retry, retry_delay);
+        BUSY.store(false, Ordering::Release);
+    }
+}
+
+fn process_request<B, S>(
+    req: CaptureRequest<B, S>,
+    handler: &Arc<Mutex<Handler<B, S>>>,
+    ctx: &Arc<Mutex<ServerCtx<B, S>>>,
+    subs: &Subscribers,
+    pending_retry: &mut Option<(u32, Instant)>,
+    retry_delay: Duration,
+) where
+    B: CaptureBackend + 'static,
+    S: FrameStore + 'static,
+{
+    match req {
+        CaptureRequest::Ensure { reply, retries } => {
+            if lock_tolerant(handler).is_buffer_enabled() {
+                send(reply.as_ref(), Event::BufferState { enabled: true });
+                return;
+            }
+            let mut engine = build_engine(ctx);
+            match engine.start() {
+                Ok(()) => {
+                    let mut stale = lock_tolerant(handler).install_engine_preserving_replay(engine);
+                    // Outgoing engine is empty/stopped; finish any residual
+                    // teardown off-lock so a wedged prior session cannot
+                    // hold the handler mutex.
+                    let _ = stale.stop();
+                    // Broadcast BEFORE replying: the requester continues
+                    // (and may broadcast follow-ups) the moment the reply
+                    // lands, and subscribers must see the state change
+                    // first — both go through the same subs-lock FIFO.
+                    let ev = Event::BufferState { enabled: true };
+                    broadcast(subs, &ev);
+                    send(reply.as_ref(), ev);
+                    tracing::info!("capture armed");
                 }
-                let mut engine = build_engine(&ctx);
-                match engine.start() {
-                    Ok(()) => {
-                        lock_tolerant(&handler).install_engine_preserving_replay(engine);
-                        // Broadcast BEFORE replying: the requester continues
-                        // (and may broadcast follow-ups) the moment the reply
-                        // lands, and subscribers must see the state change
-                        // first — both go through the same subs-lock FIFO.
-                        let ev = Event::BufferState { enabled: true };
-                        broadcast(&subs, &ev);
-                        send(reply.as_ref(), ev);
-                        tracing::info!("capture armed");
-                    }
-                    Err(e) => {
-                        let message = format!("failed to start capture: {e}");
-                        send(
-                            reply.as_ref(),
-                            Event::Error {
-                                message: message.clone(),
-                            },
+                Err(e) => {
+                    let message = format!("failed to start capture: {e}");
+                    send(
+                        reply.as_ref(),
+                        Event::Error {
+                            message: message.clone(),
+                        },
+                    );
+                    // A user-dismissed portal picker must not be re-asked
+                    // automatically; everything else (portal not ready at
+                    // login, transient D-Bus errors) retries on schedule.
+                    let cancelled = message.to_ascii_lowercase().contains("cancelled");
+                    if retries > 0 && !cancelled {
+                        tracing::warn!(
+                            error = %message,
+                            retries_left = retries - 1,
+                            retry_in = ?retry_delay,
+                            "capture start failed; will retry"
                         );
-                        // A user-dismissed portal picker must not be re-asked
-                        // automatically; everything else (portal not ready at
-                        // login, transient D-Bus errors) retries on schedule.
-                        let cancelled = message.to_ascii_lowercase().contains("cancelled");
-                        if retries > 0 && !cancelled {
-                            tracing::warn!(
-                                error = %message,
-                                retries_left = retries - 1,
-                                retry_in = ?retry_delay,
-                                "capture start failed; will retry"
-                            );
-                            pending_retry = Some((retries - 1, Instant::now() + retry_delay));
-                        } else {
-                            tracing::error!(error = %message, "capture start failed; staying degraded (arm again via `ord buffer on` or auto-arm)");
-                        }
+                        *pending_retry = Some((retries - 1, Instant::now() + retry_delay));
+                    } else {
+                        tracing::error!(error = %message, "capture start failed; staying degraded (arm again via `ord buffer on` or auto-arm)");
                     }
                 }
             }
-            CaptureRequest::Disable { reply } => {
-                let ev = lock_tolerant(&handler).disable_capture();
-                if ev.is_state_change() {
-                    broadcast(&subs, &ev);
-                }
-                send(reply.as_ref(), ev);
+        }
+        CaptureRequest::Disable { reply } => {
+            // Detach under the lock, stop off-lock: a hung PipeWire/NVENC
+            // teardown must not freeze status/save/config.
+            let placeholder = build_engine(ctx);
+            let (mut old, ev) = lock_tolerant(handler).disable_capture_detach(placeholder);
+            if let Err(e) = old.stop() {
+                tracing::debug!(error = %e, "capture stop on disable");
             }
-            CaptureRequest::Restart => {
-                {
-                    let mut h = lock_tolerant(&handler);
-                    if !h.is_buffer_enabled() {
-                        continue; // disarmed while the request was queued
-                    }
-                    h.stop_engine_for_restart();
+            if ev.is_state_change() {
+                broadcast(subs, &ev);
+            }
+            send(reply.as_ref(), ev);
+        }
+        CaptureRequest::Restart => {
+            // Stop the live session off the handler lock (portal/NVENC
+            // teardown can hang). A placeholder keeps the control plane
+            // alive and preserves armed intent; the detached buffer is
+            // re-adopted into the fresh engine below.
+            let placeholder = build_engine(ctx);
+            let mut old = {
+                let mut h = lock_tolerant(handler);
+                if !h.is_buffer_enabled() {
+                    return; // disarmed while the request was queued
                 }
-                let mut engine = build_engine(&ctx);
-                match engine.start() {
-                    Ok(()) => {
-                        lock_tolerant(&handler).install_engine_preserving_replay(engine);
-                        broadcast(&subs, &Event::CaptureRestarted);
-                    }
-                    Err(e) => {
-                        // The watchdog fires again after its window, which
-                        // re-queues a restart — no schedule needed here.
-                        broadcast(
-                            &subs,
-                            &Event::Error {
-                                message: format!("capture stalled and restart failed: {e}"),
-                            },
-                        );
-                    }
+                h.detach_engine_for_stop(placeholder)
+            };
+            if let Err(e) = old.stop() {
+                tracing::debug!(error = %e, "old engine stop before restart");
+            }
+            let mut engine = build_engine(ctx);
+            match engine.start() {
+                Ok(()) => {
+                    // Adopt from the detached (stopped) engine so the
+                    // ring/markers/recording survive the restart.
+                    engine.adopt_replay_from(&mut old);
+                    let mut stale = lock_tolerant(handler).exchange_engine(engine, true);
+                    let _ = stale.stop();
+                    broadcast(subs, &Event::CaptureRestarted);
+                }
+                Err(e) => {
+                    // Put the stopped-but-buffered engine back so the user
+                    // can still save; the watchdog will try again.
+                    let mut stale = lock_tolerant(handler).exchange_engine(old, true);
+                    let _ = stale.stop();
+                    broadcast(
+                        subs,
+                        &Event::Error {
+                            message: format!("capture stalled and restart failed: {e}"),
+                        },
+                    );
                 }
             }
-            CaptureRequest::Swap { mut engine, reply } => {
-                if lock_tolerant(&handler).is_buffer_enabled() {
-                    if let Err(e) = engine.start() {
-                        // The old engine keeps running; the persisted
-                        // overrides are retried on the next daemon start.
-                        let _ = reply.try_send(Event::Error {
-                            message: format!("new capture settings failed to start: {e}"),
-                        });
-                        continue;
-                    }
+        }
+        CaptureRequest::Swap { mut engine, reply } => {
+            if lock_tolerant(handler).is_buffer_enabled() {
+                if let Err(e) = engine.start() {
+                    // The old engine keeps running; the persisted
+                    // overrides are retried on the next daemon start.
+                    let _ = reply.try_send(Event::Error {
+                        message: format!("new capture settings failed to start: {e}"),
+                    });
+                    return;
                 }
-                // A settings change is a clean cut: buffered footage from the
-                // old encoder is dropped with it. Broadcast BEFORE replying so
-                // subscribers see CaptureRestarted ahead of any follow-up the
-                // (now unblocked) requester broadcasts — e.g. apply_config's
-                // Config push.
-                lock_tolerant(&handler).replace_engine(*engine);
-                broadcast(&subs, &Event::CaptureRestarted);
-                let _ = reply.try_send(Event::CaptureRestarted);
             }
+            // A settings change is a clean cut: buffered footage from the
+            // old encoder is dropped with it. Any active full-length
+            // recording is finalized first (never drop an open muxer).
+            // Old capture is stopped off-lock after the exchange.
+            let armed = engine.is_running();
+            let (rec_events, mut old) = {
+                let mut h = lock_tolerant(handler);
+                let events = h.cut_active_recording();
+                let old = h.exchange_engine(*engine, armed);
+                (events, old)
+            };
+            if let Err(e) = old.stop() {
+                tracing::debug!(error = %e, "old engine stop after settings swap");
+            }
+            for ev in &rec_events {
+                broadcast(subs, ev);
+            }
+            broadcast(subs, &Event::CaptureRestarted);
+            let _ = reply.try_send(Event::CaptureRestarted);
         }
     }
 }

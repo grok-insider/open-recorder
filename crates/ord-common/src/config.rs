@@ -157,12 +157,29 @@ fn collect_diff_paths(
     }
 }
 
+/// How the capture frame rate is chosen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FpsMode {
+    /// Use [`CaptureConfig::fps`] as a fixed CFR target (the default; matches
+    /// every config written before this field existed).
+    #[default]
+    Fixed,
+    /// Match the selected/focused monitor's refresh rate at capture start
+    /// (OBS-style "match display"). [`CaptureConfig::fps`] is only a fallback
+    /// when no output can be probed.
+    Auto,
+}
+
 /// Capture/replay-buffer settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CaptureConfig {
-    /// Target capture frame rate.
+    /// Target capture frame rate when [`fps_mode`](Self::fps_mode) is
+    /// [`FpsMode::Fixed`]. Also the fallback when mode is Auto and probe fails.
     pub fps: u32,
+    /// Whether [`fps`](Self::fps) is a fixed target or "match display refresh".
+    pub fps_mode: FpsMode,
     /// Replay buffer length in seconds.
     pub buffer_seconds: u32,
     /// Encoder quality preset (ignored when `bitrate_kbps` is set).
@@ -216,6 +233,7 @@ impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
             fps: 60,
+            fps_mode: FpsMode::Fixed,
             buffer_seconds: 60,
             quality: Quality::High,
             codec: CaptureCodec::H264,
@@ -656,6 +674,7 @@ mod tests {
     fn default_is_sane() {
         let c = Config::default();
         assert_eq!(c.capture.fps, 60);
+        assert_eq!(c.capture.fps_mode, FpsMode::Fixed);
         assert_eq!(c.capture.buffer_seconds, 60);
         assert_eq!(c.capture.quality, Quality::High);
         assert_eq!(c.capture.codec, CaptureCodec::H264);
@@ -793,6 +812,7 @@ mod tests {
         let c = Config {
             capture: CaptureConfig {
                 fps: 120,
+                fps_mode: FpsMode::Auto,
                 buffer_seconds: 30,
                 quality: Quality::Ultra,
                 codec: CaptureCodec::Hevc,

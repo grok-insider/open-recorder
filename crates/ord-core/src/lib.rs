@@ -39,7 +39,7 @@ pub use backend::{BackendError, CaptureBackend, CaptureStreams, Codec, MockBacke
 pub use clip::{select_clip, ClipError, ClipSelection};
 #[cfg(unix)]
 pub use disk_store::DiskFrameStore;
-pub use engine::{Engine, PreparedClip};
+pub use engine::{Engine, PreparedClip, RecordingFault};
 pub use mux::{verify_clip, write_clip, ClipCheck, MuxError};
 pub use record::Recorder;
 pub use ring::{EncodedFrame, RingBuffer};

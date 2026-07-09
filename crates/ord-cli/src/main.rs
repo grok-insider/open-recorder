@@ -23,6 +23,7 @@ fn usage() -> &'static str {
        ord buffer on|off          enable/disable the replay buffer\n  \
        ord config show            print the effective daemon configuration\n  \
        ord config set <key> <v>   change one setting (e.g. capture.fps 30)\n  \
+       ord outputs                list displays (name, mode, refresh Hz)\n  \
        ord subscribe [--reconnect] stream daemon events (for the HUD)\n  \
        ord doctor [--fix]         diagnose/fix the NVIDIA P2 downclock\n  \
        ord export <in> ...        transcode/trim a clip (see `ord export --help`)\n"
@@ -88,6 +89,10 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Parsed, String> {
         }),
         "shot" => Ok(Parsed::Cmd {
             cmd: Command::Screenshot,
+            json: false,
+        }),
+        "outputs" => Ok(Parsed::Cmd {
+            cmd: Command::ListOutputs,
             json: false,
         }),
         "config" => match args.next().as_deref() {
@@ -164,6 +169,26 @@ fn render(event: Event) -> String {
         }
         Event::CaptureRestarted => "capture restarted".to_string(),
         Event::ScreenshotSaved { path } => format!("screenshot -> {path}"),
+        Event::Outputs { outputs } => {
+            if outputs.is_empty() {
+                "no displays detected (is hyprctl available?)".into()
+            } else {
+                outputs
+                    .iter()
+                    .map(|o| {
+                        format!(
+                            "{}  {}×{}  {} Hz{}",
+                            o.name,
+                            o.width,
+                            o.height,
+                            o.refresh_fps(),
+                            if o.focused { "  (focused)" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
         Event::Config { effective, base } => {
             let overridden = effective.overridden_fields(&base);
             let toml = effective
@@ -200,16 +225,40 @@ fn render_json(event: &Event) -> Result<String, String> {
     }
 }
 
-/// Set a dotted `section.key` in a TOML document, keeping (or inferring) the
-/// value's type. Pure so `config set` parsing is unit-testable.
+/// Set a dotted `section.key` (or `section.nested.field`) in a TOML document,
+/// keeping (or inferring) the value's type. Missing intermediate tables are
+/// created so optional nested objects like `capture.resolution` can be set
+/// without a prior table in the effective config.
+///
+/// Pure so `config set` parsing is unit-testable.
 fn set_dotted(doc: &mut toml::Value, key: &str, value: &str) -> Result<(), String> {
+    // Shorthand: `capture.resolution = 1920x1080` (or `1920×1080`).
+    if key == "capture.resolution" {
+        return set_resolution_shorthand(doc, value);
+    }
+
     let mut parts: Vec<&str> = key.split('.').collect();
     let last = parts.pop().filter(|s| !s.is_empty()).ok_or("empty key")?;
     let mut cur = doc;
-    for p in &parts {
-        cur = cur
-            .get_mut(p)
+    for (depth, p) in parts.iter().enumerate() {
+        let table = cur
+            .as_table_mut()
+            .ok_or_else(|| format!("cannot descend into {p}: parent is not a table"))?;
+        if !table.contains_key(*p) {
+            // Top-level sections (`capture`, `storage`, …) must already exist
+            // so typos don't invent tables `Config` would reject poorly.
+            // Nested optionals (e.g. `capture.resolution`) are created empty.
+            if depth == 0 {
+                return Err(format!("unknown config section: {p}"));
+            }
+            table.insert(p.to_string(), toml::Value::Table(toml::map::Map::new()));
+        }
+        cur = table
+            .get_mut(*p)
             .ok_or_else(|| format!("unknown config section: {p}"))?;
+        if !cur.is_table() {
+            return Err(format!("{p} is not a config section"));
+        }
     }
     let table = cur
         .as_table_mut()
@@ -229,6 +278,13 @@ fn set_dotted(doc: &mut toml::Value, key: &str, value: &str) -> Result<(), Strin
             toml::Value::Float(value.parse().map_err(|_| format!("{key} needs a number"))?)
         }
         Some(toml::Value::String(_)) => toml::Value::String(value.to_string()),
+        Some(toml::Value::Table(_)) if last == "resolution" => {
+            // Replacing a whole resolution table via dotted set is rare; use
+            // the shorthand path instead.
+            return Err(format!(
+                "set {key} with a WxH value (e.g. `ord config set capture.resolution 1920x1080`)"
+            ));
+        }
         Some(_) => return Err(format!("{key} is not a settable scalar")),
         // Absent (an unset Option field): infer, and let the config parse
         // validate the final type — unknown keys are rejected there.
@@ -245,6 +301,38 @@ fn set_dotted(doc: &mut toml::Value, key: &str, value: &str) -> Result<(), Strin
         }
     };
     table.insert(last.to_string(), new);
+    Ok(())
+}
+
+/// Parse `1920x1080` / `1920×1080` into `[capture.resolution]`.
+fn set_resolution_shorthand(doc: &mut toml::Value, value: &str) -> Result<(), String> {
+    let v = value.trim().to_ascii_lowercase().replace('×', "x");
+    if matches!(v.as_str(), "native" | "auto" | "none" | "off" | "") {
+        // Clear explicit resolution → native monitor size.
+        if let Some(capture) = doc.get_mut("capture").and_then(|c| c.as_table_mut()) {
+            capture.remove("resolution");
+        }
+        return Ok(());
+    }
+    let (w, h) = v
+        .split_once('x')
+        .ok_or_else(|| "capture.resolution needs WxH (e.g. 1920x1080) or native".to_string())?;
+    let width: i64 = w
+        .trim()
+        .parse()
+        .map_err(|_| "capture.resolution width must be an integer".to_string())?;
+    let height: i64 = h
+        .trim()
+        .parse()
+        .map_err(|_| "capture.resolution height must be an integer".to_string())?;
+    let capture = doc
+        .get_mut("capture")
+        .and_then(|c| c.as_table_mut())
+        .ok_or_else(|| "missing [capture] section".to_string())?;
+    let mut table = toml::map::Map::new();
+    table.insert("width".into(), toml::Value::Integer(width));
+    table.insert("height".into(), toml::Value::Integer(height));
+    capture.insert("resolution".into(), toml::Value::Table(table));
     Ok(())
 }
 
@@ -441,6 +529,13 @@ mod tests {
                 json: false
             }
         );
+        assert_eq!(
+            p("outputs").unwrap(),
+            Parsed::Cmd {
+                cmd: Command::ListOutputs,
+                json: false
+            }
+        );
     }
 
     #[test]
@@ -504,6 +599,25 @@ mod tests {
             doc["overlay"]["pressed_keys"]["scale_percent"].as_integer(),
             Some(135)
         );
+        // Nested optional table: create [capture.resolution] on demand.
+        set_dotted(&mut doc, "capture.resolution.width", "1920").unwrap();
+        set_dotted(&mut doc, "capture.resolution.height", "1080").unwrap();
+        assert_eq!(
+            doc["capture"]["resolution"]["width"].as_integer(),
+            Some(1920)
+        );
+        assert_eq!(
+            doc["capture"]["resolution"]["height"].as_integer(),
+            Some(1080)
+        );
+        // Shorthand WxH and native clear.
+        set_dotted(&mut doc, "capture.resolution", "1280x720").unwrap();
+        assert_eq!(
+            doc["capture"]["resolution"]["width"].as_integer(),
+            Some(1280)
+        );
+        set_dotted(&mut doc, "capture.resolution", "native").unwrap();
+        assert!(doc["capture"].get("resolution").is_none());
 
         // Type mismatches are rejected with the key in the message.
         assert!(set_dotted(&mut doc, "capture.fps", "fast").is_err());

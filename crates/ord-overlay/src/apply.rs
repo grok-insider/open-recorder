@@ -57,6 +57,8 @@ pub fn apply(hud: &mut Hud, event: &Event, now_ms: u64) {
         Event::Config { effective, .. } => {
             hud.apply_overlay_config(&effective.overlay);
         }
+        // Point-to-point probe reply; never broadcast to the HUD.
+        Event::Outputs { .. } => {}
     }
 }
 
