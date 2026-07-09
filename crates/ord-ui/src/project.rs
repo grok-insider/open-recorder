@@ -13,6 +13,8 @@ pub struct EditorProject {
     pub history: SegmentHistory,
     pub mute_export: bool,
     pub volume: f32,
+    /// Preview / export playback rate (`0.25`…`2.0`). `1.0` = real-time.
+    pub speed: f32,
     pub zoom: f32,
     pub scroll: f32,
 }
@@ -27,9 +29,15 @@ impl EditorProject {
             history: SegmentHistory::new(),
             mute_export: false,
             volume,
+            speed: 1.0,
             zoom: 1.0,
             scroll: 0.0,
         }
+    }
+
+    /// Clamp speed to the supported preview/export range.
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = speed.clamp(0.25, 2.0);
     }
 
     /// Apply a cut mutation with undo: keeps a snapshot only when `f` reports

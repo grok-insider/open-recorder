@@ -609,6 +609,8 @@ impl LibraryApp {
             None,
             None,
             false,
+            1.0,
+            false,
             ctx,
         );
     }
@@ -616,7 +618,8 @@ impl LibraryApp {
     /// Export `input` with `preset`, optionally trimmed/muted — or, when
     /// `segments` is set, the editor's kept pieces concatenated into one file.
     /// Runs off-thread and reports via the export channel; ignores a duplicate
-    /// in-flight export.
+    /// in-flight export. When `to_library` is true the file lands next to
+    /// clips (not under `exports/`).
     #[allow(clippy::too_many_arguments)]
     fn run_export(
         &mut self,
@@ -627,6 +630,8 @@ impl LibraryApp {
         trim: Option<Trim>,
         segments: Option<Vec<Trim>>,
         mute: bool,
+        speed: f32,
+        to_library: bool,
         ctx: &egui::Context,
     ) {
         if self.exports.contains_key(input) {
@@ -634,17 +639,24 @@ impl LibraryApp {
         }
         let mut profile = preset.profile();
         profile.mute = mute;
+        profile.speed = speed.clamp(0.25, 2.0) as f64;
         let ext = profile.output_extension();
         let preset_name = preset.slug();
         let suffix = if segments.is_some() {
             "-cut"
         } else if trim.is_some() {
             "-trim"
+        } else if to_library {
+            "-edit"
         } else {
             ""
         };
-        let out =
-            meta::exports_dir(&self.clips_dir).join(format!("{stem}-{preset_name}{suffix}.{ext}"));
+        let out = if to_library {
+            self.clips_dir
+                .join(format!("{stem}-{preset_name}{suffix}.{ext}"))
+        } else {
+            meta::exports_dir(&self.clips_dir).join(format!("{stem}-{preset_name}{suffix}.{ext}"))
+        };
         let input = input.to_path_buf();
         let tx = self.export_tx.clone();
         let ctx = ctx.clone();
@@ -807,6 +819,12 @@ impl eframe::App for LibraryApp {
 
         // Trim editor takes over the whole window when open.
         if let Some(ed) = self.editor.as_mut() {
+            // Surface export progress inside the editor chrome.
+            let prog = self
+                .exports
+                .get(ed.clip())
+                .map(|j| *lock_tolerant(&j.progress));
+            ed.set_export_progress(prog);
             self.watchdog.beat("editor");
             let wd = self.watchdog.clone();
             match ed.ui(ctx, &wd) {
@@ -817,14 +835,42 @@ impl eframe::App for LibraryApp {
                     trim,
                     segments,
                     mute,
+                    speed,
                 } => {
                     let clip = ed.clip().clone();
                     let stem = clip
                         .file_stem()
                         .map(|s| s.to_string_lossy().to_string())
                         .unwrap_or_else(|| "clip".to_string());
-                    self.run_export(&clip, &stem, &stem, preset, trim, segments, mute, ctx);
-                    self.editor = None;
+                    self.run_export(
+                        &clip, &stem, &stem, preset, trim, segments, mute, speed, false, ctx,
+                    );
+                    // Keep the editor open so progress shows on the export bar.
+                }
+                EditorAction::SaveAsClip {
+                    trim,
+                    segments,
+                    mute,
+                    speed,
+                } => {
+                    let clip = ed.clip().clone();
+                    let stem = clip
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "clip".to_string());
+                    // Prefer stream-copy when possible; re-encode when cuts or
+                    // non-1× speed force it.
+                    let needs_reencode = segments.is_some() || (speed - 1.0).abs() > 0.01;
+                    let preset = if needs_reencode {
+                        Preset::HighQuality
+                    } else {
+                        Preset::Source
+                    };
+                    self.run_export(
+                        &clip, &stem, &stem, preset, trim, segments, mute, speed,
+                        true, // land in the main clips library
+                        ctx,
+                    );
                 }
             }
             // Clips saved while editing were deferred; rescan now it's closed.

@@ -185,7 +185,11 @@ struct Shared {
     /// Playback volume as `f32` bits — atomic so the realtime audio callback
     /// never takes a lock for it.
     volume_bits: AtomicU32,
-    /// Wall-clock anchor used as the master clock when there is no audio.
+    /// Playback rate × 1000 (`1000` = 1×). Non-1× uses wall-clock master and
+    /// mutes the audio stream so video scrubbing stays frame-stable.
+    speed_milli: AtomicU32,
+    /// Wall-clock anchor used as the master clock when there is no audio, or
+    /// when speed ≠ 1×.
     play_anchor: Mutex<Option<Instant>>,
     audio_buf: Mutex<VecDeque<f32>>,
     frames: Mutex<VecDeque<Frame>>,
@@ -256,6 +260,7 @@ impl Player {
             in_secs: Mutex::new(0.0),
             out_secs: Mutex::new(duration),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
+            speed_milli: AtomicU32::new(1000),
             play_anchor: Mutex::new(None),
             audio_buf: Mutex::new(VecDeque::new()),
             frames: Mutex::new(VecDeque::new()),
@@ -372,6 +377,36 @@ impl Player {
             .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
+    /// Playback rate (`0.25`…`2.0`). Non-1× uses a wall-clock master and holds
+    /// the audio stream so the preview stays lip-free but frame-stable.
+    pub fn set_speed(&mut self, speed: f32) {
+        let speed = speed.clamp(0.25, 2.0);
+        let milli = (speed * 1000.0).round() as u32;
+        let pos = self.position();
+        self.shared.speed_milli.store(milli, Ordering::Relaxed);
+        *lock_tolerant(&self.shared.seek_base) = pos;
+        self.shared.samples_played.store(0, Ordering::Relaxed);
+        if self.is_playing() {
+            if self.uses_wall_clock() {
+                if let Some(s) = &self._stream {
+                    let _ = s.pause();
+                }
+                *lock_tolerant(&self.shared.play_anchor) = Some(Instant::now());
+            } else if let Some(s) = &self._stream {
+                let _ = s.play();
+                *lock_tolerant(&self.shared.play_anchor) = None;
+            }
+        }
+    }
+
+    pub fn speed(&self) -> f32 {
+        self.shared.speed_milli.load(Ordering::Relaxed) as f32 / 1000.0
+    }
+
+    fn uses_wall_clock(&self) -> bool {
+        !self.has_audio() || self.shared.speed_milli.load(Ordering::Relaxed) != 1000
+    }
+
     pub fn set_range(&self, in_s: f64, out_s: f64) {
         *lock_tolerant(&self.shared.in_secs) = in_s;
         *lock_tolerant(&self.shared.out_secs) = out_s;
@@ -380,16 +415,17 @@ impl Player {
     /// Current playback position in seconds (the master clock).
     pub fn position(&self) -> f64 {
         let base = *lock_tolerant(&self.shared.seek_base);
-        if self.has_audio() {
+        let speed = self.shared.speed_milli.load(Ordering::Relaxed) as f64 / 1000.0;
+        if self.uses_wall_clock() {
+            match *lock_tolerant(&self.shared.play_anchor) {
+                Some(t0) => (base + t0.elapsed().as_secs_f64() * speed).min(self.duration),
+                None => base,
+            }
+        } else {
             let sr = self.shared.sample_rate.load(Ordering::Relaxed).max(1) as f64;
             let ch = self.shared.channels.load(Ordering::Relaxed).max(1) as f64;
             let played = self.shared.samples_played.load(Ordering::Relaxed) as f64;
             (base + played / (sr * ch)).min(self.duration)
-        } else {
-            match *lock_tolerant(&self.shared.play_anchor) {
-                Some(t0) => (base + t0.elapsed().as_secs_f64()).min(self.duration),
-                None => base,
-            }
         }
     }
 
@@ -401,7 +437,7 @@ impl Player {
         // Drive repaints until the seeked frame is shown (then we idle if paused).
         self.needs_frame = true;
         self.eof_settle_ticks = 0;
-        if !self.has_audio() {
+        if self.uses_wall_clock() {
             let playing = self.is_playing();
             *lock_tolerant(&self.shared.play_anchor) = playing.then(Instant::now);
         }
@@ -415,25 +451,27 @@ impl Player {
             self.seek(i);
         }
         self.shared.playing.store(true, Ordering::Release);
-        if self.has_audio() {
+        if self.uses_wall_clock() {
+            // Non-1× (or silent clips): wall clock drives the master; keep
+            // audio paused so speed changes don't desync A/V.
             if let Some(s) = &self._stream {
-                let _ = s.play();
+                let _ = s.pause();
             }
-        } else {
             *lock_tolerant(&self.shared.play_anchor) = Some(Instant::now());
+        } else if let Some(s) = &self._stream {
+            let _ = s.play();
+            *lock_tolerant(&self.shared.play_anchor) = None;
         }
     }
 
     pub fn pause(&mut self) {
-        if self.has_audio() {
-            if let Some(s) = &self._stream {
-                let _ = s.pause();
-            }
-        } else {
-            // Freeze the wall clock at the current position.
-            let pos = self.position();
-            *lock_tolerant(&self.shared.seek_base) = pos;
-            *lock_tolerant(&self.shared.play_anchor) = None;
+        // Freeze the master clock at the current position.
+        let pos = self.position();
+        *lock_tolerant(&self.shared.seek_base) = pos;
+        self.shared.samples_played.store(0, Ordering::Relaxed);
+        *lock_tolerant(&self.shared.play_anchor) = None;
+        if let Some(s) = &self._stream {
+            let _ = s.pause();
         }
         self.shared.playing.store(false, Ordering::Release);
     }

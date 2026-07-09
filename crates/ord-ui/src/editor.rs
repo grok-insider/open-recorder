@@ -36,6 +36,15 @@ pub enum EditorAction {
         /// it supersedes `trim` and the pieces are concatenated on export.
         segments: Option<Vec<Trim>>,
         mute: bool,
+        /// Preview/export rate (`0.25`…`2.0`).
+        speed: f32,
+    },
+    /// Write the selection into the clips library (stream-copy when possible).
+    SaveAsClip {
+        trim: Option<Trim>,
+        segments: Option<Vec<Trim>>,
+        mute: bool,
+        speed: f32,
     },
 }
 
@@ -55,6 +64,8 @@ pub struct EditorState {
     strip: Vec<Option<egui::TextureHandle>>,
     debug: bool,
     dbg_log_at: Instant,
+    /// In-flight export progress from the library shell (`None` = idle).
+    export_progress: Option<f32>,
 }
 
 impl EditorState {
@@ -82,11 +93,17 @@ impl EditorState {
             strip: vec![None; FILMSTRIP_TILES],
             debug: crate::tuning::debug_overlay(),
             dbg_log_at: Instant::now(),
+            export_progress: None,
         })
     }
 
     pub fn clip(&self) -> &PathBuf {
         &self.clip
+    }
+
+    /// Feed export progress from the app (library shell owns the job).
+    pub fn set_export_progress(&mut self, progress: Option<f32>) {
+        self.export_progress = progress;
     }
 
     /// Pause playback (used when the window loses focus / is hidden).
@@ -529,6 +546,30 @@ impl EditorState {
                 }
             }
 
+            ui.separator();
+            ui.label("Speed").on_hover_text(
+                "Preview rate (0.25×–2×). Audio is held when not 1× so frames stay stable.",
+            );
+            let mut speed = self.project.speed;
+            let speed_slider = ui.add(
+                egui::Slider::new(&mut speed, 0.25..=2.0)
+                    .fixed_decimals(2)
+                    .suffix("×"),
+            );
+            if speed_slider.changed() {
+                self.project.set_speed(speed);
+                self.player.set_speed(self.project.speed);
+            }
+            for (label, s) in [("½×", 0.5f32), ("1×", 1.0), ("2×", 2.0)] {
+                if ui
+                    .selectable_label((self.project.speed - s).abs() < 0.01, label)
+                    .clicked()
+                {
+                    self.project.set_speed(s);
+                    self.player.set_speed(self.project.speed);
+                }
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let pos = self.player.position();
                 ui.monospace(format!(
@@ -621,6 +662,15 @@ impl EditorState {
                     .clicked()
                 {
                     self.undo_cut_edit();
+                }
+            });
+            ui.add_enabled_ui(self.project.history.can_redo(), |ui| {
+                if ui
+                    .button("↷ Redo")
+                    .on_hover_text("Redo the last cut change (Ctrl+Shift+Z / Ctrl+Y)")
+                    .clicked()
+                {
+                    self.project.redo_cut();
                 }
             });
             if !self.project.segments.is_trivial()
@@ -1176,18 +1226,55 @@ impl EditorState {
             }
             ui.add_space(12.0);
             ui.checkbox(&mut self.project.mute_export, "Mute audio");
+            if let Some(p) = self.export_progress {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!("Exporting… {}%", (p * 100.0) as u32))
+                        .color(crate::theme::KIN),
+                );
+                ui.add(
+                    egui::ProgressBar::new(p.clamp(0.0, 1.0))
+                        .desired_width(120.0)
+                        .show_percentage(),
+                );
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let trim = self.current_trim();
+                let segments = self.export_segments();
+                let mute = self.project.mute_export;
+                let speed = self.project.speed;
+                let empty_cuts = segments.as_ref().is_some_and(|s| s.is_empty());
+                let can_save = !empty_cuts && self.export_progress.is_none();
+
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Save as clip"))
+                    .on_hover_text(
+                        "Write the selection into the clips library (stream-copy when \
+                         possible; re-encodes when cuts or non-1× speed require it)",
+                    )
+                    .on_disabled_hover_text(if empty_cuts {
+                        "Every piece is cut — nothing to save"
+                    } else {
+                        "An export is already running"
+                    })
+                    .clicked()
+                {
+                    *action = EditorAction::SaveAsClip {
+                        trim,
+                        segments: segments.clone(),
+                        mute,
+                        speed,
+                    };
+                }
+
                 ui.menu_button(egui::RichText::new("Export selection").strong(), |ui| {
-                    let trim = self.current_trim();
-                    let segments = self.export_segments();
-                    let mute = self.project.mute_export;
                     let dur = if cuts_active {
                         kept
                     } else {
                         self.project.timeline.selection_duration()
-                    };
-                    if segments.as_ref().is_some_and(|s| s.is_empty()) {
+                    } / self.project.speed.max(0.25) as f64;
+                    if empty_cuts {
                         ui.label(
                             egui::RichText::new("Every piece is cut — nothing to export")
                                 .color(crate::theme::KIN),
@@ -1197,12 +1284,19 @@ impl EditorState {
                     for preset in Preset::ALL {
                         // Joining cuts re-encodes through the concat filter, so
                         // stream-copy / GIF / audio presets need a whole clip.
-                        let unsupported = segments.is_some()
-                            && matches!(preset, Preset::Source | Preset::Gif | Preset::AudioOnly);
+                        // Speed ≠ 1× also forces re-encode (setpts/atempo).
+                        let unsupported = (segments.is_some()
+                            && matches!(preset, Preset::Source | Preset::Gif | Preset::AudioOnly))
+                            || ((speed - 1.0).abs() > 0.01
+                                && matches!(
+                                    preset,
+                                    Preset::Source | Preset::Gif | Preset::AudioOnly
+                                ));
                         // Size-predictable presets show an honest estimate from
                         // the planner's own bitrate math.
                         let mut profile = preset.profile();
                         profile.mute = mute;
+                        profile.speed = speed as f64;
                         let label = match ord_export::estimated_output_mib(&profile, dur) {
                             Some(est) if est > 0.0 => {
                                 format!("{}  (~{est:.1} MiB)", preset.label())
@@ -1212,7 +1306,7 @@ impl EditorState {
                         let btn = ui.add_enabled(!unsupported, egui::Button::new(label));
                         let btn = if unsupported {
                             btn.on_disabled_hover_text(
-                                "Not available with cuts (joining pieces re-encodes video)",
+                                "Not available with cuts or non-1× speed (re-encode required)",
                             )
                         } else {
                             btn
@@ -1223,6 +1317,7 @@ impl EditorState {
                                 trim,
                                 segments: segments.clone(),
                                 mute,
+                                speed,
                             };
                             ui.close_menu();
                         }

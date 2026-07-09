@@ -211,20 +211,53 @@ fn scale_filter(scale: Scale, src: &SourceInfo) -> Option<String> {
     }
 }
 
+/// Combined `-vf` chain: optional scale + optional setpts for playback speed.
+fn video_filter_chain(profile: &ExportProfile, src: &SourceInfo) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(s) = scale_filter(profile.scale, src) {
+        parts.push(s);
+    }
+    if (profile.speed - 1.0).abs() > 0.01 {
+        // PTS/speed: 2.0 → half the presentation timestamps → twice as fast.
+        parts.push(format!("setpts=PTS/{:.6}", profile.speed.clamp(0.25, 2.0)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
+}
+
+/// Audio filters for speed (`atempo` is limited to 0.5…2.0) and loudnorm.
+fn audio_filter_chain(profile: &ExportProfile) -> Option<String> {
+    let mut parts = Vec::new();
+    if (profile.speed - 1.0).abs() > 0.01 {
+        parts.push(format!("atempo={:.6}", profile.speed.clamp(0.5, 2.0)));
+    }
+    if profile.normalize_audio {
+        parts.push("loudnorm".into());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
+    }
+}
+
 /// Audio output flags for a re-encode (the copy path sets `-c copy` globally).
 fn audio_args(profile: &ExportProfile, src: &SourceInfo) -> Vec<String> {
     if profile.mute || !src.has_audio {
         return vec!["-an".into()];
     }
-    // Target-size must control audio size, and loudnorm is a filter, so both
-    // force a transcode (you can't filter or re-bitrate a copied stream).
-    let force_transcode =
-        matches!(profile.rate_control, RateControl::TargetSize { .. }) || profile.normalize_audio;
+    // Target-size must control audio size, and filters (loudnorm / atempo) force
+    // a transcode (you can't filter a copied stream).
+    let force_transcode = matches!(profile.rate_control, RateControl::TargetSize { .. })
+        || audio_filter_chain(profile).is_some();
     let kbps = profile.audio_kbps.max(1);
     let mut a = Vec::new();
-    if profile.normalize_audio {
+    if let Some(af) = audio_filter_chain(profile) {
         a.push("-af".into());
-        a.push("loudnorm".into());
+        a.push(af);
     }
     match profile.container {
         Container::Mkv => {
@@ -413,7 +446,7 @@ pub fn build_plan(
 
     let encoder = encoder_name(profile.codec, hardware);
 
-    if let Some(vf) = scale_filter(profile.scale, src) {
+    if let Some(vf) = video_filter_chain(profile, src) {
         args.push("-vf".into());
         args.push(vf);
     }
@@ -422,13 +455,16 @@ pub fn build_plan(
         args.push(f.to_string());
     }
 
+    // Speed changes wall-clock duration of the content.
+    let effective_duration = duration / profile.speed.clamp(0.25, 2.0);
+
     args.push("-c:v".into());
     args.push(encoder.into());
     args.extend(preset_args(encoder));
     args.extend(rate_control_args(
         encoder,
         profile.rate_control,
-        duration,
+        effective_duration,
         src.has_audio,
         profile.audio_kbps,
     ));
@@ -532,14 +568,25 @@ pub fn build_segments_plan(
         filter.push_str("[ac]");
         aout = "[ac]".to_string();
     }
-    if let Some(vf) = scale_filter(profile.scale, src) {
-        filter.push_str(&format!(";[vc]{vf}[vs]"));
-        vout = "[vs]".to_string();
+    {
+        let mut vparts = Vec::new();
+        if let Some(s) = scale_filter(profile.scale, src) {
+            vparts.push(s);
+        }
+        if (profile.speed - 1.0).abs() > 0.01 {
+            vparts.push(format!("setpts=PTS/{:.6}", profile.speed.clamp(0.25, 2.0)));
+        }
+        if !vparts.is_empty() {
+            filter.push_str(&format!(";[vc]{}[vs]", vparts.join(",")));
+            vout = "[vs]".to_string();
+        }
     }
-    if with_audio && profile.normalize_audio {
-        // -af cannot coexist with -filter_complex; fold loudnorm in here.
-        filter.push_str(";[ac]loudnorm[an]");
-        aout = "[an]".to_string();
+    if with_audio {
+        if let Some(af) = audio_filter_chain(profile) {
+            // -af cannot coexist with -filter_complex; fold into the graph.
+            filter.push_str(&format!(";[ac]{af}[an]"));
+            aout = "[an]".to_string();
+        }
     }
 
     let mut args: Vec<String> = vec![
@@ -824,6 +871,16 @@ mod tests {
         s.has_audio = false;
         let p = ExportProfile::audio_only(Container::Mkv);
         assert!(build_plan("i", "o", &p, &s, None, true).is_err());
+    }
+
+    #[test]
+    fn speed_forces_setpts_and_atempo() {
+        let mut p = ExportProfile::high_quality();
+        p.speed = 2.0;
+        let s = joined(&build_plan("in.mkv", "o.mp4", &p, &src(), None, true).unwrap());
+        assert!(s.contains("setpts=PTS/2"), "{s}");
+        assert!(s.contains("atempo=2"), "{s}");
+        assert!(p.reencodes());
     }
 
     #[test]

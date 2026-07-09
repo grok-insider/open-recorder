@@ -97,6 +97,14 @@ pub struct ExportProfile {
     /// Apply EBU R128 loudness normalization (`-af loudnorm`) to the audio.
     #[serde(default)]
     pub normalize_audio: bool,
+    /// Playback rate for the export (`0.25`…`2.0`, default `1.0`). Applied via
+    /// `setpts`/`atempo` and forces a re-encode when not 1.0.
+    #[serde(default = "default_speed")]
+    pub speed: f64,
+}
+
+fn default_speed() -> f64 {
+    1.0
 }
 
 impl Default for ExportProfile {
@@ -120,6 +128,7 @@ impl ExportProfile {
             mute: false,
             output: Output::Video,
             normalize_audio: false,
+            speed: 1.0,
         }
     }
 
@@ -137,6 +146,7 @@ impl ExportProfile {
             mute: false,
             output: Output::Video,
             normalize_audio: false,
+            speed: 1.0,
         }
     }
 
@@ -155,6 +165,7 @@ impl ExportProfile {
             mute: false,
             output: Output::Video,
             normalize_audio: false,
+            speed: 1.0,
         }
     }
 
@@ -173,6 +184,7 @@ impl ExportProfile {
             mute: false,
             output: Output::Video,
             normalize_audio: false,
+            speed: 1.0,
         }
     }
 
@@ -191,6 +203,7 @@ impl ExportProfile {
             mute: false,
             output: Output::Video,
             normalize_audio: false,
+            speed: 1.0,
         }
     }
 
@@ -207,6 +220,7 @@ impl ExportProfile {
             mute: false,
             output: Output::AudioOnly,
             normalize_audio: false,
+            speed: 1.0,
         }
     }
 
@@ -224,6 +238,7 @@ impl ExportProfile {
             mute: true,
             output: Output::Gif,
             normalize_audio: false,
+            speed: 1.0,
         }
     }
 
@@ -241,12 +256,14 @@ impl ExportProfile {
             mute: false,
             output: Output::Video,
             normalize_audio: false,
+            speed: 1.0,
         }
     }
 
     /// Whether this profile re-encodes the video (vs. a pure stream copy).
     pub fn reencodes(&self) -> bool {
-        self.output == Output::Video && self.rate_control != RateControl::Copy
+        self.output == Output::Video
+            && (self.rate_control != RateControl::Copy || (self.speed - 1.0).abs() > 0.01)
     }
 
     /// The output file extension (no dot) this profile should write to. Video
