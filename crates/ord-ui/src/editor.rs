@@ -18,7 +18,8 @@ use ord_export::{Preset, Trim};
 use crate::format::{human_duration, human_duration_ms};
 use crate::player::{DecKind, Player, PreviewFrame};
 use crate::prefs::{self, EditorPrefs};
-use crate::timeline::{self, DragTarget, Segments, Timeline, View};
+use crate::project::EditorProject;
+use crate::timeline::{self, DragTarget, Segments, View};
 
 const FILMSTRIP_TILES: usize = 14;
 /// Snap radius (px) for markers under the in/out/playhead drags and clicks.
@@ -43,17 +44,10 @@ pub struct EditorState {
     clip: PathBuf,
     label: String,
     player: Player,
-    timeline: Timeline,
-    segments: Segments,
-    /// Snapshots for Ctrl+Z over cut edits (split/toggle/join/move/reset).
-    undo: Vec<Segments>,
-    zoom: f32,
-    scroll: f32,
-    markers: Vec<f64>,
+    /// Pure domain (timeline, cuts, markers, history, mute/volume/zoom).
+    project: EditorProject,
     /// Chapters probed off-thread land here (the clip's `ord mark` bookmarks).
     chapters_rx: Receiver<Vec<f64>>,
-    mute_export: bool,
-    volume: f32,
     drag: Option<DragTarget>,
     /// Pre-drag snapshot for a cut-line drag (one undo entry per drag).
     drag_undo: Option<Segments>,
@@ -73,23 +67,15 @@ impl EditorState {
         if crate::tuning::autoplay() {
             player.play();
         }
-        let timeline = Timeline::new(player.duration());
-        let segments = Segments::new(player.duration());
+        let project = EditorProject::new(player.duration(), saved.volume);
         let strip_rx = spawn_filmstrip(&clip, player.duration(), ctx.clone());
         let chapters_rx = spawn_chapters(&clip, ctx.clone());
         Ok(Self {
             clip,
             label,
             player,
-            timeline,
-            segments,
-            undo: Vec::new(),
-            zoom: 1.0,
-            scroll: 0.0,
-            markers: Vec::new(),
+            project,
             chapters_rx,
-            mute_export: false,
-            volume: saved.volume,
             drag: None,
             drag_undo: None,
             strip_rx,
@@ -111,42 +97,25 @@ impl EditorState {
     }
 
     fn seek_to(&mut self, t: f64) {
-        self.timeline.set_playhead(t);
+        self.project.timeline.set_playhead(t);
         self.player.seek(t);
-    }
-
-    fn push_undo(&mut self, snapshot: Segments) {
-        const MAX_UNDO: usize = 64;
-        self.undo.push(snapshot);
-        if self.undo.len() > MAX_UNDO {
-            self.undo.remove(0);
-        }
     }
 
     /// Run a cut mutation with undo: the previous state is kept only when the
     /// mutation reports an actual change.
     fn edit_cuts(&mut self, f: impl FnOnce(&mut Segments) -> bool) {
-        let snapshot = self.segments.clone();
-        if f(&mut self.segments) {
-            self.push_undo(snapshot);
-        }
+        self.project.edit_cuts(f);
     }
 
     /// Revert the most recent cut edit (Ctrl+Z / the Undo button).
     fn undo_cut_edit(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            self.segments = prev;
-        }
+        self.project.undo_cut();
     }
 
     /// Place a marker at the playhead (deduplicated, kept sorted).
     fn add_marker(&mut self) {
-        let ph = self.timeline.playhead();
-        if !self.markers.iter().any(|m| (m - ph).abs() < 1e-3) {
-            self.markers.push(ph);
-            self.markers
-                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        }
+        let ph = self.project.timeline.playhead();
+        self.project.markers.add(ph);
     }
 
     /// Render the editor; returns the action the user took (if any).
@@ -160,25 +129,25 @@ impl EditorState {
         }
         // The clip's chapters (`ord mark` bookmarks) arrive as markers.
         while let Ok(chapters) = self.chapters_rx.try_recv() {
-            for t in chapters {
-                if !self.markers.iter().any(|m| (m - t).abs() < 1e-3) {
-                    self.markers.push(t);
-                }
-            }
-            self.markers
-                .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            self.project.markers.extend(chapters);
         }
 
         // Player drives the playhead during playback; keep its range in sync.
-        self.player
-            .set_range(self.timeline.in_point(), self.timeline.out_point());
+        self.player.set_range(
+            self.project.timeline.in_point(),
+            self.project.timeline.out_point(),
+        );
         if self.player.is_playing() {
-            self.timeline.set_playhead(self.player.position());
+            self.project.timeline.set_playhead(self.player.position());
             // Cut segments are skipped live, so the preview plays exactly what
             // an export would contain.
-            if !self.segments.is_trivial() {
-                let pos = self.timeline.playhead();
-                if let Some(target) = self.segments.skip_target(pos, self.timeline.out_point()) {
+            if !self.project.segments.is_trivial() {
+                let pos = self.project.timeline.playhead();
+                if let Some(target) = self
+                    .project
+                    .segments
+                    .skip_target(pos, self.project.timeline.out_point())
+                {
                     self.seek_to(target);
                 }
             }
@@ -287,16 +256,20 @@ impl EditorState {
                 i.key_pressed(egui::Key::Escape),
             )
         });
-        let (split, toggle_seg, prev_marker, next_marker, join, undo_key) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::S),
-                i.key_pressed(egui::Key::X),
-                i.key_pressed(egui::Key::OpenBracket),
-                i.key_pressed(egui::Key::CloseBracket),
-                i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete),
-                i.modifiers.command && i.key_pressed(egui::Key::Z),
-            )
-        });
+        let (split, toggle_seg, prev_marker, next_marker, join, undo_key, redo_key) =
+            ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::S),
+                    i.key_pressed(egui::Key::X),
+                    i.key_pressed(egui::Key::OpenBracket),
+                    i.key_pressed(egui::Key::CloseBracket),
+                    i.key_pressed(egui::Key::Backspace) || i.key_pressed(egui::Key::Delete),
+                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                    i.modifiers.command
+                        && (i.modifiers.shift && i.key_pressed(egui::Key::Z)
+                            || i.key_pressed(egui::Key::Y)),
+                )
+            });
 
         if esc {
             return EditorAction::Back;
@@ -304,14 +277,14 @@ impl EditorState {
         if space {
             self.player.toggle();
         }
-        let ph = self.timeline.playhead();
+        let ph = self.project.timeline.playhead();
         if key_i {
-            self.timeline.set_in(ph);
-            self.seek_to(self.timeline.in_point());
+            self.project.timeline.set_in(ph);
+            self.seek_to(self.project.timeline.in_point());
         }
         if key_o {
-            self.timeline.set_out(ph);
-            self.seek_to(self.timeline.out_point());
+            self.project.timeline.set_out(ph);
+            self.seek_to(self.project.timeline.out_point());
         }
         let frame = 1.0 / self.player.fps().max(1.0);
         if left {
@@ -327,16 +300,16 @@ impl EditorState {
             self.seek_to(ph + frame);
         }
         if home {
-            self.seek_to(self.timeline.in_point());
+            self.seek_to(self.project.timeline.in_point());
         }
         if end {
-            self.seek_to(self.timeline.out_point());
+            self.seek_to(self.project.timeline.out_point());
         }
         if plus {
-            self.zoom = (self.zoom * 1.5).min(60.0);
+            self.project.zoom = (self.project.zoom * 1.5).min(60.0);
         }
         if minus {
-            self.zoom = (self.zoom / 1.5).max(1.0);
+            self.project.zoom = (self.project.zoom / 1.5).max(1.0);
         }
         if mkey && !shift {
             self.add_marker();
@@ -366,6 +339,9 @@ impl EditorState {
         if undo_key {
             self.undo_cut_edit();
         }
+        if redo_key {
+            self.project.redo_cut();
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::F3)) {
             self.debug = !self.debug;
         }
@@ -374,39 +350,17 @@ impl EditorState {
 
     /// The nearest marker strictly before `t`.
     fn prev_marker(&self, t: f64) -> Option<f64> {
-        self.markers
-            .iter()
-            .copied()
-            .filter(|m| *m < t - 1e-3)
-            .fold(None, |acc: Option<f64>, m| {
-                Some(acc.map_or(m, |a| a.max(m)))
-            })
+        self.project.markers.prev(t)
     }
 
     /// The nearest marker strictly after `t`.
     fn next_marker(&self, t: f64) -> Option<f64> {
-        self.markers
-            .iter()
-            .copied()
-            .filter(|m| *m > t + 1e-3)
-            .fold(None, |acc: Option<f64>, m| {
-                Some(acc.map_or(m, |a| a.min(m)))
-            })
+        self.project.markers.next(t)
     }
 
     /// Remove the marker closest to `t` (within a second), e.g. a misplaced M.
     fn remove_nearest_marker(&mut self, t: f64) {
-        let nearest = self
-            .markers
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (i, (m - t).abs()))
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        if let Some((i, d)) = nearest {
-            if d <= 1.0 {
-                self.markers.remove(i);
-            }
-        }
+        self.project.markers.remove_nearest(t, 1.0);
     }
 
     /// Debug overlay + throttled log to `/tmp/ord-ui-debug.log` (toggle: F3 or
@@ -431,7 +385,7 @@ impl EditorState {
                     ui.monospace(format!(
                         "decoder {}  src_fps {fps:.2}  zoom {:.1}",
                         s.decoder.label(),
-                        self.zoom
+                        self.project.zoom
                     ));
                     ui.monospace("F3: toggle debug");
                 });
@@ -513,14 +467,14 @@ impl EditorState {
                 .on_hover_text("Jump to in (Home)")
                 .clicked()
             {
-                self.seek_to(self.timeline.in_point());
+                self.seek_to(self.project.timeline.in_point());
             }
             if ui
                 .button("−1f")
                 .on_hover_text("Previous frame (,)")
                 .clicked()
             {
-                self.seek_to(self.timeline.playhead() - frame);
+                self.seek_to(self.project.timeline.playhead() - frame);
             }
             let play_label = if self.player.is_playing() {
                 "⏸ Pause"
@@ -534,14 +488,14 @@ impl EditorState {
                 self.player.toggle();
             }
             if ui.button("+1f").on_hover_text("Next frame (.)").clicked() {
-                self.seek_to(self.timeline.playhead() + frame);
+                self.seek_to(self.project.timeline.playhead() + frame);
             }
             if ui
                 .button("Out ⏭")
                 .on_hover_text("Jump to out (End)")
                 .clicked()
             {
-                self.seek_to(self.timeline.out_point());
+                self.seek_to(self.project.timeline.out_point());
             }
 
             ui.separator();
@@ -550,7 +504,7 @@ impl EditorState {
                 looping = !looping;
                 self.player.set_loop(looping);
                 let _ = prefs::save(EditorPrefs {
-                    volume: self.volume,
+                    volume: self.project.volume,
                     looping,
                 });
             }
@@ -559,17 +513,17 @@ impl EditorState {
                 ui.separator();
                 ui.label("Vol");
                 let slider = ui.add(
-                    egui::Slider::new(&mut self.volume, 0.0..=1.0)
+                    egui::Slider::new(&mut self.project.volume, 0.0..=1.0)
                         .show_value(false)
                         .fixed_decimals(2),
                 );
                 if slider.changed() {
-                    self.player.set_volume(self.volume);
+                    self.player.set_volume(self.project.volume);
                 }
                 // Persist once the adjustment settles, not per drag tick.
                 if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
                     let _ = prefs::save(EditorPrefs {
-                        volume: self.volume,
+                        volume: self.project.volume,
                         looping: self.player.looping(),
                     });
                 }
@@ -603,7 +557,7 @@ impl EditorState {
     /// button (split / cut / marker / zoom), so nothing is keyboard-only.
     fn tools_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let ph = self.timeline.playhead();
+            let ph = self.project.timeline.playhead();
             if ui
                 .button("✂ Split")
                 .on_hover_text(
@@ -615,9 +569,10 @@ impl EditorState {
                 self.edit_cuts(|s| s.split_at(ph));
             }
             let piece_cut = self
+                .project
                 .segments
                 .index_at(ph)
-                .map(|i| !self.segments.segments()[i].enabled)
+                .map(|i| !self.project.segments.segments()[i].enabled)
                 .unwrap_or(false);
             let toggle_label = if piece_cut {
                 "↩ Keep piece"
@@ -634,7 +589,7 @@ impl EditorState {
             {
                 self.edit_cuts(|s| s.toggle_at(ph));
             }
-            let has_selection = !self.timeline.is_full();
+            let has_selection = !self.project.timeline.is_full();
             let cut_range = ui.add_enabled(has_selection, egui::Button::new("✕ Cut In→Out"));
             let cut_range = if has_selection {
                 cut_range.on_hover_text(
@@ -648,15 +603,18 @@ impl EditorState {
                 )
             };
             if cut_range.clicked() {
-                let (a, b) = (self.timeline.in_point(), self.timeline.out_point());
+                let (a, b) = (
+                    self.project.timeline.in_point(),
+                    self.project.timeline.out_point(),
+                );
                 let dur = self.player.duration();
                 self.edit_cuts(|s| s.cut_range(a, b));
-                self.timeline.set_out(dur);
-                self.timeline.set_in(0.0);
+                self.project.timeline.set_out(dur);
+                self.project.timeline.set_in(0.0);
                 self.seek_to(a);
             }
             ui.separator();
-            ui.add_enabled_ui(!self.undo.is_empty(), |ui| {
+            ui.add_enabled_ui(self.project.history.can_undo(), |ui| {
                 if ui
                     .button("↶ Undo")
                     .on_hover_text("Undo the last cut change (Ctrl+Z)")
@@ -665,7 +623,7 @@ impl EditorState {
                     self.undo_cut_edit();
                 }
             });
-            if !self.segments.is_trivial()
+            if !self.project.segments.is_trivial()
                 && ui
                     .button("Reset cuts")
                     .on_hover_text("Remove every split and keep the whole clip again")
@@ -695,26 +653,26 @@ impl EditorState {
                     .on_hover_text("Show the whole clip (zoom out fully)")
                     .clicked()
                 {
-                    self.zoom = 1.0;
-                    self.scroll = 0.0;
+                    self.project.zoom = 1.0;
+                    self.project.scroll = 0.0;
                 }
                 if ui
                     .button("+")
                     .on_hover_text("Zoom in (wheel or =)")
                     .clicked()
                 {
-                    self.zoom = (self.zoom * 1.5).min(60.0);
+                    self.project.zoom = (self.project.zoom * 1.5).min(60.0);
                 }
                 if ui
                     .button("−")
                     .on_hover_text("Zoom out (wheel or -)")
                     .clicked()
                 {
-                    self.zoom = (self.zoom / 1.5).max(1.0);
+                    self.project.zoom = (self.project.zoom / 1.5).max(1.0);
                 }
                 ui.label(
-                    egui::RichText::new(if self.zoom > 1.01 {
-                        format!("zoom {:.1}×", self.zoom)
+                    egui::RichText::new(if self.project.zoom > 1.01 {
+                        format!("zoom {:.1}×", self.project.zoom)
                     } else {
                         "zoom 1×".to_string()
                     })
@@ -749,22 +707,29 @@ impl EditorState {
                 egui::pos2(rect.right() - 4.0, rect.bottom() - 4.0),
             );
             let pan = scroll_x + if shift { scroll_y } else { 0.0 };
-            if pan != 0.0 && self.zoom > 1.0 {
-                self.scroll = (self.scroll - pan * 0.01 / self.zoom).clamp(0.0, 1.0);
+            if pan != 0.0 && self.project.zoom > 1.0 {
+                self.project.scroll =
+                    (self.project.scroll - pan * 0.01 / self.project.zoom).clamp(0.0, 1.0);
             } else if scroll_y != 0.0 && !shift {
                 let frac = pointer
                     .map(|p| {
                         ((p.x - track_guess.left()) / track_guess.width().max(1.0)).clamp(0.0, 1.0)
                     })
                     .unwrap_or(0.5);
-                let (zoom, scroll) =
-                    timeline::zoom_anchored(dur, self.zoom, self.scroll, frac, scroll_y, 60.0);
-                self.zoom = zoom;
-                self.scroll = scroll;
+                let (zoom, scroll) = timeline::zoom_anchored(
+                    dur,
+                    self.project.zoom,
+                    self.project.scroll,
+                    frac,
+                    scroll_y,
+                    60.0,
+                );
+                self.project.zoom = zoom;
+                self.project.scroll = scroll;
             }
         }
 
-        let view = View::new(dur, self.zoom, self.scroll);
+        let view = View::new(dur, self.project.zoom, self.project.scroll);
         let ruler =
             egui::Rect::from_min_max(rect.left_top(), egui::pos2(rect.right(), rect.top() + 16.0));
         let track = egui::Rect::from_min_max(
@@ -774,9 +739,9 @@ impl EditorState {
         let painter = ui.painter_at(rect);
 
         let x_of = |t: f64| track.left() + view.frac_of(t) * track.width();
-        let in_x = x_of(self.timeline.in_point());
-        let out_x = x_of(self.timeline.out_point());
-        let ph_x = x_of(self.timeline.playhead());
+        let in_x = x_of(self.project.timeline.in_point());
+        let out_x = x_of(self.project.timeline.out_point());
+        let ph_x = x_of(self.project.timeline.playhead());
 
         // Track background.
         painter.rect_filled(track, 4.0, crate::theme::RAISED);
@@ -805,8 +770,8 @@ impl EditorState {
 
         // Cut segments: heavy dim + diagonal hatch + a vermilion edge strip on
         // pieces toggled off, and a draggable grip on every cut line.
-        if !self.segments.is_trivial() {
-            for seg in self.segments.segments() {
+        if !self.project.segments.is_trivial() {
+            for seg in self.project.segments.segments() {
                 if seg.enabled {
                     continue;
                 }
@@ -857,7 +822,7 @@ impl EditorState {
             }
             // Cut lines get a grip handle mid-track: they look (and are)
             // draggable, like the trim handles. Right-click joins the pieces.
-            for cut in self.segments.cuts() {
+            for cut in self.project.segments.cuts() {
                 let x = x_of(cut);
                 if track.x_range().contains(x) {
                     painter.line_segment(
@@ -889,7 +854,7 @@ impl EditorState {
         self.paint_ruler(&painter, ruler, track, &view);
 
         // Markers: a gold line with a small flag head (click to jump to it).
-        for &m in &self.markers {
+        for &m in self.project.markers.as_slice() {
             let mx = x_of(m);
             if track.x_range().contains(mx) {
                 painter.line_segment(
@@ -961,9 +926,9 @@ impl EditorState {
                         .clamp(0.0, dur);
                     // With cuts present, lightly lift the piece under the
                     // pointer — the target of X / right-click.
-                    if !self.segments.is_trivial() {
-                        if let Some(i) = self.segments.index_at(t) {
-                            let seg = self.segments.segments()[i];
+                    if !self.project.segments.is_trivial() {
+                        if let Some(i) = self.project.segments.index_at(t) {
+                            let seg = self.project.segments.segments()[i];
                             let r = egui::Rect::from_min_max(
                                 egui::pos2(cl(x_of(seg.start)), track.top()),
                                 egui::pos2(cl(x_of(seg.end)), track.bottom()),
@@ -1016,6 +981,7 @@ impl EditorState {
         // The grab radius is bigger than the visual handle (fat-finger rule).
         const GRAB: f32 = 10.0;
         let cut_xs: Vec<(usize, f64, f32)> = self
+            .project
             .segments
             .cut_points()
             .map(|(i, t)| (i, t, x_of(t)))
@@ -1025,8 +991,8 @@ impl EditorState {
         };
         if resp.hovered() {
             if let Some(p) = ui.input(|i| i.pointer.hover_pos()) {
-                let din = (p.x - x_of(self.timeline.in_point())).abs();
-                let dout = (p.x - x_of(self.timeline.out_point())).abs();
+                let din = (p.x - x_of(self.project.timeline.in_point())).abs();
+                let dout = (p.x - x_of(self.project.timeline.out_point())).abs();
                 if din <= GRAB
                     || dout <= GRAB
                     || timeline::nearest_cut(p.x, &cut_xs, GRAB).is_some()
@@ -1040,13 +1006,13 @@ impl EditorState {
             if let Some(p) = resp.interact_pointer_pos() {
                 let target = timeline::classify_drag(
                     p.x,
-                    x_of(self.timeline.in_point()),
-                    x_of(self.timeline.out_point()),
+                    x_of(self.project.timeline.in_point()),
+                    x_of(self.project.timeline.out_point()),
                     &cut_xs,
                     GRAB,
                 );
                 if let DragTarget::Cut(_) = target {
-                    self.drag_undo = Some(self.segments.clone());
+                    self.drag_undo = Some(self.project.segments.clone());
                 }
                 self.drag = Some(target);
                 if self.player.is_playing() {
@@ -1058,20 +1024,20 @@ impl EditorState {
             if let (Some(drag), Some(p)) = (self.drag, resp.interact_pointer_pos()) {
                 // Handles, cut lines, and the playhead snap to nearby markers,
                 // so a mark placed in-game becomes a precise edit point.
-                let t = snap(&self.markers, time_at(p.x));
+                let t = snap(self.project.markers.as_slice(), time_at(p.x));
                 match drag {
                     DragTarget::In => {
-                        self.timeline.set_in(t);
-                        self.seek_to(self.timeline.in_point());
+                        self.project.timeline.set_in(t);
+                        self.seek_to(self.project.timeline.in_point());
                     }
                     DragTarget::Out => {
-                        self.timeline.set_out(t);
-                        self.seek_to(self.timeline.out_point());
+                        self.project.timeline.set_out(t);
+                        self.seek_to(self.project.timeline.out_point());
                     }
                     DragTarget::Playhead => self.seek_to(t),
                     DragTarget::Cut(i) => {
                         // The preview follows the sliding cut, frame-accurate.
-                        if let Some(applied) = self.segments.move_cut(i, t) {
+                        if let Some(applied) = self.project.segments.move_cut(i, t) {
                             self.seek_to(applied);
                         }
                     }
@@ -1080,15 +1046,15 @@ impl EditorState {
         }
         if resp.drag_stopped() {
             if let Some(snapshot) = self.drag_undo.take() {
-                if snapshot != self.segments {
-                    self.push_undo(snapshot);
+                if snapshot != self.project.segments {
+                    self.project.history.push(snapshot);
                 }
             }
             self.drag = None;
         }
         if resp.clicked() {
             if let Some(p) = resp.interact_pointer_pos() {
-                let t = snap(&self.markers, time_at(p.x));
+                let t = snap(self.project.markers.as_slice(), time_at(p.x));
                 self.seek_to(t);
             }
         }
@@ -1168,17 +1134,18 @@ impl EditorState {
     }
 
     fn export_ui(&mut self, ui: &mut egui::Ui, action: &mut EditorAction) {
-        let cuts_active = !self.segments.is_trivial();
-        let kept = self
-            .segments
-            .kept_duration(self.timeline.in_point(), self.timeline.out_point());
+        let cuts_active = !self.project.segments.is_trivial();
+        let kept = self.project.segments.kept_duration(
+            self.project.timeline.in_point(),
+            self.project.timeline.out_point(),
+        );
         ui.horizontal(|ui| {
             let weak = ui.visuals().weak_text_color();
             ui.label(egui::RichText::new("In").color(weak));
-            ui.monospace(human_duration(self.timeline.in_point()));
+            ui.monospace(human_duration(self.project.timeline.in_point()));
             ui.add_space(6.0);
             ui.label(egui::RichText::new("Out").color(weak));
-            ui.monospace(human_duration(self.timeline.out_point()));
+            ui.monospace(human_duration(self.project.timeline.out_point()));
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(if cuts_active { "Kept" } else { "Selection" }).color(weak),
@@ -1186,11 +1153,12 @@ impl EditorState {
             ui.monospace(human_duration(if cuts_active {
                 kept
             } else {
-                self.timeline.selection_duration()
+                self.project.timeline.selection_duration()
             }));
             if cuts_active {
                 ui.add_space(6.0);
                 let removed = self
+                    .project
                     .segments
                     .segments()
                     .iter()
@@ -1207,17 +1175,17 @@ impl EditorState {
                 );
             }
             ui.add_space(12.0);
-            ui.checkbox(&mut self.mute_export, "Mute audio");
+            ui.checkbox(&mut self.project.mute_export, "Mute audio");
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button(egui::RichText::new("Export selection").strong(), |ui| {
                     let trim = self.current_trim();
                     let segments = self.export_segments();
-                    let mute = self.mute_export;
+                    let mute = self.project.mute_export;
                     let dur = if cuts_active {
                         kept
                     } else {
-                        self.timeline.selection_duration()
+                        self.project.timeline.selection_duration()
                     };
                     if segments.as_ref().is_some_and(|s| s.is_empty()) {
                         ui.label(
@@ -1265,12 +1233,12 @@ impl EditorState {
     }
 
     fn current_trim(&self) -> Option<Trim> {
-        if self.timeline.is_full() {
+        if self.project.timeline.is_full() {
             None
         } else {
             Some(Trim {
-                start_secs: self.timeline.in_point(),
-                end_secs: self.timeline.out_point(),
+                start_secs: self.project.timeline.in_point(),
+                end_secs: self.project.timeline.out_point(),
             })
         }
     }
@@ -1278,9 +1246,9 @@ impl EditorState {
     /// The cut list for export (see [`timeline::export_spans`]).
     fn export_segments(&self) -> Option<Vec<Trim>> {
         timeline::export_spans(
-            &self.segments,
-            self.timeline.in_point(),
-            self.timeline.out_point(),
+            &self.project.segments,
+            self.project.timeline.in_point(),
+            self.project.timeline.out_point(),
         )
         .map(|spans| {
             spans

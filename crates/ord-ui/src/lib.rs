@@ -1,14 +1,17 @@
 //! open-recorder clip library GUI.
 //!
 //! The pure models ([`library`] discover/sort, [`timeline`] trim math,
-//! [`settings`] config editing, [`pace`] player demux pacing) are always
-//! available and tested. The egui views (`app`, `editor`, `settings_view`,
-//! behind the `gui` feature) render from them through the [`theme`] design
-//! system.
+//! [`markers`] / [`edit_history`] / [`project`] editor domain, [`settings`]
+//! config editing, [`pace`] player demux pacing) are always available and
+//! tested. The egui views (`app`, `editor`, `settings_view`, behind the `gui`
+//! feature) render from them through the [`theme`] design system.
 
+pub mod edit_history;
 pub mod format;
 pub mod library;
+pub mod markers;
 pub mod pace;
+pub mod project;
 pub mod settings;
 pub mod timeline;
 
