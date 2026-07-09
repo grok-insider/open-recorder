@@ -11,10 +11,13 @@
 use std::sync::mpsc::{channel, Receiver};
 
 use eframe::egui;
-use ord_common::config::{CaptureCodec, Container, ExportCodec, PressedKeysPosition, Quality};
-use ord_common::Config;
+use ord_common::config::{
+    CaptureCodec, ColorRange, Container, EncoderTune, ExportCodec, FpsMode, FramerateMode,
+    PressedKeysPosition, Quality, ReplayStorage, Resolution,
+};
+use ord_common::{Config, OutputInfo};
 
-use crate::settings::{ApplyTier, SettingsModel};
+use crate::settings::{capture_summary, ApplyTier, CaptureProfile, SettingsModel};
 use crate::theme;
 
 /// Fixed label column so every control starts on the same vertical line.
@@ -50,20 +53,33 @@ enum BrowseMsg {
 /// Settings page state: the model arrives asynchronously (`GetConfig` reply).
 pub struct SettingsView {
     pub model: Option<SettingsModel>,
+    /// Connected displays from the last `ListOutputs` reply (may be empty).
+    pub outputs: Vec<OutputInfo>,
     /// An apply is in flight; disable the footer until the daemon replies.
     pub busy: bool,
     /// Last daemon error for this page, shown inline.
     pub error: Option<String>,
+    /// Advanced capture knobs collapsed by default.
+    advanced_open: bool,
     /// An external file/folder dialog in flight (its result lands here).
     browse: Option<(BrowseTarget, Receiver<BrowseMsg>)>,
+}
+
+/// Side-channel actions the form needs from the app (beyond Apply/Back).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsExtra {
+    /// Re-probe displays (`Command::ListOutputs`).
+    RefreshOutputs,
 }
 
 impl SettingsView {
     pub fn new() -> Self {
         Self {
             model: None,
+            outputs: Vec::new(),
             busy: false,
             error: None,
+            advanced_open: false,
             browse: None,
         }
     }
@@ -76,6 +92,11 @@ impl SettingsView {
             Some(m) => m.applied(effective, base),
             None => self.model = Some(SettingsModel::new(effective, base)),
         }
+    }
+
+    /// Feed a `Event::Outputs` reply.
+    pub fn on_outputs(&mut self, outputs: Vec<OutputInfo>) {
+        self.outputs = outputs;
     }
 
     /// Feed a daemon error that arrived while this page was waiting.
@@ -130,8 +151,9 @@ impl SettingsView {
     }
 
     /// Render the page; returns the action for the app to perform.
-    pub fn ui(&mut self, ctx: &egui::Context) -> SettingsAction {
+    pub fn ui(&mut self, ctx: &egui::Context) -> (SettingsAction, Option<SettingsExtra>) {
         let mut action = SettingsAction::None;
+        let mut extra = None;
         self.poll_browse();
 
         egui::TopBottomPanel::top("settings-top")
@@ -165,6 +187,8 @@ impl SettingsView {
         }
 
         let mut browse_request: Option<BrowseTarget> = None;
+        let outputs = self.outputs.clone();
+        let mut advanced_open = self.advanced_open;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
@@ -196,16 +220,21 @@ impl SettingsView {
                         ui.vertical_centered(|ui| {
                             ui.set_max_width(col);
                             ui.add_space(theme::SP_3);
-                            browse_request = form(ui, model, browsing);
+                            let (b, e) = form(ui, model, &outputs, browsing, &mut advanced_open);
+                            browse_request = b;
+                            if e.is_some() {
+                                extra = e;
+                            }
                             ui.add_space(theme::SP_6); // breathing room at the end
                         });
                     });
             });
+        self.advanced_open = advanced_open;
         if let Some(target) = browse_request {
             self.start_browse(target, ctx);
         }
 
-        action
+        (action, extra)
     }
 
     /// Sticky footer: problems, override summary, Revert / Reset / Apply.
@@ -603,30 +632,217 @@ fn path_input(
     clicked
 }
 
-fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<BrowseTarget> {
+fn form(
+    ui: &mut egui::Ui,
+    model: &mut SettingsModel,
+    outputs: &[OutputInfo],
+    browsing: bool,
+    advanced_open: &mut bool,
+) -> (Option<BrowseTarget>, Option<SettingsExtra>) {
     // Computed once per frame; each row only scans this list for its path.
     let overridden = model.overridden();
     let mut browse = None;
+    let mut extra = None;
 
-    theme::section(ui, "Capture");
+    theme::section(ui, "Recording");
+    // Profile chips
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new("Profile")
+                .size(theme::TEXT_LABEL)
+                .color(theme::INK_2),
+        );
+        ui.add_space(theme::SP_2);
+        let current = CaptureProfile::detect(&model.draft.capture);
+        for p in CaptureProfile::ALL {
+            let selected = p == current;
+            let resp = ui.selectable_label(selected, p.label());
+            if resp.clicked() && p != CaptureProfile::Custom {
+                p.apply(&mut model.draft.capture);
+            }
+            if p != CaptureProfile::Custom {
+                resp.on_hover_text(profile_hint(p));
+            }
+        }
+    });
+    ui.add_space(theme::SP_2);
+
+    // Live summary banner
+    let summary = capture_summary(&model.draft.capture, outputs);
+    egui::Frame::none()
+        .fill(theme::SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
+        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+        .rounding(theme::RADIUS)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Will capture ≈ {} @ {} · {} · {} s buffer",
+                    summary.resolution_label,
+                    summary.fps_label,
+                    summary.quality_label,
+                    summary.buffer_secs
+                ))
+                .size(theme::TEXT_LABEL)
+                .color(theme::INK),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "Apply restarts capture when source, resolution, fps, codec, or quality change.",
+                )
+                .size(theme::TEXT_MICRO)
+                .color(theme::INK_3),
+            );
+        });
+    ui.add_space(theme::SP_3);
+
     row(
         ui,
         &overridden,
-        "capture.fps",
-        "Frame rate",
-        "Frames per second the buffer records at. Higher is smoother but costs \
-         more GPU encode time, RAM, and disk per clip. Applying restarts capture.",
+        "capture.target",
+        "Source",
+        "Portal opens the system share picker (restore token remembers your choice). \
+         Named monitors list modes from the compositor when available.",
         |ui| {
-            stepper_u32(ui, "fps", &mut model.draft.capture.fps, 1..=240, 5, "fps");
+            let mut target = model.draft.capture.target.clone();
+            let display = if target == "portal" {
+                "Portal (picker)".to_string()
+            } else {
+                target.clone()
+            };
+            egui::ComboBox::from_id_salt("capture-target")
+                .selected_text(display)
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut target, "portal".into(), "Portal (picker)");
+                    for o in outputs {
+                        let label = format!(
+                            "{} — {}×{} @ {} Hz",
+                            o.name,
+                            o.width,
+                            o.height,
+                            o.refresh_fps()
+                        );
+                        ui.selectable_value(&mut target, o.name.clone(), label);
+                    }
+                });
+            model.draft.capture.target = target;
+            if ui
+                .small_button("↻")
+                .on_hover_text("Refresh display list")
+                .clicked()
+            {
+                extra = Some(SettingsExtra::RefreshOutputs);
+            }
         },
     );
+
+    // Resolution
+    row(
+        ui,
+        &overridden,
+        "capture.resolution",
+        "Resolution",
+        "Native keeps the full monitor. Lower sizes reduce encode cost and file size \
+         (downscale is applied when the capture backend supports it).",
+        |ui| {
+            let preset = res_preset(&model.draft.capture.resolution);
+            let mut choice = preset;
+            egui::ComboBox::from_id_salt("res-preset")
+                .selected_text(res_preset_label(choice))
+                .show_ui(ui, |ui| {
+                    for p in ResPreset::ALL {
+                        ui.selectable_value(&mut choice, p, res_preset_label(p));
+                    }
+                });
+            if choice != preset {
+                model.draft.capture.resolution = choice.to_resolution();
+            }
+            if choice == ResPreset::Custom {
+                let mut w = model
+                    .draft
+                    .capture
+                    .resolution
+                    .map(|r| r.width)
+                    .unwrap_or(1920);
+                let mut h = model
+                    .draft
+                    .capture
+                    .resolution
+                    .map(|r| r.height)
+                    .unwrap_or(1080);
+                ui.label("W");
+                stepper_u32(ui, "res-w", &mut w, 16..=16384, 2, "");
+                ui.label("H");
+                stepper_u32(ui, "res-h", &mut h, 16..=16384, 2, "");
+                // Keep even for NVENC.
+                w -= w % 2;
+                h -= h % 2;
+                model.draft.capture.resolution = Some(Resolution {
+                    width: w.max(16),
+                    height: h.max(16),
+                });
+            }
+        },
+    );
+
+    // Frame rate
+    row(
+        ui,
+        &overridden,
+        "capture.fps_mode",
+        "Frame rate",
+        "Match display uses the selected/focused monitor refresh (like OBS). \
+         Fixed locks a CFR target. Applying restarts capture.",
+        |ui| {
+            let mut auto = model.draft.capture.fps_mode == FpsMode::Auto;
+            if ui.checkbox(&mut auto, "Match display refresh").changed() {
+                model.draft.capture.fps_mode = if auto { FpsMode::Auto } else { FpsMode::Fixed };
+            }
+            if model.draft.capture.fps_mode == FpsMode::Fixed {
+                let rates = [30_u32, 60, 120, 144, 165, 240];
+                egui::ComboBox::from_id_salt("fps-preset")
+                    .selected_text(format!("{} fps", model.draft.capture.fps))
+                    .show_ui(ui, |ui| {
+                        for r in rates {
+                            ui.selectable_value(
+                                &mut model.draft.capture.fps,
+                                r,
+                                format!("{r} fps"),
+                            );
+                        }
+                    });
+                stepper_u32(ui, "fps", &mut model.draft.capture.fps, 1..=240, 1, "fps");
+            } else if let Some(o) = outputs.iter().find(|o| {
+                let t = model.draft.capture.target.trim();
+                if t != "portal" && !t.is_empty() {
+                    o.name == t
+                } else {
+                    o.focused
+                }
+            }) {
+                ui.label(
+                    egui::RichText::new(format!("~{} fps from {}", o.refresh_fps(), o.name))
+                        .size(theme::TEXT_LABEL)
+                        .color(theme::INK_2),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("no display probe — will use fallback fps")
+                        .size(theme::TEXT_LABEL)
+                        .color(theme::KIN),
+                );
+            }
+        },
+    );
+
     row(
         ui,
         &overridden,
         "capture.buffer_seconds",
         "Replay buffer",
-        "How many seconds of the past are kept in RAM for `ord save`. Longer \
-         buffers use proportionally more memory. Applies live.",
+        "How many seconds of the past are kept for `ord save`. Longer buffers use \
+         more memory (or disk if advanced storage is set to Disk). Applies live.",
         |ui| {
             stepper_u32(
                 ui,
@@ -660,8 +876,8 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
         &overridden,
         "capture.codec",
         "Codec",
-        "H.264 plays everywhere. HEVC and AV1 give noticeably smaller clips at \
-         the same quality, but AV1 encoding needs an RTX 40/50-series card.",
+        "H.264 plays everywhere. HEVC and AV1 give smaller clips at the same \
+         quality; AV1 needs an RTX 40/50-series card to encode.",
         |ui| {
             egui::ComboBox::from_id_salt("codec")
                 .selected_text(codec_label(model.draft.capture.codec))
@@ -702,6 +918,124 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
             ui.checkbox(&mut model.draft.capture.clear_on_save, "");
         },
     );
+
+    // Advanced capture knobs
+    ui.add_space(theme::SP_2);
+    egui::CollapsingHeader::new("Advanced capture")
+        .id_salt("adv-capture")
+        .default_open(*advanced_open)
+        .show(ui, |ui| {
+            *advanced_open = true;
+            row(
+                ui,
+                &overridden,
+                "capture.keyframe_interval_ms",
+                "Keyframe interval",
+                "GOP length in milliseconds. Smaller = finer “save last N” reachability \
+                 and seeking, at a small bitrate cost. Default 2000 ms.",
+                |ui| {
+                    stepper_u32(
+                        ui,
+                        "keyint",
+                        &mut model.draft.capture.keyframe_interval_ms,
+                        100..=10_000,
+                        100,
+                        "ms",
+                    );
+                },
+            );
+            row(
+                ui,
+                &overridden,
+                "capture.framerate_mode",
+                "Frame timing",
+                "CFR is safest for editors. VFR skips static frames. Content syncs to \
+                 screen updates (best under VRR; needs backend support).",
+                |ui| {
+                    let m = &mut model.draft.capture.framerate_mode;
+                    egui::ComboBox::from_id_salt("frmode")
+                        .selected_text(match *m {
+                            FramerateMode::Cfr => "CFR (constant)",
+                            FramerateMode::Vfr => "VFR (variable)",
+                            FramerateMode::Content => "Content-sync",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(m, FramerateMode::Cfr, "CFR (constant)");
+                            ui.selectable_value(m, FramerateMode::Vfr, "VFR (variable)");
+                            ui.selectable_value(m, FramerateMode::Content, "Content-sync");
+                        });
+                },
+            );
+            row(
+                ui,
+                &overridden,
+                "capture.color_range",
+                "Color range",
+                "Limited is most compatible. Full preserves studio range when the pipeline supports it.",
+                |ui| {
+                    let m = &mut model.draft.capture.color_range;
+                    egui::ComboBox::from_id_salt("crange")
+                        .selected_text(format!("{m:?}"))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(m, ColorRange::Limited, "Limited");
+                            ui.selectable_value(m, ColorRange::Full, "Full");
+                        });
+                },
+            );
+            row(
+                ui,
+                &overridden,
+                "capture.tune",
+                "Encoder tune",
+                "Performance = lowest overhead while gaming. Quality biases the encoder toward fidelity.",
+                |ui| {
+                    let m = &mut model.draft.capture.tune;
+                    egui::ComboBox::from_id_salt("tune")
+                        .selected_text(format!("{m:?}"))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(m, EncoderTune::Performance, "Performance");
+                            ui.selectable_value(m, EncoderTune::Quality, "Quality");
+                        });
+                },
+            );
+            row(
+                ui,
+                &overridden,
+                "capture.replay_storage",
+                "Replay storage",
+                "RAM is lowest latency. Disk spills encoded frames so long windows fit on low-RAM machines.",
+                |ui| {
+                    let m = &mut model.draft.capture.replay_storage;
+                    egui::ComboBox::from_id_salt("rstore")
+                        .selected_text(format!("{m:?}"))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(m, ReplayStorage::Ram, "RAM");
+                            ui.selectable_value(m, ReplayStorage::Disk, "Disk");
+                        });
+                },
+            );
+            row(
+                ui,
+                &overridden,
+                "capture.auto_arm",
+                "Auto-arm on game",
+                "Start the replay buffer when a game takes the foreground (Steam app or fullscreen).",
+                |ui| {
+                    ui.checkbox(&mut model.draft.capture.auto_arm, "");
+                },
+            );
+            row(
+                ui,
+                &overridden,
+                "capture.hdr",
+                "HDR capture",
+                "10-bit BT.2020/PQ. Requires HEVC or AV1 and a capture path that can carry HDR \
+                 (portal tonemaps to SDR today).",
+                |ui| {
+                    ui.checkbox(&mut model.draft.capture.hdr, "");
+                },
+            );
+        });
 
     theme::section(ui, "Audio");
     row(
@@ -953,7 +1287,87 @@ fn form(ui: &mut egui::Ui, model: &mut SettingsModel, browsing: bool) -> Option<
         });
     });
 
-    browse
+    (browse, extra)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResPreset {
+    Native,
+    P1080,
+    P1440,
+    P4k,
+    Custom,
+}
+
+impl ResPreset {
+    const ALL: [ResPreset; 5] = [
+        ResPreset::Native,
+        ResPreset::P1080,
+        ResPreset::P1440,
+        ResPreset::P4k,
+        ResPreset::Custom,
+    ];
+
+    fn to_resolution(self) -> Option<Resolution> {
+        match self {
+            ResPreset::Native => None,
+            ResPreset::P1080 => Some(Resolution {
+                width: 1920,
+                height: 1080,
+            }),
+            ResPreset::P1440 => Some(Resolution {
+                width: 2560,
+                height: 1440,
+            }),
+            ResPreset::P4k => Some(Resolution {
+                width: 3840,
+                height: 2160,
+            }),
+            ResPreset::Custom => Some(Resolution {
+                width: 1920,
+                height: 1080,
+            }),
+        }
+    }
+}
+
+fn res_preset(res: &Option<Resolution>) -> ResPreset {
+    match res {
+        None => ResPreset::Native,
+        Some(Resolution {
+            width: 1920,
+            height: 1080,
+        }) => ResPreset::P1080,
+        Some(Resolution {
+            width: 2560,
+            height: 1440,
+        }) => ResPreset::P1440,
+        Some(Resolution {
+            width: 3840,
+            height: 2160,
+        }) => ResPreset::P4k,
+        Some(_) => ResPreset::Custom,
+    }
+}
+
+fn res_preset_label(p: ResPreset) -> &'static str {
+    match p {
+        ResPreset::Native => "Match display (native)",
+        ResPreset::P1080 => "1080p (1920×1080)",
+        ResPreset::P1440 => "1440p (2560×1440)",
+        ResPreset::P4k => "4K (3840×2160)",
+        ResPreset::Custom => "Custom…",
+    }
+}
+
+fn profile_hint(p: CaptureProfile) -> &'static str {
+    match p {
+        CaptureProfile::Performance => "1080p60 H.264 Medium — lightest GPU cost",
+        CaptureProfile::Balanced => "Native 60 HEVC High — good quality/size",
+        CaptureProfile::Competitive => "1080p144 H.264 CBR 20 Mbps — high refresh",
+        CaptureProfile::Quality => "Native @ display refresh, AV1 Ultra",
+        CaptureProfile::Custom => "",
+    }
 }
 
 fn pressed_keys_layout_editor(ui: &mut egui::Ui, overridden: &[String], model: &mut SettingsModel) {

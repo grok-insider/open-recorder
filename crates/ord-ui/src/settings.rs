@@ -2,7 +2,8 @@
 //! layered configuration. The egui view renders this; the daemon applies it
 //! (`SetConfig`). No I/O, no egui here.
 
-use ord_common::Config;
+use ord_common::config::{CaptureCodec, CaptureConfig, FpsMode, Quality, Resolution};
+use ord_common::{Config, OutputInfo};
 
 /// Which apply tier a pending change lands in (drives the Apply button copy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,166 @@ pub enum ApplyTier {
     Live,
     /// Restarts the capture session (encoder/audio fields) — a ~1 s gap.
     CaptureRestart,
+}
+
+/// Named recording quality stamps for the settings Capture section.
+/// Selecting a profile overwrites a subset of [`CaptureConfig`]; any later
+/// manual edit of those fields leaves the UI on [`CaptureProfile::Custom`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureProfile {
+    Performance,
+    Balanced,
+    Competitive,
+    Quality,
+    Custom,
+}
+
+impl CaptureProfile {
+    pub const ALL: [CaptureProfile; 5] = [
+        CaptureProfile::Performance,
+        CaptureProfile::Balanced,
+        CaptureProfile::Competitive,
+        CaptureProfile::Quality,
+        CaptureProfile::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CaptureProfile::Performance => "Performance",
+            CaptureProfile::Balanced => "Balanced",
+            CaptureProfile::Competitive => "Competitive",
+            CaptureProfile::Quality => "Quality",
+            CaptureProfile::Custom => "Custom",
+        }
+    }
+
+    /// Apply this profile's stamp to `cap` (no-op for Custom).
+    pub fn apply(self, cap: &mut CaptureConfig) {
+        match self {
+            CaptureProfile::Custom => {}
+            CaptureProfile::Performance => {
+                cap.resolution = Some(Resolution {
+                    width: 1920,
+                    height: 1080,
+                });
+                cap.fps_mode = FpsMode::Fixed;
+                cap.fps = 60;
+                cap.codec = CaptureCodec::H264;
+                cap.quality = Quality::Medium;
+                cap.bitrate_kbps = None;
+            }
+            CaptureProfile::Balanced => {
+                cap.resolution = None;
+                cap.fps_mode = FpsMode::Fixed;
+                cap.fps = 60;
+                cap.codec = CaptureCodec::Hevc;
+                cap.quality = Quality::High;
+                cap.bitrate_kbps = None;
+            }
+            CaptureProfile::Competitive => {
+                cap.resolution = Some(Resolution {
+                    width: 1920,
+                    height: 1080,
+                });
+                cap.fps_mode = FpsMode::Fixed;
+                cap.fps = 144;
+                cap.codec = CaptureCodec::H264;
+                cap.quality = Quality::High;
+                cap.bitrate_kbps = Some(20_000);
+            }
+            CaptureProfile::Quality => {
+                cap.resolution = None;
+                cap.fps_mode = FpsMode::Auto;
+                cap.fps = 60;
+                cap.codec = CaptureCodec::Av1;
+                cap.quality = Quality::Ultra;
+                cap.bitrate_kbps = None;
+            }
+        }
+    }
+
+    /// Which named profile (if any) matches the current capture config.
+    pub fn detect(cap: &CaptureConfig) -> CaptureProfile {
+        for p in [
+            CaptureProfile::Performance,
+            CaptureProfile::Balanced,
+            CaptureProfile::Competitive,
+            CaptureProfile::Quality,
+        ] {
+            let mut probe = cap.clone();
+            p.apply(&mut probe);
+            // Compare only the fields a profile stamps.
+            if probe.resolution == cap.resolution
+                && probe.fps_mode == cap.fps_mode
+                && probe.fps == cap.fps
+                && probe.codec == cap.codec
+                && probe.quality == cap.quality
+                && probe.bitrate_kbps == cap.bitrate_kbps
+            {
+                return p;
+            }
+        }
+        CaptureProfile::Custom
+    }
+}
+
+/// Pure summary of what a draft would capture, for the settings banner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSummary {
+    pub resolution_label: String,
+    pub fps_label: String,
+    pub quality_label: String,
+    pub buffer_secs: u32,
+}
+
+/// Build a human-readable capture summary from the draft + probed outputs.
+pub fn capture_summary(cap: &CaptureConfig, outputs: &[OutputInfo]) -> CaptureSummary {
+    let resolution_label = match cap.resolution {
+        None => {
+            if let Some((w, h)) = pick_output(outputs, &cap.target).map(|o| (o.width, o.height)) {
+                format!("{w}×{h} (native)")
+            } else {
+                "native".into()
+            }
+        }
+        Some(r) => format!("{}×{}", r.width, r.height),
+    };
+    let fps_label = match cap.fps_mode {
+        FpsMode::Fixed => format!("{} fps", cap.fps),
+        FpsMode::Auto => {
+            if let Some(o) = pick_output(outputs, &cap.target) {
+                format!("~{} fps ({} refresh)", o.refresh_fps(), o.name)
+            } else {
+                format!("auto (fallback {} fps)", cap.fps.max(1))
+            }
+        }
+    };
+    let codec = match cap.codec {
+        CaptureCodec::H264 => "H.264",
+        CaptureCodec::Hevc => "HEVC",
+        CaptureCodec::Av1 => "AV1",
+    };
+    let quality_label = match cap.bitrate_kbps {
+        Some(kbps) => format!("{codec} CBR {kbps} kbps"),
+        None => format!("{codec} {:?}", cap.quality),
+    };
+    CaptureSummary {
+        resolution_label,
+        fps_label,
+        quality_label,
+        buffer_secs: cap.buffer_seconds,
+    }
+}
+
+fn pick_output<'a>(outputs: &'a [OutputInfo], target: &str) -> Option<&'a OutputInfo> {
+    let t = target.trim();
+    if t != "portal" && !t.is_empty() {
+        return outputs.iter().find(|o| o.name == t);
+    }
+    outputs
+        .iter()
+        .find(|o| o.focused)
+        .or_else(|| outputs.iter().max_by_key(|o| o.refresh_mhz))
 }
 
 /// The draft state of the settings panel.
@@ -48,9 +209,18 @@ impl SettingsModel {
         }
         let (d, s) = (&self.draft.capture, &self.saved.capture);
         let encoder_changed = d.fps != s.fps
+            || d.fps_mode != s.fps_mode
             || d.quality != s.quality
             || d.codec != s.codec
             || d.bitrate_kbps != s.bitrate_kbps
+            || d.resolution != s.resolution
+            || d.keyframe_interval_ms != s.keyframe_interval_ms
+            || d.framerate_mode != s.framerate_mode
+            || d.color_range != s.color_range
+            || d.tune != s.tune
+            || d.replay_storage != s.replay_storage
+            || d.target != s.target
+            || d.hdr != s.hdr
             || self.draft.audio != self.saved.audio;
         if encoder_changed {
             ApplyTier::CaptureRestart
@@ -63,7 +233,7 @@ impl SettingsModel {
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
         let c = &self.draft.capture;
-        if c.fps == 0 || c.fps > 240 {
+        if c.fps_mode == FpsMode::Fixed && (c.fps == 0 || c.fps > 240) {
             out.push("Frame rate must be between 1 and 240.".into());
         }
         if c.buffer_seconds == 0 || c.buffer_seconds > 3600 {
@@ -73,6 +243,22 @@ impl SettingsModel {
             if !(1_000..=200_000).contains(&kbps) {
                 out.push("Bitrate must be between 1,000 and 200,000 kbps.".into());
             }
+        }
+        if let Some(res) = c.resolution {
+            let even = res.width.is_multiple_of(2) && res.height.is_multiple_of(2);
+            let in_range = (16..=16384).contains(&res.width) && (16..=16384).contains(&res.height);
+            if !even || !in_range {
+                out.push("Resolution must be even and between 16 and 16384 on each side.".into());
+            }
+        }
+        if !(100..=10_000).contains(&c.keyframe_interval_ms) {
+            out.push("Keyframe interval must be between 100 and 10,000 ms.".into());
+        }
+        if c.target.trim().is_empty() {
+            out.push("Capture source cannot be empty (use portal or a monitor name).".into());
+        }
+        if c.hdr && c.codec == CaptureCodec::H264 {
+            out.push("HDR requires HEVC or AV1 (not H.264).".into());
         }
         if self.draft.storage.template.trim().is_empty() {
             out.push("Filename template cannot be empty.".into());
@@ -173,6 +359,19 @@ mod tests {
     }
 
     #[test]
+    fn resolution_and_fps_mode_restart_capture() {
+        let mut m = model();
+        m.draft.capture.fps_mode = FpsMode::Auto;
+        assert_eq!(m.apply_tier(), ApplyTier::CaptureRestart);
+        m.revert();
+        m.draft.capture.resolution = Some(Resolution {
+            width: 1920,
+            height: 1080,
+        });
+        assert_eq!(m.apply_tier(), ApplyTier::CaptureRestart);
+    }
+
+    #[test]
     fn audio_change_restarts_capture() {
         let mut m = model();
         m.draft.audio.mic = !m.draft.audio.mic;
@@ -194,6 +393,20 @@ mod tests {
         m.draft.overlay.pressed_keys.rotation_degrees = 45;
         let problems = m.problems();
         assert_eq!(problems.len(), 10, "{problems:?}");
+    }
+
+    #[test]
+    fn validation_catches_odd_resolution_and_hdr_codec() {
+        let mut m = model();
+        m.draft.capture.resolution = Some(Resolution {
+            width: 1921,
+            height: 1080,
+        });
+        m.draft.capture.hdr = true;
+        m.draft.capture.codec = CaptureCodec::H264;
+        let p = m.problems();
+        assert!(p.iter().any(|s| s.contains("Resolution")), "{p:?}");
+        assert!(p.iter().any(|s| s.contains("HDR")), "{p:?}");
     }
 
     #[test]
@@ -224,5 +437,39 @@ mod tests {
         m.applied(confirmed.clone(), m.base.clone());
         assert!(!m.is_dirty());
         assert_eq!(m.saved, confirmed);
+    }
+
+    #[test]
+    fn profiles_stamp_and_detect() {
+        let mut cap = CaptureConfig::default();
+        CaptureProfile::Competitive.apply(&mut cap);
+        assert_eq!(cap.fps, 144);
+        assert_eq!(cap.bitrate_kbps, Some(20_000));
+        assert_eq!(CaptureProfile::detect(&cap), CaptureProfile::Competitive);
+        cap.fps = 120;
+        assert_eq!(CaptureProfile::detect(&cap), CaptureProfile::Custom);
+    }
+
+    #[test]
+    fn capture_summary_uses_probe() {
+        let outs = vec![OutputInfo {
+            name: "DP-1".into(),
+            width: 2560,
+            height: 1440,
+            refresh_mhz: 165_002,
+            focused: true,
+        }];
+        let cap = CaptureConfig {
+            fps_mode: FpsMode::Auto,
+            resolution: None,
+            ..CaptureConfig::default()
+        };
+        let s = capture_summary(&cap, &outs);
+        assert!(
+            s.resolution_label.contains("2560"),
+            "{}",
+            s.resolution_label
+        );
+        assert!(s.fps_label.contains("165"), "{}", s.fps_label);
     }
 }

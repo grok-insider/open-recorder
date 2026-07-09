@@ -9,6 +9,7 @@
 //! | `ORD_DECODE=sw\|nvdec\|gl\|hw` | Force software or hardware decode (default: auto). |
 //! | `ORD_DEBUG` | Enable the editor debug overlay + watchdog logging. |
 //! | `ORD_OPEN=<path>` | Auto-open a clip in the editor on launch (dev aid). |
+//! | `ORD_SETTINGS` | Open the Settings page on launch (dev/QA; skips the click). |
 //! | `ORD_AUTOPLAY` | Start playback immediately when the editor opens (dev/QA). |
 //! | `ORD_DEBUG_LOG=<path>` | Override the diagnostics log path (see [`crate::diag::log_path`]). |
 
@@ -32,6 +33,13 @@ pub fn debug_overlay() -> bool {
 /// A clip path to auto-open in the editor on launch (`ORD_OPEN`), for dev/QA.
 pub fn auto_open() -> Option<String> {
     std::env::var("ORD_OPEN").ok()
+}
+
+/// Open Settings on launch (`ORD_SETTINGS` set to anything). Used by wisp/QA so
+/// the settings form can be inspected without relying on pointer hit-testing
+/// against egui's (historically empty) AT-SPI tree.
+pub fn auto_settings() -> bool {
+    std::env::var("ORD_SETTINGS").is_ok()
 }
 
 /// Whether to start playback as soon as the editor opens (`ORD_AUTOPLAY`). A

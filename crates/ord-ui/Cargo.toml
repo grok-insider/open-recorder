@@ -17,17 +17,25 @@ ord-common.workspace = true
 ord-export = { workspace = true, optional = true }
 thiserror.workspace = true
 dirs.workspace = true
-eframe = { version = "0.29", optional = true }
+# Explicit `accesskit` so the AT-SPI tree is always on for the gui feature —
+# screen readers and wisp automation can target widgets (Settings, profiles, …).
+eframe = {
+    version = "0.29",
+    optional = true,
+    default-features = false,
+    features = ["accesskit", "default_fonts", "glow", "wayland", "x11"],
+}
 image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
 # Inline A/V preview player (decode via ffmpeg-next, audio out via cpal).
 ffmpeg-next = { workspace = true, optional = true }
 cpal = { version = "0.15", optional = true }
 
 [features]
-# `gui` pulls in eframe/egui (needs system GL/Wayland libs), image decoding for
-# thumbnails, ord-export for the Export action, and ffmpeg-next + cpal for the
-# inline editor preview/playback. Off in CI so the pure clip-library scanning +
-# formatting logic builds and tests without a display or media libs.
+# `gui` pulls in eframe/egui (needs system GL/Wayland libs + AccessKit/AT-SPI),
+# image decoding for thumbnails, ord-export for the Export action, and
+# ffmpeg-next + cpal for the inline editor preview/playback. Off in CI so the
+# pure clip-library scanning + formatting logic builds and tests without a
+# display or media libs.
 default = []
 gui = ["dep:eframe", "dep:image", "dep:ord-export", "dep:ffmpeg-next", "dep:cpal"]
 

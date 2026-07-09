@@ -21,7 +21,7 @@ use crate::editor::{EditorAction, EditorState};
 use crate::format::{human_duration, human_size, relative_time, resolution};
 use crate::library::{changed_paths, filter_sort, scan_dir, Clip, SortOrder};
 use crate::meta::{self, ClipMeta};
-use crate::settings_view::{SettingsAction, SettingsView};
+use crate::settings_view::{SettingsAction, SettingsExtra, SettingsView};
 use crate::theme;
 
 const CARD_INNER_W: f32 = 300.0;
@@ -108,7 +108,7 @@ pub struct LibraryApp {
     /// doesn't compete with the preview decoder mid-playback.
     pending_refresh: bool,
     watchdog: crate::diag::Watchdog,
-    /// One-shot: honor `ORD_OPEN=<clip>` (debug) to open straight into the editor.
+    /// One-shot: honor `ORD_OPEN=<clip>` / `ORD_SETTINGS` (debug/QA launch aids).
     auto_open_tried: bool,
     /// Window focus tracking, to pause + idle when hidden (e.g. special workspace
     /// toggled away). `visible` is shared with the loader thread so it doesn't
@@ -209,6 +209,11 @@ impl LibraryApp {
                 Ok(Event::Config { effective, base }) => {
                     if let Some(s) = self.settings.as_mut() {
                         s.on_config(*effective, *base);
+                    }
+                }
+                Ok(Event::Outputs { outputs }) => {
+                    if let Some(s) = self.settings.as_mut() {
+                        s.on_outputs(outputs);
                     }
                 }
                 Ok(Event::ClipSaved { path, duration }) => {
@@ -350,9 +355,9 @@ impl LibraryApp {
                         .unwrap_or(path);
                     self.set_status(format!("Screenshot → {name}"));
                 }
-                // One-shot Config replies drive the settings page; a pushed
-                // Config mid-edit must not clobber the user's draft.
-                Event::Config { .. } | Event::Error { .. } => {}
+                // One-shot Config/Outputs replies drive the settings page via
+                // drain_ctl; a pushed Config mid-edit must not clobber drafts.
+                Event::Config { .. } | Event::Outputs { .. } | Event::Error { .. } => {}
             }
         }
     }
@@ -760,11 +765,15 @@ impl eframe::App for LibraryApp {
             }
         }
 
-        // Debug: ORD_OPEN=<path> opens straight into the editor (skips the grid),
-        // for screenshotting/validating the preview render path.
+        // Debug/QA launch aids (one-shot): ORD_OPEN=<path> → editor, or
+        // ORD_SETTINGS → settings page (for wisp without pointer hit-testing).
         if !self.auto_open_tried {
             self.auto_open_tried = true;
-            if let Some(path) = crate::tuning::auto_open() {
+            if crate::tuning::auto_settings() {
+                self.settings = Some(SettingsView::new());
+                self.send_ctl(Command::GetConfig, ctx);
+                self.send_ctl(Command::ListOutputs, ctx);
+            } else if let Some(path) = crate::tuning::auto_open() {
                 let path = PathBuf::from(path);
                 if path.is_file() {
                     let label = path
@@ -781,7 +790,11 @@ impl eframe::App for LibraryApp {
         // Settings page takes over the whole window when open.
         if let Some(mut view) = self.settings.take() {
             self.watchdog.beat("settings");
-            match view.ui(ctx) {
+            let (action, extra) = view.ui(ctx);
+            if let Some(SettingsExtra::RefreshOutputs) = extra {
+                self.send_ctl(Command::ListOutputs, ctx);
+            }
+            match action {
                 SettingsAction::Back => {} // dropped
                 SettingsAction::None => self.settings = Some(view),
                 SettingsAction::Apply(config) => {
@@ -872,13 +885,18 @@ impl eframe::App for LibraryApp {
                         });
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button("Settings")
-                            .on_hover_text("Daemon configuration (applies live)")
-                            .clicked()
-                        {
+                        let settings_btn = ui
+                            .add(egui::Button::new("Settings").min_size(egui::vec2(72.0, 0.0)))
+                            .on_hover_text("Daemon configuration (applies live)");
+                        // AccessKit: a stable name so automation can find this
+                        // control even when the grid has no other labels.
+                        settings_btn.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Settings")
+                        });
+                        if settings_btn.clicked() {
                             self.settings = Some(SettingsView::new());
                             self.send_ctl(Command::GetConfig, ctx);
+                            self.send_ctl(Command::ListOutputs, ctx);
                         }
                         ui.add_space(theme::SP_1);
                         self.daemon_controls(ui, ctx);
