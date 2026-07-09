@@ -16,7 +16,10 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use waycap_rs::pipeline::builder::CaptureBuilder;
-use waycap_rs::types::config::{AudioEncoder, QualityPreset, RateControl, VideoEncoder};
+use waycap_rs::types::config::{
+    AudioEncoder, ColorRange as WaycapColorRange, EncoderTune as WaycapTune, QualityPreset,
+    RateControl, VideoEncoder,
+};
 use waycap_rs::Capture;
 
 use crate::audio::{AudioCodec, AudioParams, EncodedAudioFrame};
@@ -26,6 +29,29 @@ use crate::ring::EncodedFrame;
 /// waycap-rs emits Opus at 48 kHz stereo (see its `OpusEncoder`).
 const AUDIO_SAMPLE_RATE: u32 = 48_000;
 const AUDIO_CHANNELS: u16 = 2;
+
+/// Convert a keyframe interval in milliseconds + capture fps into a GOP length
+/// in frames (minimum 1). Pure so unit tests cover the math without a GPU.
+pub fn gop_frames_from_interval_ms(keyframe_interval_ms: u32, fps: u32) -> u32 {
+    let fps = fps.max(1);
+    let ms = keyframe_interval_ms.max(1);
+    // Round to nearest frame so 2000ms @ 60fps → 120, not 119.
+    (((ms as u64) * (fps as u64) + 500) / 1000).max(1) as u32
+}
+
+fn map_color_range(r: ord_common::config::ColorRange) -> WaycapColorRange {
+    match r {
+        ord_common::config::ColorRange::Limited => WaycapColorRange::Limited,
+        ord_common::config::ColorRange::Full => WaycapColorRange::Full,
+    }
+}
+
+fn map_tune(t: ord_common::config::EncoderTune) -> WaycapTune {
+    match t {
+        ord_common::config::EncoderTune::Performance => WaycapTune::Performance,
+        ord_common::config::EncoderTune::Quality => WaycapTune::Quality,
+    }
+}
 
 /// Quality knob mapped onto waycap-rs presets.
 #[derive(Debug, Clone, Copy)]
@@ -222,11 +248,15 @@ impl CaptureBackend for WaycapBackend {
             None => RateControl::Quality,
         };
 
+        let gop = gop_frames_from_interval_ms(self.keyframe_interval_ms, self.fps);
         let mut builder = CaptureBuilder::new()
             .with_video_encoder(encoder)
             .with_quality_preset(self.quality.into())
             .with_rate_control(rate_control)
             .with_target_fps(self.fps as u64)
+            .with_gop(gop)
+            .with_encoder_tune(map_tune(self.tune))
+            .with_color_range(map_color_range(self.color_range))
             .with_cursor_shown();
         if self.mic_enabled {
             // with_microphone() implies audio; mixes mic + desktop into one track.
@@ -239,20 +269,17 @@ impl CaptureBackend for WaycapBackend {
         if let Some(token) = saved_token {
             builder = builder.with_restore_token(token);
         }
-        // fork: the pinned waycap-rs rev exposes fps/quality/rate-control/codec/
-        // audio but not GOP length, framerate mode, color range, or encoder tune.
-        // These knobs are wired through the config + builder now so the surface is
-        // stable; they take effect on the rev bump that adds the matching
-        // CaptureBuilder setters (see docs/spike-results.md fork recipe). Logged so
-        // they are observable (and not dead fields) until then.
+        // framerate_mode, named target, and true HDR still need further fork
+        // work (see continue-plan.md). Log so they stay observable.
         tracing::debug!(
+            gop_frames = gop,
             keyframe_interval_ms = self.keyframe_interval_ms,
-            framerate_mode = ?self.framerate_mode,
             color_range = ?self.color_range,
             tune = ?self.tune,
+            framerate_mode = ?self.framerate_mode,
             target = %self.target,
             hdr = self.hdr,
-            "capture knobs pending waycap-rs builder support (GOP/fps-mode/range/tune/target/hdr)"
+            "starting waycap capture (GOP/tune/color_range applied; fps-mode/target/hdr pending)"
         );
 
         let mut capture = builder
@@ -430,5 +457,64 @@ impl CaptureBackend for WaycapBackend {
 
     fn is_running(&self) -> bool {
         self.running
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ord_common::config::{ColorRange, EncoderTune};
+
+    #[test]
+    fn gop_from_interval_rounds_to_nearest_frame() {
+        assert_eq!(gop_frames_from_interval_ms(2000, 60), 120);
+        assert_eq!(gop_frames_from_interval_ms(1000, 30), 30);
+        assert_eq!(gop_frames_from_interval_ms(500, 60), 30);
+        // Sub-frame intervals still yield at least one frame.
+        assert_eq!(gop_frames_from_interval_ms(1, 60), 1);
+        assert_eq!(gop_frames_from_interval_ms(0, 60), 1);
+        assert_eq!(gop_frames_from_interval_ms(2000, 0), 2); // fps clamped to 1
+    }
+
+    #[test]
+    fn maps_config_enums_onto_waycap() {
+        assert!(matches!(
+            map_color_range(ColorRange::Full),
+            WaycapColorRange::Full
+        ));
+        assert!(matches!(
+            map_color_range(ColorRange::Limited),
+            WaycapColorRange::Limited
+        ));
+        assert!(matches!(
+            map_tune(EncoderTune::Performance),
+            WaycapTune::Performance
+        ));
+        assert!(matches!(
+            map_tune(EncoderTune::Quality),
+            WaycapTune::Quality
+        ));
+    }
+
+    #[test]
+    fn start_path_no_longer_logs_pending_for_gop_tune_range() {
+        // Structural: the production start path (above this test module) must
+        // apply the three setters and confirm they are applied at runtime.
+        let src = include_str!("waycap_backend.rs");
+        // Only the production body before the test module.
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        assert!(
+            prod.contains(".with_gop(")
+                && prod.contains(".with_encoder_tune(")
+                && prod.contains(".with_color_range("),
+            "builder chain must call with_gop / with_encoder_tune / with_color_range"
+        );
+        // Old message was split so this needle cannot live only in tests.
+        let old = ["capture knobs pending ", "waycap-rs builder support"].concat();
+        assert!(!prod.contains(&old), "old pending-only log must be gone");
+        assert!(
+            prod.contains("GOP/tune/color_range applied"),
+            "start log must confirm GOP/tune/color_range are applied"
+        );
     }
 }
