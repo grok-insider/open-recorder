@@ -225,7 +225,9 @@ impl EditorState {
         egui::TopBottomPanel::top("editor-top").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("← Back").clicked() {
+                let back = ui.button("← Back");
+                crate::a11y::button(&back, "Back");
+                if back.clicked() {
                     action = EditorAction::Back;
                 }
                 ui.separator();
@@ -506,7 +508,9 @@ impl EditorState {
                         .fit_to_exact_size(size)
                         .rounding(8.0)
                         .sense(egui::Sense::click());
-                    if ui.add(img).clicked() {
+                    let resp = ui.add(img);
+                    crate::a11y::button(&resp, "Play/Pause preview");
+                    if resp.clicked() {
                         self.player.toggle();
                     }
                 });
@@ -516,6 +520,7 @@ impl EditorState {
                 let size = fit(tw, th);
                 ui.vertical_centered(|ui| {
                     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                    crate::a11y::button(&resp, "Play/Pause preview");
                     // Draw the NV12 frame on the GPU into this rect.
                     ui.painter().add(self.player.gl_callback(rect));
                     if resp.clicked() {
@@ -537,18 +542,14 @@ impl EditorState {
     fn transport_ui(&mut self, ui: &mut egui::Ui) {
         let frame = 1.0 / self.player.fps().max(1.0);
         ui.horizontal(|ui| {
-            if ui
-                .button("⏮ In")
-                .on_hover_text("Jump to in (Home)")
-                .clicked()
-            {
+            let to_in = ui.button("⏮ In").on_hover_text("Jump to in (Home)");
+            crate::a11y::button(&to_in, "Jump to In");
+            if to_in.clicked() {
                 self.seek_to(self.project.timeline.in_point());
             }
-            if ui
-                .button("−1f")
-                .on_hover_text("Previous frame (,)")
-                .clicked()
-            {
+            let prev_f = ui.button("−1f").on_hover_text("Previous frame (,)");
+            crate::a11y::button(&prev_f, "Previous frame");
+            if prev_f.clicked() {
                 self.seek_to(self.project.timeline.playhead() - frame);
             }
             let play_label = if self.player.is_playing() {
@@ -556,26 +557,34 @@ impl EditorState {
             } else {
                 "▶ Play"
             };
-            if ui
-                .button(egui::RichText::new(play_label).strong())
-                .clicked()
-            {
+            let play = ui.button(egui::RichText::new(play_label).strong());
+            crate::a11y::button(
+                &play,
+                if self.player.is_playing() {
+                    "Pause"
+                } else {
+                    "Play"
+                },
+            );
+            if play.clicked() {
                 self.player.toggle();
             }
-            if ui.button("+1f").on_hover_text("Next frame (.)").clicked() {
+            let next_f = ui.button("+1f").on_hover_text("Next frame (.)");
+            crate::a11y::button(&next_f, "Next frame");
+            if next_f.clicked() {
                 self.seek_to(self.project.timeline.playhead() + frame);
             }
-            if ui
-                .button("Out ⏭")
-                .on_hover_text("Jump to out (End)")
-                .clicked()
-            {
+            let to_out = ui.button("Out ⏭").on_hover_text("Jump to out (End)");
+            crate::a11y::button(&to_out, "Jump to Out");
+            if to_out.clicked() {
                 self.seek_to(self.project.timeline.out_point());
             }
 
             ui.separator();
             let mut looping = self.player.looping();
-            if ui.selectable_label(looping, "↻ Loop").clicked() {
+            let loop_btn = ui.selectable_label(looping, "↻ Loop");
+            crate::a11y::button(&loop_btn, "Loop");
+            if loop_btn.clicked() {
                 looping = !looping;
                 self.player.set_loop(looping);
                 let _ = prefs::save(EditorPrefs {
@@ -592,6 +601,7 @@ impl EditorState {
                         .show_value(false)
                         .fixed_decimals(2),
                 );
+                crate::a11y::slider(&slider, "Volume");
                 if slider.changed() {
                     self.player.set_volume(self.project.volume);
                 }
@@ -614,15 +624,21 @@ impl EditorState {
                     .fixed_decimals(2)
                     .suffix("×"),
             );
+            crate::a11y::slider(&speed_slider, "Speed");
             if speed_slider.changed() {
                 self.project.set_speed(speed);
                 self.player.set_speed(self.project.speed);
             }
             for (label, s) in [("½×", 0.5f32), ("1×", 1.0), ("2×", 2.0)] {
-                if ui
-                    .selectable_label((self.project.speed - s).abs() < 0.01, label)
-                    .clicked()
-                {
+                let name = match label {
+                    "½×" => "Speed half",
+                    "1×" => "Speed normal",
+                    "2×" => "Speed double",
+                    _ => label,
+                };
+                let btn = ui.selectable_label((self.project.speed - s).abs() < 0.01, label);
+                crate::a11y::button(&btn, name);
+                if btn.clicked() {
                     self.project.set_speed(s);
                     self.player.set_speed(self.project.speed);
                 }
@@ -753,26 +769,22 @@ impl EditorState {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
+                let fit = ui
                     .button("Fit")
-                    .on_hover_text("Show the whole clip (zoom out fully)")
-                    .clicked()
-                {
+                    .on_hover_text("Show the whole clip (zoom out fully)");
+                crate::a11y::button(&fit, "Zoom fit");
+                if fit.clicked() {
                     self.project.zoom = 1.0;
                     self.project.scroll = 0.0;
                 }
-                if ui
-                    .button("+")
-                    .on_hover_text("Zoom in (wheel or =)")
-                    .clicked()
-                {
+                let zin = ui.button("+").on_hover_text("Zoom in (wheel or =)");
+                crate::a11y::button(&zin, "Zoom in");
+                if zin.clicked() {
                     self.project.zoom = (self.project.zoom * 1.5).min(60.0);
                 }
-                if ui
-                    .button("−")
-                    .on_hover_text("Zoom out (wheel or -)")
-                    .clicked()
-                {
+                let zout = ui.button("−").on_hover_text("Zoom out (wheel or -)");
+                crate::a11y::button(&zout, "Zoom out");
+                if zout.clicked() {
                     self.project.zoom = (self.project.zoom / 1.5).max(1.0);
                 }
                 ui.label(
@@ -1096,6 +1108,7 @@ impl EditorState {
     fn timeline_interactions(&mut self, ui: &mut egui::Ui, track: egui::Rect, view: &View) {
         let id = ui.id().with("tl");
         let resp = ui.interact(track, id, egui::Sense::click_and_drag());
+        crate::a11y::slider(&resp, "Timeline");
         // Capture plain values so the closures don't borrow `self`.
         let dur = self.player.duration();
         let view = *view;
@@ -1359,12 +1372,18 @@ impl EditorState {
                 .map(|(_, s)| s.clone())
                 .unwrap_or_default();
             let mut edit = buf;
+            let a11y = match field {
+                TimeField::In => "In time",
+                TimeField::Out => "Out time",
+                TimeField::Playhead => "Playhead time",
+            };
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut edit)
                     .desired_width(78.0)
                     .font(egui::TextStyle::Monospace)
                     .hint_text("m:ss.mmm"),
             );
+            crate::a11y::text_input(&resp, a11y);
             // Grab keyboard on the first paint of the edit field.
             if !resp.has_focus() && !resp.lost_focus() {
                 resp.request_focus();
@@ -1389,6 +1408,11 @@ impl EditorState {
                 self.time_edit = Some((field, edit));
             }
         } else {
+            let a11y = match field {
+                TimeField::In => "In time",
+                TimeField::Out => "Out time",
+                TimeField::Playhead => "Playhead time",
+            };
             let label = human_duration_ms(value);
             let resp = ui
                 .add(
@@ -1396,6 +1420,7 @@ impl EditorState {
                         .sense(egui::Sense::click()),
                 )
                 .on_hover_text("Click to type a time (m:ss.mmm or seconds)");
+            crate::a11y::clickable_label(&resp, a11y);
             if resp.clicked() {
                 self.time_edit = Some((field, human_duration_ms(value)));
             }

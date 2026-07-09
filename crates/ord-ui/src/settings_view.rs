@@ -160,9 +160,9 @@ impl SettingsView {
             .frame(theme::chrome())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("←  Library").clicked()
-                        || ui.input(|i| i.key_pressed(egui::Key::Escape))
-                    {
+                    let back = ui.button("←  Library");
+                    crate::a11y::button(&back, "Library");
+                    if back.clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         action = SettingsAction::Back;
                     }
                     ui.add_space(theme::SP_2);
@@ -292,6 +292,7 @@ impl SettingsView {
                                 theme::primary_button(ui, label)
                             }
                         });
+                        crate::a11y::button(&apply.inner, "Apply");
                         if apply.inner.clicked() {
                             self.busy = true;
                             action = Some(SettingsAction::Apply(Box::new(model.draft.clone())));
@@ -300,19 +301,19 @@ impl SettingsView {
                             ui.spinner();
                         }
                         ui.add_enabled_ui(dirty && !self.busy, |ui| {
-                            if ui.button("Revert").clicked() {
+                            let rev = ui.button("Revert");
+                            crate::a11y::button(&rev, "Revert");
+                            if rev.clicked() {
                                 model.revert();
                             }
                         });
                         ui.add_enabled_ui(!self.busy, |ui| {
-                            if ui
-                                .button("Reset to base")
-                                .on_hover_text(
-                                    "Discard every runtime override and go back to the values \
-                                     in config.toml (applies on Apply).",
-                                )
-                                .clicked()
-                            {
+                            let reset = ui.button("Reset to base").on_hover_text(
+                                "Discard every runtime override and go back to the values \
+                                 in config.toml (applies on Apply).",
+                            );
+                            crate::a11y::button(&reset, "Reset to base");
+                            if reset.clicked() {
                                 model.reset_to_base();
                             }
                         });
@@ -657,6 +658,7 @@ fn form(
         for p in CaptureProfile::ALL {
             let selected = p == current;
             let resp = ui.selectable_label(selected, p.label());
+            crate::a11y::button(&resp, &format!("Profile {}", p.label()));
             if resp.clicked() && p != CaptureProfile::Custom {
                 p.apply(&mut model.draft.capture);
             }
@@ -727,11 +729,9 @@ fn form(
                     }
                 });
             model.draft.capture.target = target;
-            if ui
-                .small_button("↻")
-                .on_hover_text("Refresh display list")
-                .clicked()
-            {
+            let refresh = ui.small_button("↻").on_hover_text("Refresh display list");
+            crate::a11y::button(&refresh, "Refresh displays");
+            if refresh.clicked() {
                 extra = Some(SettingsExtra::RefreshOutputs);
             }
         },

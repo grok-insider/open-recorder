@@ -934,11 +934,8 @@ impl eframe::App for LibraryApp {
                         let settings_btn = ui
                             .add(egui::Button::new("Settings").min_size(egui::vec2(72.0, 0.0)))
                             .on_hover_text("Daemon configuration (applies live)");
-                        // AccessKit: a stable name so automation can find this
-                        // control even when the grid has no other labels.
-                        settings_btn.widget_info(|| {
-                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Settings")
-                        });
+                        // AccessKit: stable name for screen readers / wisp marks.
+                        crate::a11y::button(&settings_btn, "Settings");
                         if settings_btn.clicked() {
                             self.settings = Some(SettingsView::new());
                             self.send_ctl(Command::GetConfig, ctx);

@@ -14,6 +14,9 @@ fn main() {
     // Record panics + UI stalls to the diagnostics log so crashes/ANRs are
     // captured by the program itself.
     ord_ui::diag::install_panic_hook();
+    // QA env (ORD_A11Y / ORD_SETTINGS / ORD_OPEN): enable AT-SPI so AccessKit
+    // publishes a tree before the first frame — otherwise wisp sees no marks.
+    ord_ui::tuning::ensure_a11y_bus();
     if let Err(e) = ord_ui::app::run(clips_dir()) {
         eprintln!("ord-ui: {e}");
         ord_ui::diag::log_line(&format!("ord-ui exited with error: {e}"));

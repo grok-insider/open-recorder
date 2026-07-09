@@ -20,6 +20,8 @@ pub use library::{parse_clip, scan_dir, sort_newest_first, Clip};
 pub use settings::{ApplyTier, SettingsModel};
 
 #[cfg(feature = "gui")]
+pub mod a11y;
+#[cfg(feature = "gui")]
 pub mod app;
 #[cfg(feature = "gui")]
 pub mod diag;
