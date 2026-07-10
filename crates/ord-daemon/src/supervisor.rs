@@ -170,7 +170,8 @@ fn process_request<B, S>(
                     tracing::info!("capture armed");
                 }
                 Err(e) => {
-                    let message = format!("failed to start capture: {e}");
+                    let detail = e.to_string();
+                    let message = user_facing_capture_error(&detail);
                     send(
                         reply.as_ref(),
                         Event::Error {
@@ -180,17 +181,22 @@ fn process_request<B, S>(
                     // A user-dismissed portal picker must not be re-asked
                     // automatically; everything else (portal not ready at
                     // login, transient D-Bus errors) retries on schedule.
-                    let cancelled = message.to_ascii_lowercase().contains("cancelled");
+                    let cancelled = detail.to_ascii_lowercase().contains("cancelled");
                     if retries > 0 && !cancelled {
                         tracing::warn!(
-                            error = %message,
+                            error = %detail,
+                            user_message = %message,
                             retries_left = retries - 1,
                             retry_in = ?retry_delay,
                             "capture start failed; will retry"
                         );
                         *pending_retry = Some((retries - 1, Instant::now() + retry_delay));
                     } else {
-                        tracing::error!(error = %message, "capture start failed; staying degraded (arm again via `ord buffer on` or auto-arm)");
+                        tracing::error!(
+                            error = %detail,
+                            user_message = %message,
+                            "capture start failed; staying degraded (arm again via `ord buffer on` or auto-arm)"
+                        );
                     }
                 }
             }
@@ -236,13 +242,15 @@ fn process_request<B, S>(
                 }
                 Err(e) => {
                     // Put the stopped-but-buffered engine back so the user
-                    // can still save; the watchdog will try again.
+                    // can still save; the watchdog will try again (with backoff).
                     let mut stale = lock_tolerant(handler).exchange_engine(old, true);
                     let _ = stale.stop();
+                    // Full detail is for operators; the HUD toast must stay short.
+                    tracing::error!(error = %e, "capture stalled and restart failed");
                     broadcast(
                         subs,
                         &Event::Error {
-                            message: format!("capture stalled and restart failed: {e}"),
+                            message: "Capture stalled — restart failed".into(),
                         },
                     );
                 }
@@ -253,8 +261,10 @@ fn process_request<B, S>(
                 if let Err(e) = engine.start() {
                     // The old engine keeps running; the persisted
                     // overrides are retried on the next daemon start.
+                    let detail = e.to_string();
+                    tracing::error!(error = %detail, "new capture settings failed to start");
                     let _ = reply.try_send(Event::Error {
-                        message: format!("new capture settings failed to start: {e}"),
+                        message: user_facing_capture_error(&detail),
                     });
                     return;
                 }
@@ -297,5 +307,47 @@ where
 fn send(reply: Option<&SyncSender<Event>>, ev: Event) {
     if let Some(tx) = reply {
         let _ = tx.try_send(ev);
+    }
+}
+
+/// Short HUD/CLI-friendly capture error. Full `detail` belongs in logs only.
+fn user_facing_capture_error(detail: &str) -> String {
+    let d = detail.to_ascii_lowercase();
+    if d.contains("cancelled") || d.contains("canceled") {
+        return "Screen share cancelled — run ord buffer on".into();
+    }
+    if d.contains("permission") || d.contains("denied") || d.contains("not authorized") {
+        return "Screen share denied — re-approve portal share".into();
+    }
+    if d.contains("nvenc") || d.contains("cuda") || d.contains("encoder") {
+        return "Encoder init failed — check NVIDIA / ord doctor".into();
+    }
+    if d.contains("stall") || d.contains("restart") {
+        return "Capture stalled — restart failed".into();
+    }
+    if d.contains("initialization") || d.contains("init") {
+        return "Capture init failed — try buffer off/on".into();
+    }
+    // Generic short form; never paste the full backend dump into the toast.
+    "Capture failed to start".into()
+}
+
+#[cfg(test)]
+mod user_facing_tests {
+    use super::user_facing_capture_error;
+
+    #[test]
+    fn maps_common_failures_to_short_lines() {
+        assert!(user_facing_capture_error("portal: cancelled by user").contains("cancelled"));
+        assert!(user_facing_capture_error("NVENC open failed").contains("Encoder"));
+        assert!(
+            user_facing_capture_error("capture initialization failed: x").contains("init failed")
+        );
+        assert!(
+            user_facing_capture_error("capture stalled and restart failed: y").contains("stalled")
+        );
+        // Never echo a multi-sentence dump.
+        let long = "a".repeat(200);
+        assert!(user_facing_capture_error(&long).len() < 80);
     }
 }

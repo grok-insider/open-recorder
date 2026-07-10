@@ -24,30 +24,40 @@ pub fn list_outputs() -> Vec<OutputInfo> {
     }
 }
 
+/// Upper bound for encode FPS when `fps_mode = auto`.
+///
+/// Matching a 240 Hz display 1:1 is rarely sustainable for portal + NVENC and
+/// tends to produce a stalled session (watchdog restart loop). Cap auto to a
+/// practical encode rate; users who want higher set `fps_mode = fixed`.
+pub const MAX_AUTO_ENCODE_FPS: u32 = 144;
+
 /// Resolve the integer FPS to use when `fps_mode = auto`.
 ///
 /// - Named target (`DP-1`): match that connector; fallback 60.
 /// - `portal` / unknown: focused output, else highest refresh, else 60.
+/// - Always clamped to [`MAX_AUTO_ENCODE_FPS`].
 pub fn resolve_auto_fps(outputs: &[OutputInfo], target: &str) -> u32 {
     const FALLBACK: u32 = 60;
     if outputs.is_empty() {
-        return FALLBACK;
+        return FALLBACK.min(MAX_AUTO_ENCODE_FPS);
     }
     let t = target.trim();
-    if t != "portal" && !t.is_empty() {
-        if let Some(o) = outputs.iter().find(|o| o.name == t) {
-            return o.refresh_fps();
-        }
-        return FALLBACK;
-    }
-    if let Some(o) = outputs.iter().find(|o| o.focused) {
-        return o.refresh_fps();
-    }
-    outputs
-        .iter()
-        .max_by_key(|o| o.refresh_mhz)
-        .map(OutputInfo::refresh_fps)
-        .unwrap_or(FALLBACK)
+    let raw = if t != "portal" && !t.is_empty() {
+        outputs
+            .iter()
+            .find(|o| o.name == t)
+            .map(OutputInfo::refresh_fps)
+            .unwrap_or(FALLBACK)
+    } else if let Some(o) = outputs.iter().find(|o| o.focused) {
+        o.refresh_fps()
+    } else {
+        outputs
+            .iter()
+            .max_by_key(|o| o.refresh_mhz)
+            .map(OutputInfo::refresh_fps)
+            .unwrap_or(FALLBACK)
+    };
+    raw.clamp(1, MAX_AUTO_ENCODE_FPS)
 }
 
 /// Pick a monitor for a native-resolution container hint when the target is a
@@ -202,9 +212,23 @@ mod tests {
     fn resolve_auto_fps_prefers_named_then_focused() {
         let outs = parse_hyprctl_monitors(FIXTURE).unwrap();
         assert_eq!(resolve_auto_fps(&outs, "HDMI-A-1"), 60);
-        assert_eq!(resolve_auto_fps(&outs, "portal"), 165);
+        // DP-1 is 165 Hz focused; auto encode caps at MAX_AUTO_ENCODE_FPS.
+        assert_eq!(
+            resolve_auto_fps(&outs, "portal"),
+            MAX_AUTO_ENCODE_FPS.min(165)
+        );
         assert_eq!(resolve_auto_fps(&outs, "missing"), 60);
         assert_eq!(resolve_auto_fps(&[], "portal"), 60);
+    }
+
+    #[test]
+    fn resolve_auto_fps_caps_high_refresh_for_encode() {
+        let json =
+            r#"[{"name":"DP-1","width":2560,"height":1440,"refreshRate":239.99,"focused":true}]"#;
+        let outs = parse_hyprctl_monitors(json).unwrap();
+        assert_eq!(outs[0].refresh_fps(), 240);
+        assert_eq!(resolve_auto_fps(&outs, "portal"), MAX_AUTO_ENCODE_FPS);
+        assert_eq!(resolve_auto_fps(&outs, "DP-1"), MAX_AUTO_ENCODE_FPS);
     }
 
     #[test]

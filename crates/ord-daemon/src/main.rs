@@ -441,8 +441,9 @@ fn effective_capture_fps(config: &Config) -> u32 {
             let fps = ord_daemon::outputs::resolve_auto_fps(&outs, &config.capture.target);
             tracing::info!(
                 fps,
+                max_auto = ord_daemon::outputs::MAX_AUTO_ENCODE_FPS,
                 target = %config.capture.target,
-                "capture fps_mode=auto resolved from monitor probe"
+                "capture fps_mode=auto resolved from monitor probe (capped for encode)"
             );
             fps
         }

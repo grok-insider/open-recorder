@@ -226,6 +226,9 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
             // Only arms *we* made are auto-disarmed; a manual arm stays on.
             let mut auto_armed = false;
             let mut not_game_probes: u32 = 0;
+            // After a restart request, wait before another (avoids toast spam
+            // while the portal/NVENC is wedged).
+            let mut restart_cooldown_until = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_millis(250));
                 tick = tick.wrapping_add(1);
@@ -314,6 +317,9 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
                     last_frames = Instant::now();
                     continue;
                 }
+                if Instant::now() < restart_cooldown_until {
+                    continue;
+                }
                 tracing::warn!(
                     stalled_for = ?last_frames.elapsed(),
                     "no frames from capture; requesting a session restart"
@@ -323,7 +329,9 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
                 // the replay buffer) off this thread and broadcasts the
                 // outcome; a hung portal can never stall frame draining here.
                 let _ = supervisor.send(crate::supervisor::CaptureRequest::Restart);
-                // Either way, wait a full window before the next attempt.
+                // Cooldown covers both success and failure: rapid re-init while
+                // the portal is still tearing down is a common init-failure loop.
+                restart_cooldown_until = Instant::now() + Duration::from_secs(20);
                 last_frames = Instant::now();
             }
         });
@@ -1436,7 +1444,14 @@ mod tests {
         let reply = request(&mut client, &Command::SetBuffer { enabled: true });
         match reply {
             Event::Error { message } => {
-                assert!(message.contains("failed to start capture"), "{message}")
+                // Short user-facing copy (full backend detail is logged only).
+                assert!(
+                    message.len() < 120
+                        && (message.to_ascii_lowercase().contains("capture")
+                            || message.to_ascii_lowercase().contains("share")
+                            || message.to_ascii_lowercase().contains("failed")),
+                    "unexpected error toast: {message}"
+                );
             }
             other => panic!("expected Error, got {other:?}"),
         }
