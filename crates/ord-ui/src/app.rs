@@ -24,9 +24,22 @@ use crate::meta::{self, ClipMeta};
 use crate::settings_view::{SettingsAction, SettingsExtra, SettingsView};
 use crate::theme;
 
-const CARD_INNER_W: f32 = 300.0;
-const THUMB_W: f32 = 300.0;
-const THUMB_H: f32 = 169.0; // 16:9
+/// Adaptive card sizing for the library grid (computed per layout pass).
+#[derive(Clone, Copy)]
+struct CardMetrics {
+    inner: f32,
+    thumb_w: f32,
+    thumb_h: f32,
+}
+
+/// Per-card render inputs (keeps `card` under clippy's arg limit).
+struct CardArgs<'a> {
+    clip: &'a Clip,
+    now: u64,
+    is_export: bool,
+    idx: usize,
+    metrics: CardMetrics,
+}
 
 /// Message from the background loader thread.
 enum Loaded {
@@ -1017,9 +1030,15 @@ impl eframe::App for LibraryApp {
                 // lay out fixed rows of fixed-width cards: a real grid, no
                 // reliance on egui's wrap inference.
                 let avail = ui.available_width();
-                const CARD_OUTER_W: f32 = CARD_INNER_W + 2.0 * theme::SP_3 + 8.0;
                 let spacing = theme::SP_3;
-                let cols = (((avail + spacing) / (CARD_OUTER_W + spacing)).floor() as usize).max(1);
+                // Frame pad ≈ horizontal card margin + rounding chrome.
+                let frame_pad = 2.0 * theme::SP_3 + 8.0;
+                let (cols, card_inner) = crate::layout::library_grid(avail, spacing, frame_pad);
+                let metrics = CardMetrics {
+                    inner: card_inner,
+                    thumb_w: card_inner,
+                    thumb_h: crate::layout::thumb_height(card_inner),
+                };
                 // Owned snapshots of the cached views, so the card closures can
                 // mutate `self`; restored below (no per-repaint clone).
                 let clips = std::mem::take(&mut self.view_clips);
@@ -1034,7 +1053,17 @@ impl eframe::App for LibraryApp {
                         for row in clips.chunks(cols) {
                             ui.horizontal(|ui| {
                                 for clip in row {
-                                    self.card(ui, clip, now, ctx, false, idx);
+                                    self.card(
+                                        ui,
+                                        ctx,
+                                        CardArgs {
+                                            clip,
+                                            now,
+                                            is_export: false,
+                                            idx,
+                                            metrics,
+                                        },
+                                    );
                                     idx += 1;
                                 }
                             });
@@ -1044,7 +1073,17 @@ impl eframe::App for LibraryApp {
                             for row in exports.chunks(cols) {
                                 ui.horizontal(|ui| {
                                     for clip in row {
-                                        self.card(ui, clip, now, ctx, true, idx);
+                                        self.card(
+                                            ui,
+                                            ctx,
+                                            CardArgs {
+                                                clip,
+                                                now,
+                                                is_export: true,
+                                                idx,
+                                                metrics,
+                                            },
+                                        );
                                         idx += 1;
                                     }
                                 });
@@ -1180,15 +1219,14 @@ impl LibraryApp {
         }
     }
 
-    fn card(
-        &mut self,
-        ui: &mut egui::Ui,
-        clip: &Clip,
-        now: u64,
-        ctx: &egui::Context,
-        is_export: bool,
-        idx: usize,
-    ) {
+    fn card(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, args: CardArgs<'_>) {
+        let CardArgs {
+            clip,
+            now,
+            is_export,
+            idx,
+            metrics,
+        } = args;
         let focused = self.focused == Some(idx);
         let frame = if focused {
             theme::card_focused()
@@ -1196,9 +1234,9 @@ impl LibraryApp {
             theme::card()
         };
         let resp = frame.show(ui, |ui| {
-            ui.set_width(CARD_INNER_W);
+            ui.set_width(metrics.inner);
             ui.vertical(|ui| {
-                if self.thumbnail(ui, clip, is_export) {
+                if self.thumbnail(ui, clip, is_export, metrics) {
                     if is_export {
                         open_clip(&clip.path);
                     } else {
@@ -1255,8 +1293,14 @@ impl LibraryApp {
 
     /// Render the thumbnail; returns true if it was clicked (opens the editor,
     /// or plays the file for an export).
-    fn thumbnail(&self, ui: &mut egui::Ui, clip: &Clip, is_export: bool) -> bool {
-        let size = egui::vec2(THUMB_W, THUMB_H);
+    fn thumbnail(
+        &self,
+        ui: &mut egui::Ui,
+        clip: &Clip,
+        is_export: bool,
+        metrics: CardMetrics,
+    ) -> bool {
+        let size = egui::vec2(metrics.thumb_w, metrics.thumb_h);
         let hover = if is_export { "Play" } else { "Edit / trim" };
         match self.states.get(&clip.path).and_then(|s| s.texture.as_ref()) {
             Some(tex) => ui
@@ -1404,8 +1448,11 @@ pub fn run(clips_dir: PathBuf) -> eframe::Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_app_id("open-recorder")
             .with_title("open-recorder")
-            .with_inner_size([920.0, 640.0])
-            .with_min_inner_size([420.0, 320.0]),
+            // Default open size suits 1440p/ultrawide desktops; the layout
+            // grows with available width (see `layout::`). Min keeps the grid
+            // usable on small windows.
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([480.0, 360.0]),
         // Disable vsync so eframe's swap_buffers never BLOCKS waiting for a frame
         // callback. On Wayland a hidden surface (e.g. this window's Hyprland
         // special workspace toggled away) stops getting frame callbacks, so a

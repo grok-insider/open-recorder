@@ -214,9 +214,11 @@ impl SettingsView {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        // One centered column, ~620px: a form wants a measure,
-                        // not the full window width.
-                        let col = 620.0_f32.min(ui.available_width() - 2.0 * theme::SP_4);
+                        // Responsive measure: grow on large displays, keep a
+                        // readable column on small ones (see layout::form_column_width).
+                        let pad = 2.0 * theme::SP_4;
+                        let col =
+                            crate::layout::form_column_width((ui.available_width() - pad).max(0.0));
                         ui.vertical_centered(|ui| {
                             ui.set_max_width(col);
                             ui.add_space(theme::SP_3);
@@ -1483,7 +1485,7 @@ fn transform_slider_i32(
 }
 
 fn pressed_keys_preview(ui: &mut egui::Ui, keys: &mut ord_common::PressedKeysConfig) {
-    let width = ui.available_width().clamp(280.0, 460.0);
+    let width = ui.available_width().clamp(280.0, 720.0);
     let size = egui::vec2(width, width * 9.0 / 16.0);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
     if (resp.clicked() || resp.dragged()) && resp.interact_pointer_pos().is_some() {

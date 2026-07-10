@@ -93,6 +93,9 @@ pub struct EditorState {
     dbg_log_at: Instant,
     /// In-flight export progress from the library shell (`None` = idle).
     export_progress: Option<f32>,
+    /// Last decode seek issued during a timeline scrub (throttle intermediate
+    /// seeks so keyframe run-up can finish and the preview updates live).
+    last_scrub_seek: Option<(f64, Instant)>,
 }
 
 impl EditorState {
@@ -130,6 +133,7 @@ impl EditorState {
             debug: crate::tuning::debug_overlay(),
             dbg_log_at: Instant::now(),
             export_progress: None,
+            last_scrub_seek: None,
         })
     }
 
@@ -152,6 +156,31 @@ impl EditorState {
     fn seek_to(&mut self, t: f64) {
         self.project.timeline.set_playhead(t);
         self.player.seek(t);
+        self.last_scrub_seek = Some((t, Instant::now()));
+    }
+
+    /// Scrub the playhead (and optionally the decoder) during a drag.
+    ///
+    /// The playhead UI always follows the pointer. Decode seeks are throttled
+    /// so the demuxer can finish keyframe run-up and paint intermediate frames
+    /// instead of thrashing on every pointer motion; `force` is used on
+    /// drag-end / click so the final frame is exact.
+    fn scrub_to(&mut self, t: f64, force: bool, ctx: &egui::Context) {
+        self.project.timeline.set_playhead(t);
+        let now = Instant::now();
+        if crate::layout::should_scrub_seek(
+            self.last_scrub_seek,
+            now,
+            t,
+            force,
+            Duration::from_millis(50),
+            0.04,
+        ) {
+            self.player.seek(t);
+            self.last_scrub_seek = Some((t, now));
+        }
+        // Keep repainting while paused so the scrubbed frame paints promptly.
+        ctx.request_repaint();
     }
 
     /// Run a cut mutation with undo: the previous state is kept only when the
@@ -1160,6 +1189,24 @@ impl EditorState {
                 if self.player.is_playing() {
                     self.player.pause();
                 }
+                // Seek on grab so the first preview frame lands immediately.
+                let t = snap(self.project.markers.as_slice(), time_at(p.x));
+                match target {
+                    DragTarget::In => {
+                        self.project.timeline.set_in(t);
+                        self.scrub_to(self.project.timeline.in_point(), true, ui.ctx());
+                    }
+                    DragTarget::Out => {
+                        self.project.timeline.set_out(t);
+                        self.scrub_to(self.project.timeline.out_point(), true, ui.ctx());
+                    }
+                    DragTarget::Playhead => self.scrub_to(t, true, ui.ctx()),
+                    DragTarget::Cut(i) => {
+                        if let Some(applied) = self.project.segments.move_cut(i, t) {
+                            self.scrub_to(applied, true, ui.ctx());
+                        }
+                    }
+                }
             }
         }
         if resp.dragged() {
@@ -1170,23 +1217,29 @@ impl EditorState {
                 match drag {
                     DragTarget::In => {
                         self.project.timeline.set_in(t);
-                        self.seek_to(self.project.timeline.in_point());
+                        self.scrub_to(self.project.timeline.in_point(), false, ui.ctx());
                     }
                     DragTarget::Out => {
                         self.project.timeline.set_out(t);
-                        self.seek_to(self.project.timeline.out_point());
+                        self.scrub_to(self.project.timeline.out_point(), false, ui.ctx());
                     }
-                    DragTarget::Playhead => self.seek_to(t),
+                    DragTarget::Playhead => self.scrub_to(t, false, ui.ctx()),
                     DragTarget::Cut(i) => {
                         // The preview follows the sliding cut, frame-accurate.
                         if let Some(applied) = self.project.segments.move_cut(i, t) {
-                            self.seek_to(applied);
+                            self.scrub_to(applied, false, ui.ctx());
                         }
                     }
                 }
             }
         }
         if resp.drag_stopped() {
+            // Force a final seek so the paused preview matches the released
+            // playhead (intermediate seeks were throttled during the drag).
+            if self.drag.is_some() {
+                let ph = self.project.timeline.playhead();
+                self.scrub_to(ph, true, ui.ctx());
+            }
             if let Some(snapshot) = self.drag_undo.take() {
                 if snapshot != self.project.segments {
                     self.project.history.push(snapshot);

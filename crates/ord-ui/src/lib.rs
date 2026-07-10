@@ -8,6 +8,7 @@
 
 pub mod edit_history;
 pub mod format;
+pub mod layout;
 pub mod library;
 pub mod markers;
 pub mod pace;
