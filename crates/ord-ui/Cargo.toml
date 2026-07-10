@@ -19,12 +19,8 @@ thiserror.workspace = true
 dirs.workspace = true
 # Explicit `accesskit` so the AT-SPI tree is always on for the gui feature —
 # screen readers and wisp automation can target widgets (Settings, profiles, …).
-eframe = {
-    version = "0.29",
-    optional = true,
-    default-features = false,
-    features = ["accesskit", "default_fonts", "glow", "wayland", "x11"],
-}
+# Single-line table: multi-line inline tables need a newer cargo than MSRV 1.87.
+eframe = { version = "0.29", optional = true, default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"], optional = true }
 # Inline A/V preview player (decode via ffmpeg-next, audio out via cpal).
 ffmpeg-next = { workspace = true, optional = true }
