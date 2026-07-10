@@ -4,6 +4,18 @@ All notable changes to open-recorder are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-10
+
+- Added capture profiles and redesigned recording settings with OBS-style profile chips, monitor source list, native/fixed resolution, match-display refresh, advanced capture knobs, and live capture summary
+- Added adaptive filmstrip, waveform, and numeric time input for frame-accurate trims
+- Added editor speed control (0.25×–2×), Save as clip into library, in-editor export progress, and Redo (Ctrl+Shift+Z / Ctrl+Y)
+- Added AccessKit labels and environment variables (ORD_A11Y, ORD_SETTINGS, ORD_OPEN, ORD_AUTOPLAY) for automation and accessibility
+- Added capture GOP, tune, and color range settings via waycap
+- Added fps_mode (fixed/auto match display refresh), ListOutputs IPC, hyprctl monitor probe, `ord outputs` command, and nested resolution configuration
+- Changed protocol version 7 → 8; upgrade ordd and all clients together
+- Changed recording reliability: finalize recordings on write failure and config swap instead of dropping the muxer; capture stop/restart runs off the handler lock; auto-arm will not stack portal dialogs; failed clip verification removes the bad file
+- Fixed single-line eframe dependency for MSRV cargo (fixes compilation on Rust 1.87)
+
 ## [0.5.0] - 2026-07-08
 
 - Added customizable pressed-key keycaps to the overlay HUD, allowing you to see which keys are pressed with distinct visual indicators.
