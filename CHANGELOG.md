@@ -4,6 +4,13 @@ All notable changes to open-recorder are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-07-10
+
+- Fixed capture error toasts to display briefly on screen with full details in logs
+- Fixed auto-encode FPS to cap at 144, preventing unsustainable sessions on 240 Hz displays
+- Fixed watchdog restart cooldown to 20 seconds between attempts, stopping restart spam
+- Fixed long HUD toast text to wrap onto multi-line cards with word-aware line breaks
+
 ## [0.6.0] - 2026-07-10
 
 - Added capture profiles and redesigned recording settings with OBS-style profile chips, monitor source list, native/fixed resolution, match-display refresh, advanced capture knobs, and live capture summary
