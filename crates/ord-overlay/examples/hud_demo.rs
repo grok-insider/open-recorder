@@ -24,7 +24,12 @@ fn main() {
     hud.toast_for(ToastKind::Saved, "Clip saved (30s)", now_ms(), 8000);
     hud.toast_for(ToastKind::Recording, "Replay buffer on", now_ms(), 8000);
     hud.toast_for(ToastKind::Stopped, "Recording stopped", now_ms(), 8000);
-    hud.toast_for(ToastKind::Error, "Encoder error: no NVENC", now_ms(), 8000);
+    hud.toast_for(
+        ToastKind::Error,
+        "Capture stalled — restart failed (screen share or encoder init)",
+        now_ms(),
+        8000,
+    );
 
     while start.elapsed() < Duration::from_secs(9) {
         hud.tick(now_ms());

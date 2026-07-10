@@ -15,11 +15,13 @@ pub mod hud;
 pub mod key_source;
 #[cfg(feature = "layershell")]
 pub mod layershell;
+pub mod wrap;
 
 pub use apply::apply;
 pub use hud::{Hud, PressedKeyEvent, PressedKeysLayout, Toast, ToastKind};
 #[cfg(feature = "layershell")]
 pub use layershell::LayerShellOverlay;
+pub use wrap::{wrap_text, MAX_TOAST_LINES};
 
 /// Errors creating or driving an overlay surface.
 #[derive(Debug, thiserror::Error)]

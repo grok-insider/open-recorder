@@ -35,6 +35,7 @@ use fontdue::{Font, Metrics};
 use ord_common::config::PressedKeysPosition;
 
 use crate::hud::{Hud, PressedKeysLayout, ToastKind};
+use crate::wrap::{wrap_text, MAX_TOAST_LINES};
 use crate::{Overlay, OverlayError};
 
 /// A rasterized glyph (constant font size), cached so a visible toast blits the
@@ -56,13 +57,18 @@ const KEY_FONT_DATA: &[u8] = include_bytes!("../../ord-ui/assets/fonts/IBMPlexMo
 // right-aligned within it, with `SHADOW` px of transparent margin for the soft
 // drop shadow.
 const SHADOW: u32 = 16;
-const CARD_H: u32 = 46;
+/// Minimum card height (one line of text + vertical padding).
+const CARD_H_MIN: u32 = 46;
+/// Extra height per additional wrapped text line.
+const CARD_LINE_H: u32 = 18;
 const CARD_GAP: u32 = 10;
 const MAX_ROWS: u32 = 5;
 const CARD_MAX_W: u32 = 420;
 const CARD_MIN_W: u32 = 168;
+/// Tall enough for `MAX_ROWS` cards each with [`MAX_TOAST_LINES`] lines.
 const SURFACE_W: u32 = CARD_MAX_W + SHADOW * 2;
-const SURFACE_H: u32 = SHADOW * 2 + (CARD_H + CARD_GAP) * MAX_ROWS;
+const SURFACE_H: u32 =
+    SHADOW * 2 + (CARD_H_MIN + CARD_LINE_H * (MAX_TOAST_LINES as u32 - 1) + CARD_GAP) * MAX_ROWS;
 
 const KEY_SURFACE_FALLBACK_W: u32 = 1280;
 const KEY_SURFACE_FALLBACK_H: u32 = 720;
@@ -78,6 +84,8 @@ const KEY_SHADOW: f32 = 18.0;
 const CARD_RADIUS: f32 = 12.0;
 const FONT_PX: f32 = 15.0;
 const PAD_X: f32 = 15.0;
+const PAD_Y: f32 = 12.0;
+const LINE_GAP: f32 = 3.0;
 const ICON_BOX: f32 = 20.0;
 const ICON_GAP: f32 = 11.0;
 
@@ -317,25 +325,29 @@ impl State {
             let alpha = fade_in.min(fade_out);
             if alpha > 0.001 {
                 let slide = ((1.0 - fade_in) * SLIDE_PX + (1.0 - fade_out) * SLIDE_PX) * s;
-                let text_w = measure_text(cache, &toast.text);
-                let card_w = ((PAD_X + ICON_BOX + ICON_GAP + PAD_X) * s + text_w)
-                    .clamp(CARD_MIN_W as f32 * s, CARD_MAX_W as f32 * s);
+                let chrome_w = (PAD_X + ICON_BOX + ICON_GAP + PAD_X) * s;
+                let max_text_w = (CARD_MAX_W as f32 * s - chrome_w).max(8.0 * s);
+                let lines = wrap_text(&toast.text, max_text_w, |ch| {
+                    cache
+                        .get(&ch)
+                        .map_or(FONT_PX * s * 0.5, |g| g.metrics.advance_width)
+                });
+                let text_block_w = lines
+                    .iter()
+                    .map(|l| measure_text(cache, l))
+                    .fold(0.0_f32, f32::max);
+                let card_w =
+                    (chrome_w + text_block_w).clamp(CARD_MIN_W as f32 * s, CARD_MAX_W as f32 * s);
+                let n_lines = lines.len().max(1);
+                let card_h = card_height_px(n_lines, s);
                 let x0 = right - card_w + slide;
                 draw_card(
-                    canvas,
-                    w,
-                    h,
-                    cache,
-                    x0,
-                    y,
-                    card_w,
-                    toast.kind,
-                    &toast.text,
-                    alpha,
-                    s,
+                    canvas, w, h, cache, x0, y, card_w, card_h, toast.kind, &lines, alpha, s,
                 );
+                y += card_h + CARD_GAP as f32 * s;
+            } else {
+                y += CARD_H_MIN as f32 * s + CARD_GAP as f32 * s;
             }
-            y += (CARD_H + CARD_GAP) as f32 * s;
         }
 
         // Persistent replay-buffer indicator: a small dot in the top-right
@@ -508,8 +520,16 @@ fn measure_text(cache: &GlyphCache, text: &str) -> f32 {
         .sum()
 }
 
-/// Draw one toast card: soft shadow, rounded body + hairline, icon, and text.
-/// `s` is the integer output scale as f32; all inputs/outputs are physical px.
+/// Physical height of a toast card with `n_lines` of text at scale `s`.
+fn card_height_px(n_lines: usize, s: f32) -> f32 {
+    let n = n_lines.clamp(1, MAX_TOAST_LINES) as f32;
+    let text_h = FONT_PX * s * n + LINE_GAP * s * (n - 1.0).max(0.0);
+    (text_h + 2.0 * PAD_Y * s).max(CARD_H_MIN as f32 * s)
+}
+
+/// Draw one toast card: soft shadow, rounded body + hairline, icon, and
+/// multi-line text. `s` is the integer output scale as f32; all inputs are
+/// physical px.
 #[allow(clippy::too_many_arguments)]
 fn draw_card(
     canvas: &mut [u8],
@@ -519,12 +539,12 @@ fn draw_card(
     x0: f32,
     y0: f32,
     w: f32,
+    h: f32,
     kind: ToastKind,
-    text: &str,
+    lines: &[String],
     alpha: f32,
     s: f32,
 ) {
-    let h = CARD_H as f32 * s;
     let (cx, cy) = (x0 + w / 2.0, y0 + h / 2.0);
     let (hw, hh) = (w / 2.0, h / 2.0);
 
@@ -583,10 +603,15 @@ fn draw_card(
     );
 
     let tx = x0 + (PAD_X + ICON_BOX + ICON_GAP) * s;
-    let baseline = y0 + h / 2.0 + FONT_PX * s * 0.34;
-    draw_text(
-        canvas, width, height, cache, text, tx, baseline, TEXT_RGB, alpha,
-    );
+    let n = lines.len().max(1) as f32;
+    let block_h = FONT_PX * s * n + LINE_GAP * s * (n - 1.0).max(0.0);
+    let mut baseline = y0 + (h - block_h) / 2.0 + FONT_PX * s * 0.78;
+    for line in lines {
+        draw_text(
+            canvas, width, height, cache, line, tx, baseline, TEXT_RGB, alpha,
+        );
+        baseline += FONT_PX * s + LINE_GAP * s;
+    }
 }
 
 fn key_font_px(layout: PressedKeysLayout, s: f32) -> f32 {
