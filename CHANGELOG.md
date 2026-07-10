@@ -4,6 +4,11 @@ All notable changes to open-recorder are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-07-10
+
+- Fixed layout of settings form and library cards to scale properly on large displays, preventing empty space on ultrawide windows.
+- Fixed timeline scrubbing to update preview frames live while dragging the playhead, instead of only seeking on release.
+
 ## [0.6.1] - 2026-07-10
 
 - Fixed capture error toasts to display briefly on screen with full details in logs
