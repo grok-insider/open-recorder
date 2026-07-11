@@ -67,6 +67,10 @@ jobs:
   # the Linux-only jobs can never see.
   cross-check:
     name: cargo check (windows + macos targets)
+    if: >
+      github.event_name == 'workflow_dispatch'
+      || github.event_name == 'push'
+      || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -136,12 +140,6 @@ jobs:
   build:
     name: build + cache (x86_64-linux)
     if: >
-      github.event_name == 'workflow_dispatch'
-      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
-      || (github.event_name == 'pull_request'
-          && github.event.action == 'closed'
-          && github.event.pull_request.merged == true
-          && github.event.pull_request.base.ref == 'master')
       github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
       || (github.event_name == 'pull_request'
