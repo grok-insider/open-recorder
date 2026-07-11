@@ -30,17 +30,11 @@ name: Release
 # `git_only` setting in release-plz.toml.
 
 on:
-  push:
+  pull_request:
+    types: [closed]
     branches: [master]
-  # Manual test/kick handle for the release-pr job. `force` bypasses the
-  # feat/fix filter so the flow can be exercised end-to-end on demand.
   workflow_dispatch:
-    inputs:
-      force:
-        description: Open the release PR even without feat/fix commits
-        required: false
-        type: boolean
-        default: false
+
 
 # Least privilege by default; each job elevates only what it needs.
 permissions:
@@ -51,7 +45,11 @@ jobs:
   # what later triggers the `release` job (via the resulting push to master).
   release-pr:
     name: release PR (patch line)
-    if: github.repository_owner == 'grok-insider'
+    if: >
+      github.repository_owner == 'grok-insider'
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'pull_request'
+              && github.event.pull_request.merged == true))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -68,6 +66,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || github.sha }}
           # PAT so pushes to the release branch trigger required CI (a
           # GITHUB_TOKEN-pushed branch doesn't).
           persist-credentials: true
@@ -218,7 +217,11 @@ jobs:
   # whether a release was cut (and its tag/version) to the artifact jobs below.
   release-plz-release:
     name: release-plz release
-    if: github.repository_owner == 'grok-insider'
+    if: >
+      github.repository_owner == 'grok-insider'
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'pull_request'
+              && github.event.pull_request.merged == true))
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -1,14 +1,15 @@
 name: CI
 
 on:
-  push:
-    branches: [master]
-    tags: ["v*"]
   pull_request:
+    types: [opened, synchronize, reopened, closed]
+  push:
+    tags: ["v*"]
   workflow_dispatch:
 
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.pull_request.number || github.sha }}
   # PR pushes supersede each other, but master/tag runs must complete: a
   # cancelled master run skips the build→cachix job and leaves that commit's
   # closure uncached (observed when two master merges landed 10 min apart).
@@ -26,6 +27,10 @@ jobs:
   # The per-iteration check.
   rust:
     name: fmt + clippy + test (default features)
+    if: >
+      github.event_name == 'workflow_dispatch'
+      || github.event_name == 'push'
+      || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +47,10 @@ jobs:
   # floor. `cargo check` on the pinned MSRV toolchain catches that.
   msrv:
     name: cargo check (MSRV 1.87)
+    if: >
+      github.event_name == 'workflow_dispatch'
+      || github.event_name == 'push'
+      || (github.event_name == 'pull_request' && github.event.action != 'closed')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,6 +88,13 @@ jobs:
   # not only at release. Runs on every push/PR.
   nix-checks:
     name: nix --all-features + flake eval
+    if: >
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      || (github.event_name == 'pull_request'
+          && github.event.action == 'closed'
+          && github.event.pull_request.merged == true
+          && github.event.pull_request.base.ref == 'master')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -119,7 +135,19 @@ jobs:
   # rebuilding it.
   build:
     name: build + cache (x86_64-linux)
-    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    if: >
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      || (github.event_name == 'pull_request'
+          && github.event.action == 'closed'
+          && github.event.pull_request.merged == true
+          && github.event.pull_request.base.ref == 'master')
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
+      || (github.event_name == 'pull_request'
+          && github.event.action == 'closed'
+          && github.event.pull_request.merged == true
+          && github.event.pull_request.base.ref == 'master')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
