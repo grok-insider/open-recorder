@@ -130,3 +130,7 @@ plain commit list without it); the `v*` tags exist.
 
 See [`docs/releasing.md`](./docs/releasing.md) for the version surfaces (package
 version, binary `--version`, wire `PROTOCOL_VERSION`) and how consumers update.
+
+## Branch policy
+
+Open feature/fix PRs against **`dev`**, not `master`. When a batch is ready, open a single **`dev` → `master`** integration PR.

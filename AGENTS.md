@@ -237,3 +237,12 @@ the old engine's replay state instead of discarding footage.
 
 Forward work is tracked in `continue-plan.md` (the single roadmap); the shipped
 record is `docs/roadmap-status.md`.
+
+## Branch model (Model A)
+
+- Human feature/fix/docs PRs target **`dev`**, not `master`.
+- **`master`:** released line. Protected; required checks include CI + **`only dev into master`**.
+- **`dev`:** integration branch. Land work here first.
+- **Guard:** `.github/workflows/guard-master.yml` allowlists `dev` and release-bot heads.
+- **Flow:** `feat/*` → PR into `dev` → batch via `dev`→`master` PR → release on merge to `master`.
+- Org QC: `~/dev/opensource/docs/comparison.md`.
