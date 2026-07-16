@@ -151,14 +151,31 @@ fn render(event: Event) -> String {
             buffered_seconds,
             buffered_frames,
             buffered_keyframes,
-        } => format!(
-            "buffer: {} | recording: {} | buffered: {}s ({} frames, {} keyframes)",
-            if buffer_enabled { "on" } else { "off" },
-            if recording { "yes" } else { "no" },
-            buffered_seconds,
-            buffered_frames,
-            buffered_keyframes
-        ),
+            encode_bitrate_kbps,
+            target_bitrate_kbps,
+        } => {
+            let mut s = format!(
+                "buffer: {} | recording: {} | buffered: {}s ({} frames, {} keyframes)",
+                if buffer_enabled { "on" } else { "off" },
+                if recording { "yes" } else { "no" },
+                buffered_seconds,
+                buffered_frames,
+                buffered_keyframes
+            );
+            match (encode_bitrate_kbps, target_bitrate_kbps) {
+                (Some(enc), Some(tgt)) => {
+                    s.push_str(&format!(" | encode: {enc} kbps (target {tgt})"));
+                }
+                (Some(enc), None) => {
+                    s.push_str(&format!(" | encode: {enc} kbps (cq)"));
+                }
+                (None, Some(tgt)) => {
+                    s.push_str(&format!(" | encode: … (target {tgt} kbps)"));
+                }
+                (None, None) => {}
+            }
+            s
+        }
         Event::Error { message } => format!("error: {message}"),
         Event::Marked { auto_saving } => {
             if auto_saving {
@@ -212,12 +229,16 @@ fn render_json(event: &Event) -> Result<String, String> {
             buffered_seconds,
             buffered_frames,
             buffered_keyframes,
+            encode_bitrate_kbps,
+            target_bitrate_kbps,
         } => Ok(serde_json::json!({
             "buffer_enabled": buffer_enabled,
             "recording": recording,
             "buffered_seconds": buffered_seconds,
             "buffered_frames": buffered_frames,
             "buffered_keyframes": buffered_keyframes,
+            "encode_bitrate_kbps": encode_bitrate_kbps,
+            "target_bitrate_kbps": target_bitrate_kbps,
         })
         .to_string()),
         Event::Error { message } => Ok(serde_json::json!({ "error": message }).to_string()),
@@ -350,16 +371,43 @@ fn config_set(client: &mut ord_common::Client, key: &str, value: &str) -> Result
     set_dotted(&mut doc, key, value)?;
     let patched = toml::to_string(&doc).map_err(|e| e.to_string())?;
     let config = Config::from_toml_str(&patched).map_err(|e| format!("invalid setting: {e}"))?;
+    let quality_note = bitrate_policy_note(&config);
     let reply = client
         .request(&Command::SetConfig {
             config: Box::new(config),
         })
         .map_err(|e| e.to_string())?;
     match reply {
-        Event::Config { .. } => Ok(format!("set {key} = {value}")),
+        Event::Config { .. } => {
+            let mut msg = format!("set {key} = {value}");
+            if let Some(note) = quality_note {
+                msg.push_str("\n");
+                msg.push_str(&note);
+            }
+            Ok(msg)
+        }
         Event::Error { message } => Err(message),
         other => Err(format!("unexpected reply: {}", render(other))),
     }
+}
+
+/// If CBR is set too low for a typical 1440p60-class capture, warn (daemon will
+/// raise it using the real probe at session start).
+fn bitrate_policy_note(config: &Config) -> Option<String> {
+    let kbps = config.capture.bitrate_kbps?;
+    // Without live probe, use the draft resolution or a 1440p assumption.
+    let (w, h) = match config.capture.resolution {
+        Some(r) => (r.width, r.height),
+        None => (2560, 1440),
+    };
+    let fps = config.capture.fps.max(1);
+    let raise =
+        ord_common::raise_bitrate_if_too_low(kbps, w, h, fps, config.capture.codec)?;
+    Some(format!(
+        "warning: {kbps} kbps is below the quality floor for {w}x{h}@{fps} {:?} \
+         (min {}); daemon will raise to {} on next capture restart",
+        raise.codec, raise.minimum_kbps, raise.raised_to_kbps
+    ))
 }
 
 fn connect() -> Result<ord_common::Client, String> {
@@ -635,6 +683,8 @@ mod tests {
             buffered_seconds: 12,
             buffered_frames: 720,
             buffered_keyframes: 12,
+            encode_bitrate_kbps: Some(40_000),
+            target_bitrate_kbps: Some(50_000),
         })
         .unwrap();
         assert!(s.contains("\"buffer_enabled\":true"), "{s}");

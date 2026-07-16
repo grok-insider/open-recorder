@@ -139,6 +139,8 @@ mod tests {
                 buffered_seconds: 12,
                 buffered_frames: 720,
                 buffered_keyframes: 6,
+                encode_bitrate_kbps: None,
+                target_bitrate_kbps: None,
             },
             0,
         );

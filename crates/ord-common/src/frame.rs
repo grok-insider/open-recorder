@@ -14,7 +14,8 @@ use std::io::{self, Read, Write};
 ///
 /// v7: added `overlay.pressed_keys` layout transform fields, which cross the
 /// wire in `Event::Config` and `Command::SetConfig`.
-pub const PROTOCOL_VERSION: u8 = 8;
+/// v9: `Event::Status` gained `encode_bitrate_kbps` / `target_bitrate_kbps`.
+pub const PROTOCOL_VERSION: u8 = 9;
 
 /// Frame magic identifying an open-recorder control message.
 const MAGIC: [u8; 3] = *b"ORD";

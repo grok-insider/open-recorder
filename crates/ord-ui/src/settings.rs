@@ -2,7 +2,9 @@
 //! layered configuration. The egui view renders this; the daemon applies it
 //! (`SetConfig`). No I/O, no egui here.
 
-use ord_common::config::{CaptureCodec, CaptureConfig, FpsMode, Quality, Resolution};
+use ord_common::config::{
+    CaptureCodec, CaptureConfig, EncoderTune, FpsMode, Quality, Resolution,
+};
 use ord_common::{Config, OutputInfo};
 
 /// Which apply tier a pending change lands in (drives the Apply button copy).
@@ -61,6 +63,7 @@ impl CaptureProfile {
                 cap.codec = CaptureCodec::H264;
                 cap.quality = Quality::Medium;
                 cap.bitrate_kbps = None;
+                cap.tune = EncoderTune::Performance;
             }
             CaptureProfile::Balanced => {
                 cap.resolution = None;
@@ -69,6 +72,7 @@ impl CaptureProfile {
                 cap.codec = CaptureCodec::Hevc;
                 cap.quality = Quality::High;
                 cap.bitrate_kbps = None;
+                cap.tune = EncoderTune::Quality;
             }
             CaptureProfile::Competitive => {
                 cap.resolution = Some(Resolution {
@@ -79,7 +83,15 @@ impl CaptureProfile {
                 cap.fps = 144;
                 cap.codec = CaptureCodec::H264;
                 cap.quality = Quality::High;
-                cap.bitrate_kbps = Some(20_000);
+                // CBR sized for the profile's own geometry (not a flat 20 Mbps).
+                cap.bitrate_kbps = Some(ord_common::recommended_bitrate_kbps(
+                    1920,
+                    1080,
+                    144,
+                    CaptureCodec::H264,
+                    ord_common::BitrateTier::High,
+                ));
+                cap.tune = EncoderTune::Performance;
             }
             CaptureProfile::Quality => {
                 cap.resolution = None;
@@ -88,6 +100,7 @@ impl CaptureProfile {
                 cap.codec = CaptureCodec::Av1;
                 cap.quality = Quality::Ultra;
                 cap.bitrate_kbps = None;
+                cap.tune = EncoderTune::Quality;
             }
         }
     }
@@ -109,6 +122,7 @@ impl CaptureProfile {
                 && probe.codec == cap.codec
                 && probe.quality == cap.quality
                 && probe.bitrate_kbps == cap.bitrate_kbps
+                && probe.tune == cap.tune
             {
                 return p;
             }
@@ -444,7 +458,15 @@ mod tests {
         let mut cap = CaptureConfig::default();
         CaptureProfile::Competitive.apply(&mut cap);
         assert_eq!(cap.fps, 144);
-        assert_eq!(cap.bitrate_kbps, Some(20_000));
+        let expected = ord_common::recommended_bitrate_kbps(
+            1920,
+            1080,
+            144,
+            CaptureCodec::H264,
+            ord_common::BitrateTier::High,
+        );
+        assert_eq!(cap.bitrate_kbps, Some(expected));
+        assert!(expected > 20_000, "competitive 1080p144 should be > 20 Mbps");
         assert_eq!(CaptureProfile::detect(&cap), CaptureProfile::Competitive);
         cap.fps = 120;
         assert_eq!(CaptureProfile::detect(&cap), CaptureProfile::Custom);
