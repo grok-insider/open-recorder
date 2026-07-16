@@ -1411,8 +1411,7 @@ fn capture_geometry_hint(
                 .find(|o| o.name == cap.target)
                 .or_else(|| outputs.iter().find(|o| o.focused))
                 .or_else(|| outputs.first());
-            o.map(|o| o.refresh_fps().max(1))
-                .unwrap_or(cap.fps.max(1))
+            o.map(|o| o.refresh_fps().max(1)).unwrap_or(cap.fps.max(1))
         }
     };
     (w, h, fps)

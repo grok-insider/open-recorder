@@ -2,9 +2,7 @@
 //! layered configuration. The egui view renders this; the daemon applies it
 //! (`SetConfig`). No I/O, no egui here.
 
-use ord_common::config::{
-    CaptureCodec, CaptureConfig, EncoderTune, FpsMode, Quality, Resolution,
-};
+use ord_common::config::{CaptureCodec, CaptureConfig, EncoderTune, FpsMode, Quality, Resolution};
 use ord_common::{Config, OutputInfo};
 
 /// Which apply tier a pending change lands in (drives the Apply button copy).
@@ -466,7 +464,10 @@ mod tests {
             ord_common::BitrateTier::High,
         );
         assert_eq!(cap.bitrate_kbps, Some(expected));
-        assert!(expected > 20_000, "competitive 1080p144 should be > 20 Mbps");
+        assert!(
+            expected > 20_000,
+            "competitive 1080p144 should be > 20 Mbps"
+        );
         assert_eq!(CaptureProfile::detect(&cap), CaptureProfile::Competitive);
         cap.fps = 120;
         assert_eq!(CaptureProfile::detect(&cap), CaptureProfile::Custom);

@@ -381,7 +381,7 @@ fn config_set(client: &mut ord_common::Client, key: &str, value: &str) -> Result
         Event::Config { .. } => {
             let mut msg = format!("set {key} = {value}");
             if let Some(note) = quality_note {
-                msg.push_str("\n");
+                msg.push('\n');
                 msg.push_str(&note);
             }
             Ok(msg)
@@ -401,8 +401,7 @@ fn bitrate_policy_note(config: &Config) -> Option<String> {
         None => (2560, 1440),
     };
     let fps = config.capture.fps.max(1);
-    let raise =
-        ord_common::raise_bitrate_if_too_low(kbps, w, h, fps, config.capture.codec)?;
+    let raise = ord_common::raise_bitrate_if_too_low(kbps, w, h, fps, config.capture.codec)?;
     Some(format!(
         "warning: {kbps} kbps is below the quality floor for {w}x{h}@{fps} {:?} \
          (min {}); daemon will raise to {} on next capture restart",

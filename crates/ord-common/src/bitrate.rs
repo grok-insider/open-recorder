@@ -88,7 +88,7 @@ pub fn estimate_buffer_mib(bitrate_kbps: u32, buffer_seconds: u32) -> u32 {
         .saturating_mul(1000);
     let bytes = bits / 8;
     let with_overhead = bytes.saturating_mul(110) / 100;
-    ((with_overhead + (1024 * 1024) - 1) / (1024 * 1024)) as u32
+    with_overhead.div_ceil(1024 * 1024) as u32
 }
 
 /// If the user-requested CBR is below the mush floor for this geometry, return
@@ -186,9 +186,7 @@ mod tests {
 
     #[test]
     fn high_enough_cbr_not_raised() {
-        assert!(
-            raise_bitrate_if_too_low(80_000, 2560, 1440, 60, CaptureCodec::H264).is_none()
-        );
+        assert!(raise_bitrate_if_too_low(80_000, 2560, 1440, 60, CaptureCodec::H264).is_none());
     }
 
     #[test]
