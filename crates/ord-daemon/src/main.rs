@@ -434,7 +434,7 @@ fn make_engine(
         quality = ?config.capture.quality,
         "capture session knobs"
     );
-    let mut backend = WaycapBackend::new(map_quality(config.capture.quality), fps)
+    let backend = WaycapBackend::new(map_quality(config.capture.quality), fps)
         .with_codec(map_codec(config.capture.codec))
         .with_bitrate_kbps(bitrate)
         .with_keyframe_interval_ms(config.capture.keyframe_interval_ms)
