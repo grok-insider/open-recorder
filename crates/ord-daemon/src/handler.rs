@@ -56,6 +56,17 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
         self.engine.drain_available()
     }
 
+    /// Take a pending encode-health alarm (CBR undershoot). The server
+    /// broadcasts it as [`Event::Error`] so the HUD toasts.
+    pub fn take_encode_alarm(&mut self) -> Option<String> {
+        self.engine.take_encode_alarm()
+    }
+
+    /// Set the CBR target used for encode-health (call after building the engine).
+    pub fn set_target_bitrate_kbps(&mut self, kbps: Option<u32>) {
+        self.engine.set_target_bitrate_kbps(kbps);
+    }
+
     /// Take a pending recording fault (write failure → finalized file).
     pub fn take_recording_fault(&mut self) -> Option<RecordingFault> {
         self.engine.take_recording_fault()
@@ -332,6 +343,8 @@ impl<B: CaptureBackend, S: FrameStore> Handler<B, S> {
             buffered_seconds: self.engine.buffered_seconds(),
             buffered_frames: self.engine.buffered_frames() as u32,
             buffered_keyframes: self.engine.buffered_keyframes() as u32,
+            encode_bitrate_kbps: self.engine.encode_bitrate_kbps(),
+            target_bitrate_kbps: self.engine.target_bitrate_kbps(),
         }
     }
 }
@@ -481,6 +494,7 @@ mod tests {
                 buffered_seconds,
                 buffered_frames,
                 buffered_keyframes,
+                ..
             } => {
                 assert!(buffer_enabled);
                 assert!(!recording);

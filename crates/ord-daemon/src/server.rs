@@ -288,6 +288,7 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
                 let mut h = lock_tolerant(&handler);
                 let pumped = h.pump();
                 let rec_fault = h.take_recording_fault();
+                let encode_alarm = h.take_encode_alarm();
                 if pumped > 0 {
                     last_frames = Instant::now();
                 }
@@ -296,6 +297,12 @@ pub fn serve<B: CaptureBackend + 'static, S: FrameStore + 'static>(
                     for ev in Handler::<B, S>::events_for_recording_fault(fault) {
                         broadcast(&subs, &ev);
                     }
+                    continue;
+                }
+                if let Some(msg) = encode_alarm {
+                    tracing::error!("{msg}");
+                    drop(h);
+                    broadcast(&subs, &Event::Error { message: msg });
                     continue;
                 }
                 if pumped > 0 {

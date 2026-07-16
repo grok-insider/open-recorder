@@ -15,7 +15,10 @@ use ord_common::config::{
     CaptureCodec, ColorRange, Container, EncoderTune, ExportCodec, FpsMode, FramerateMode,
     PressedKeysPosition, Quality, ReplayStorage, Resolution,
 };
-use ord_common::{Config, OutputInfo};
+use ord_common::{
+    estimate_buffer_mib, minimum_bitrate_kbps, recommended_bitrate_kbps, BitrateTier, Config,
+    OutputInfo,
+};
 
 use crate::settings::{capture_summary, ApplyTier, CaptureProfile, SettingsModel};
 use crate::theme;
@@ -890,25 +893,54 @@ fn form(
                 });
         },
     );
+    let (rec_w, rec_h, rec_fps) = capture_geometry_hint(&model.draft.capture, outputs);
+    let recommended = recommended_bitrate_kbps(
+        rec_w,
+        rec_h,
+        rec_fps,
+        model.draft.capture.codec,
+        BitrateTier::from(model.draft.capture.quality),
+    );
+    let minimum = minimum_bitrate_kbps(rec_w, rec_h, rec_fps, model.draft.capture.codec);
+    let buffer_hint = estimate_buffer_mib(recommended, model.draft.capture.buffer_seconds);
+    let bitrate_caption = format!(
+        "Lock the encoder to a fixed bitrate for predictable RAM use. Off = constant quality \
+         (sharper). Recommended ~{recommended} kbps for {rec_w}×{rec_h} @ {rec_fps} · min {minimum} \
+         · buffer ~{buffer_hint} MiB at recommended."
+    );
     row(
         ui,
         &overridden,
         "capture.bitrate_kbps",
         "Constant bitrate",
-        "Lock the encoder to a fixed bitrate: predictable RAM use and clip sizes \
-         even in high-motion scenes. Off = constant quality (sharper, variable size).",
+        &bitrate_caption,
         |ui| {
             optional_u32(
                 ui,
                 "bitrate",
                 &mut model.draft.capture.bitrate_kbps,
-                12_000,
+                recommended,
                 1_000..=200_000,
                 500,
                 "kbps",
             );
         },
     );
+    if let Some(kbps) = model.draft.capture.bitrate_kbps {
+        if kbps < minimum {
+            ui.horizontal(|ui| {
+                ui.add_space(CAPTION_INDENT);
+                ui.colored_label(
+                    theme::KIN,
+                    format!(
+                        "⚠ {kbps} kbps is below the {minimum} kbps floor for this res/fps — \
+                         Apply will raise it to ~{recommended} kbps so clips stay sharp."
+                    ),
+                );
+            });
+            ui.add_space(theme::SP_2);
+        }
+    }
     row(
         ui,
         &overridden,
@@ -1350,6 +1382,39 @@ fn res_preset(res: &Option<Resolution>) -> ResPreset {
         }) => ResPreset::P4k,
         Some(_) => ResPreset::Custom,
     }
+}
+
+/// Best-effort width/height/fps for bitrate recommendations (probe-aware).
+fn capture_geometry_hint(
+    cap: &ord_common::config::CaptureConfig,
+    outputs: &[OutputInfo],
+) -> (u32, u32, u32) {
+    let (w, h) = match cap.resolution {
+        Some(r) => (r.width.max(1), r.height.max(1)),
+        None => {
+            let o = outputs
+                .iter()
+                .find(|o| o.name == cap.target)
+                .or_else(|| outputs.iter().find(|o| o.focused))
+                .or_else(|| outputs.first());
+            match o {
+                Some(o) => (o.width.max(1), o.height.max(1)),
+                None => (2560, 1440),
+            }
+        }
+    };
+    let fps = match cap.fps_mode {
+        FpsMode::Fixed => cap.fps.max(1),
+        FpsMode::Auto => {
+            let o = outputs
+                .iter()
+                .find(|o| o.name == cap.target)
+                .or_else(|| outputs.iter().find(|o| o.focused))
+                .or_else(|| outputs.first());
+            o.map(|o| o.refresh_fps().max(1)).unwrap_or(cap.fps.max(1))
+        }
+    };
+    (w, h, fps)
 }
 
 fn res_preset_label(p: ResPreset) -> &'static str {

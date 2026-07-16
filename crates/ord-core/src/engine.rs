@@ -13,6 +13,7 @@ use ord_common::ClipDuration;
 use crate::audio::{AudioParams, AudioRingBuffer, EncodedAudioFrame};
 use crate::backend::{BackendError, CaptureBackend, StreamParams};
 use crate::clip::{select_clip, ClipError};
+use crate::encode_health::EncodeHealth;
 use crate::mux::MuxError;
 use crate::record::Recorder;
 use crate::ring::{EncodedFrame, RingBuffer};
@@ -81,6 +82,8 @@ pub struct Engine<B: CaptureBackend, S: FrameStore = RingBuffer> {
     /// Marker positions ("clip that" bookmarks) in the video pts tick base,
     /// oldest first. Pruned alongside the ring's eviction window.
     markers: Vec<i64>,
+    /// Rolling encode-bitrate health (CBR undershoot detection).
+    encode_health: EncodeHealth,
 }
 
 impl<B: CaptureBackend> Engine<B> {
@@ -102,6 +105,7 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
     /// Create an engine over `backend` with a caller-provided replay store
     /// (`capacity_seconds` sizes the audio ring to match).
     pub fn with_store(backend: B, store: S, capacity_seconds: u32) -> Self {
+        let ticks = backend.params().time_base_den;
         Self {
             ring: store,
             audio_ring: AudioRingBuffer::new(capacity_seconds),
@@ -111,7 +115,30 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
             recorder: None,
             recording_fault: None,
             markers: Vec::new(),
+            encode_health: EncodeHealth::new(None, ticks),
         }
+    }
+
+    /// Set the CBR target used for encode-health undershoot detection.
+    /// Pass `None` for constant-quality capture.
+    pub fn set_target_bitrate_kbps(&mut self, kbps: Option<u32>) {
+        let ticks = self.backend.params().time_base_den;
+        self.encode_health = EncodeHealth::new(kbps, ticks);
+    }
+
+    /// Most recent measured video encode rate (kbps), if a window has completed.
+    pub fn encode_bitrate_kbps(&self) -> Option<u32> {
+        self.encode_health.encode_bitrate_kbps()
+    }
+
+    /// Configured CBR target (kbps), if any.
+    pub fn target_bitrate_kbps(&self) -> Option<u32> {
+        self.encode_health.target_kbps()
+    }
+
+    /// Take a pending encode-health alarm (CBR undershoot).
+    pub fn take_encode_alarm(&mut self) -> Option<String> {
+        self.encode_health.take_alarm()
     }
 
     /// Begin a full-length recording to `path`, tee'd from the live capture in
@@ -273,6 +300,7 @@ impl<B: CaptureBackend, S: FrameStore> Engine<B, S> {
         };
         let n = frames.len();
         for frame in frames {
+            self.encode_health.observe(frame.pts, frame.len());
             if let Some(mut rec) = self.recorder.take() {
                 match rec.push_video(&frame) {
                     Ok(()) => self.recorder = Some(rec),

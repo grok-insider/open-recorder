@@ -4,6 +4,7 @@
 //! protocol (`Command`/`Event`), and their bincode (de)serialization. The CLI,
 //! GUI, and daemon all speak this protocol over the Unix socket.
 
+pub mod bitrate;
 pub mod client;
 pub mod config;
 pub mod frame;
@@ -13,6 +14,10 @@ pub mod sync;
 pub mod transport;
 pub mod version;
 
+pub use bitrate::{
+    estimate_buffer_mib, minimum_bitrate_kbps, raise_bitrate_if_too_low, recommended_bitrate_kbps,
+    BitrateTier, RaiseBitrate,
+};
 pub use client::{connect, Client, ClientError};
 pub use config::{
     default_config_path, overrides_path, AudioConfig, CaptureCodec, CaptureConfig, Config,
