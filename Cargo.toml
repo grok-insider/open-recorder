@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 # Minimum supported Rust version. 1.87 stabilized `u32::is_multiple_of`, used on
 # the hot path. CI uses stable (>= this); the nix devshell's rustc is canonical.
@@ -32,9 +32,9 @@ ffmpeg-next = "8"
 # Cross-platform user/runtime directories (XDG on Linux, Known Folders on
 # Windows, Library on macOS) — replaces hand-rolled $XDG_*/$HOME logic.
 dirs = "6"
-ord-common = { path = "crates/ord-common", version = "0.0.1" }
-ord-core = { path = "crates/ord-core", version = "0.0.1" }
-ord-export = { path = "crates/ord-export", version = "0.0.1" }
+ord-common = { path = "crates/ord-common", version = "0.0.2" }
+ord-core = { path = "crates/ord-core", version = "0.0.2" }
+ord-export = { path = "crates/ord-export", version = "0.0.2" }
 
 # Release profile for the shipped binaries. This is a latency-sensitive recorder,
 # so tune for runtime over build time (the cachix cache absorbs the longer build):
