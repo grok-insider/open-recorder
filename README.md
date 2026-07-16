@@ -8,7 +8,8 @@ A native, open-source, Medal.tv / ShadowPlay-style game clipper for Linux —
 always-on instant replay with near-zero overhead, save the last N seconds on a
 keypress, browse, trim, and export clips. **NVIDIA-first (NVENC), Wayland-native.**
 
-> **Status: working (v0.3.0).** The full pipeline is verified end-to-end on
+> **Status: working.** (The public version line was restarted at `0.0.x`;
+> see `CHANGELOG.md`.) The full pipeline is verified end-to-end on
 > hardware (RTX 5070 Ti, Hyprland): `ordd` + `ord save` records real NVENC clips,
 > the click-through wlr-layer-shell HUD renders over fullscreen content, and
 > `ord-ui` browses/edits the library. It replaces Steam's CPU-x264 macroblocking
@@ -164,8 +165,8 @@ ord --version           # prints "ord X.Y.Z [protocol N]"
   `--start`/`--end` (trim), `--no-hardware`. Needs `ffmpeg`/`ffprobe` on `PATH`.
 
 **Environment variables:** `RUST_LOG` (daemon log level), `ORD_FFMPEG` /
-`ORD_FFPROBE` (override the ffmpeg/ffprobe binaries), `ORD_DEBUG_LOG` and
-`ORD_AUTOPLAY` (UI dev/QA aids).
+`ORD_FFPROBE` (override the ffmpeg/ffprobe binaries), `ORD_DEBUG_LOG`,
+`ORD_AUTOPLAY`, and `ORD_A11Y` (UI dev/QA/automation aids).
 
 ## Hyprland integration
 
@@ -191,7 +192,7 @@ at runtime — in-app/daemon changes persist as a sparse diff in
 
 | Section | Keys (defaults) |
 |---------|-----------------|
-| `[capture]` | `fps` (60), `fps_mode` (`fixed`\|`auto` — match monitor refresh), `buffer_seconds` (60), `quality` (high), `codec` (h264; hevc/av1 need RTX 40/50), `bitrate_kbps`, `resolution` (omit = native), `keyframe_interval_ms` (2000), `framerate_mode` (cfr), `color_range` (limited), `tune` (performance), `replay_storage` (ram\|disk), `target` (portal or e.g. `DP-1`), `auto_arm` (false), `hdr` (false), `clear_on_save` (false) |
+| `[capture]` | `fps` (60), `fps_mode` (`fixed`\|`auto` — match monitor refresh), `buffer_seconds` (60), `quality` (high), `codec` (h264; hevc/av1 need RTX 40/50), `bitrate_kbps` (optional CBR; leave unset for constant quality — recommended for sharp clips; too-low CBR is auto-raised for res×fps×codec), `resolution` (omit = native), `keyframe_interval_ms` (2000), `framerate_mode` (cfr), `color_range` (limited), `tune` (performance), `replay_storage` (ram\|disk), `target` (portal or e.g. `DP-1`), `auto_arm` (false), `hdr` (false), `clear_on_save` (false) |
 | `[audio]` | `desktop`, `mic`, `tracks` (per-application audio sources) |
 | `[storage]` | `clips_dir`, `recordings_dir`, `template`, `max_gib`, `max_age_days` |
 | `[markers]` | `auto_save_seconds` |

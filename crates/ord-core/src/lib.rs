@@ -21,6 +21,7 @@ pub mod clip;
 // Linux-only in Phase 0 anyway), so nothing is lost.
 #[cfg(unix)]
 pub mod disk_store;
+pub mod encode_health;
 pub mod engine;
 pub mod mux;
 mod order;
@@ -39,6 +40,7 @@ pub use backend::{BackendError, CaptureBackend, CaptureStreams, Codec, MockBacke
 pub use clip::{select_clip, ClipError, ClipSelection};
 #[cfg(unix)]
 pub use disk_store::DiskFrameStore;
+pub use encode_health::EncodeHealth;
 pub use engine::{Engine, PreparedClip, RecordingFault};
 pub use mux::{verify_clip, write_clip, ClipCheck, MuxError};
 pub use record::Recorder;

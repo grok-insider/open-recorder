@@ -87,6 +87,10 @@ pub enum Event {
         buffered_seconds: u32,
         buffered_frames: u32,
         buffered_keyframes: u32,
+        /// Rolling measured video encode rate (kbps), when a sample window completed.
+        encode_bitrate_kbps: Option<u32>,
+        /// Active CBR target (kbps) after policy floor; `None` = constant quality.
+        target_bitrate_kbps: Option<u32>,
     },
     /// An error occurred handling a command. User-facing, actionable text.
     Error { message: String },
@@ -208,6 +212,8 @@ mod tests {
                 buffered_seconds: 42,
                 buffered_frames: 2520,
                 buffered_keyframes: 84,
+                encode_bitrate_kbps: Some(48_000),
+                target_bitrate_kbps: Some(50_000),
             },
             Event::Error {
                 message: "no keyframe in window".to_string(),

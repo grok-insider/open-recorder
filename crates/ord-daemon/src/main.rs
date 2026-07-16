@@ -371,6 +371,39 @@ fn map_codec(c: ord_common::config::CaptureCodec) -> ord_core::Codec {
     }
 }
 
+/// Resolve capture width/height for bitrate policy (explicit scale, else probe).
+#[cfg(all(feature = "waycap", target_os = "linux"))]
+fn capture_dims(config: &Config) -> (u32, u32) {
+    if let Some(res) = config.capture.resolution {
+        return (res.width.max(1), res.height.max(1));
+    }
+    if let Some((w, h)) = ord_daemon::outputs::resolve_native_hint(
+        &ord_daemon::outputs::list_outputs(),
+        &config.capture.target,
+    ) {
+        return (w.max(1), h.max(1));
+    }
+    // Safe fallback used by WaycapBackend defaults until portal negotiates.
+    (2560, 1440)
+}
+
+/// Apply the CBR floor policy: raise mushy user bitrates to the recommended
+/// rate for the current res × fps × codec. Returns the bitrate to hand to NVENC
+/// (`None` = constant-quality mode).
+#[cfg(all(feature = "waycap", target_os = "linux"))]
+fn effective_bitrate_kbps(config: &Config) -> Option<u32> {
+    let requested = config.capture.bitrate_kbps?;
+    let (w, h) = capture_dims(config);
+    let fps = effective_capture_fps(config);
+    match ord_common::raise_bitrate_if_too_low(requested, w, h, fps, config.capture.codec) {
+        Some(raise) => {
+            tracing::warn!("{}", raise.message());
+            Some(raise.raised_to_kbps)
+        }
+        None => Some(requested),
+    }
+}
+
 #[cfg(all(feature = "waycap", target_os = "linux"))]
 fn make_engine(
     config: &Config,
@@ -390,9 +423,20 @@ fn make_engine(
             .any(|s| matches!(s, ord_common::config::AudioSource::DefaultInput))
     });
     let fps = effective_capture_fps(config);
+    let bitrate = effective_bitrate_kbps(config);
+    let (w, h) = capture_dims(config);
+    tracing::info!(
+        fps,
+        width = w,
+        height = h,
+        codec = ?config.capture.codec,
+        bitrate_kbps = ?bitrate,
+        quality = ?config.capture.quality,
+        "capture session knobs"
+    );
     let mut backend = WaycapBackend::new(map_quality(config.capture.quality), fps)
         .with_codec(map_codec(config.capture.codec))
-        .with_bitrate_kbps(config.capture.bitrate_kbps)
+        .with_bitrate_kbps(bitrate)
         .with_keyframe_interval_ms(config.capture.keyframe_interval_ms)
         .with_framerate_mode(config.capture.framerate_mode)
         .with_color_range(config.capture.color_range)
@@ -401,23 +445,16 @@ fn make_engine(
         .with_hdr(config.capture.hdr)
         .with_audio(audio_any)
         .with_mic(mic)
-        .with_restore_token_path(restore_token_path());
-    if let Some(res) = config.capture.resolution {
-        backend = backend.with_dimensions(res.width, res.height);
-    } else if let Some((w, h)) = ord_daemon::outputs::resolve_native_hint(
-        &ord_daemon::outputs::list_outputs(),
-        &config.capture.target,
-    ) {
-        // Named-monitor native: use the probed mode as a container hint until
-        // the portal session (or fork) reports the real negotiated size.
-        backend = backend.with_dimensions(w, h);
-    }
+        .with_restore_token_path(restore_token_path())
+        .with_dimensions(w, h);
     let ticks = backend.params().time_base_den;
-    Engine::with_store(
+    let mut engine = Engine::with_store(
         backend,
         make_store(config, ticks),
         config.capture.buffer_seconds,
-    )
+    );
+    engine.set_target_bitrate_kbps(bitrate);
+    engine
 }
 
 /// Where the XDG screencast restore token is cached, so the daemon skips the

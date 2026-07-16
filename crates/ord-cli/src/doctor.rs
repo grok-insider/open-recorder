@@ -217,6 +217,10 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     let diag = diagnose();
     print!("{}", render(&diag, &profile_path()));
 
+    if let Some(note) = check_recent_clip_bitrate() {
+        println!("\n{note}");
+    }
+
     if fix {
         if !diag.driver_supported() {
             // Still install (harmless) but warn it won't help on this driver.
@@ -227,6 +231,91 @@ pub fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         println!("restart ordd (and reboot once) for the NVIDIA driver to pick it up.");
     }
     Ok(())
+}
+
+/// Best-effort: if the newest clip under `~/Videos/open-recorder` is far below
+/// a sane floor for its resolution, surface a quality warning.
+fn check_recent_clip_bitrate() -> Option<String> {
+    let dir = dirs::home_dir()?.join("Videos/open-recorder");
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let rd = std::fs::read_dir(&dir).ok()?;
+    for ent in rd.flatten() {
+        let path = ent.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("mkv") || e.eq_ignore_ascii_case("mp4"))
+            .unwrap_or(false);
+        if !ext {
+            continue;
+        }
+        let meta = ent.metadata().ok()?;
+        let mtime = meta.modified().ok()?;
+        if newest.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            newest = Some((mtime, path));
+        }
+    }
+    let (_, path) = newest?;
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height:format=bit_rate,duration",
+            "-of",
+            "default=noprint_wrappers=1",
+            path.to_str()?,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut width = 0u32;
+    let mut height = 0u32;
+    let mut bit_rate = 0u64;
+    let mut duration = 0.0f64;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("width=") {
+            width = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("height=") {
+            height = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("bit_rate=") {
+            bit_rate = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("duration=") {
+            duration = v.parse().unwrap_or(0.0);
+        }
+    }
+    if width == 0 || height == 0 {
+        return None;
+    }
+    // Prefer container bit_rate; fall back to size/duration if N/A.
+    let kbps = if bit_rate > 0 {
+        (bit_rate / 1000) as u32
+    } else {
+        let size = std::fs::metadata(&path).ok()?.len();
+        if duration <= 0.0 {
+            return None;
+        }
+        ((size as f64) * 8.0 / duration / 1000.0) as u32
+    };
+    // Assume 60 fps for the floor when we don't know — still flags the 1.5 Mbps case.
+    let min = ord_common::minimum_bitrate_kbps(width, height, 60, ord_common::CaptureCodec::Av1);
+    if kbps >= min / 2 {
+        return None;
+    }
+    Some(format!(
+        "capture quality: recent clip {} is ~{} kbps at {}x{} — well below a \
+         healthy floor (~{} kbps). Check capture.bitrate_kbps / waycap-rs bitrate fix.",
+        path.file_name()?.to_string_lossy(),
+        kbps,
+        width,
+        height,
+        min
+    ))
 }
 
 #[cfg(test)]
